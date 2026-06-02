@@ -723,6 +723,79 @@ def post_edn(path, form, session=None, base=DEFAULT_BASE):
 
 
 # ---------------------------------------------------------------------------
+# UDS transport:  EDN form  ->  length-prefixed frame  ->  parsed EDN response
+#
+# A second transport that speaks the same EDN codec over a Unix domain socket
+# instead of HTTP. It sits alongside post_edn rather than replacing it -- same
+# "encode, send, decode" shape, different plumbing. Two things differ from HTTP:
+#
+#   * Framing. There is no HTTP envelope, so each message is delimited
+#     explicitly: a 4-byte big-endian UNSIGNED length prefix followed by that
+#     many UTF-8 bytes of EDN. This matches Dianoia's transport/uds.clj
+#     write-frame / read-frame exactly (DataOutputStream.writeInt is a 4-byte
+#     big-endian int).
+#   * Session binding. Over HTTP the client threads the session id back into
+#     each request header. Over UDS the server binds the session to the
+#     *connection*: it captures the id from the welcome envelope and attaches
+#     it to the socket (see uds.clj handle-frame / build-ctx). So the client
+#     must NOT echo the session id into later frames -- it just keeps sending
+#     on the same socket, and the server already knows who it is.
+#
+# Stdlib only: socket for the connection, struct for the length prefix.
+# ---------------------------------------------------------------------------
+
+import socket
+import struct
+
+# Where a locally booted Dianoia UDS listener binds by default (see uds.clj
+# start! :socket-path). Override per call via the ``socket_path`` argument.
+DEFAULT_SOCKET = "/tmp/dianoia.sock"
+
+
+def _recv_exactly(sock, n):
+    """Read exactly ``n`` bytes from ``sock``, looping until satisfied.
+
+    ``socket.recv`` may return fewer bytes than requested, so we accumulate
+    until we have all ``n``. A return of ``b""`` means the peer closed the
+    connection; getting that before ``n`` bytes is a truncated frame, which we
+    surface as a ``ConnectionError`` rather than a short read.
+    """
+    chunks = []
+    remaining = n
+    while remaining > 0:
+        chunk = sock.recv(remaining)
+        if chunk == b"":
+            raise ConnectionError(
+                f"connection closed with {remaining} of {n} bytes still expected"
+            )
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def uds_send_frame(sock, edn_str):
+    """Frame ``edn_str`` and send it: 4-byte big-endian length, then the body.
+
+    The body is the UTF-8 encoding of ``edn_str``; the prefix is its byte
+    length packed as ``>I`` (big-endian unsigned 32-bit). ``sendall`` keeps
+    writing until every byte is on the wire. Mirrors uds.clj write-frame.
+    """
+    body = edn_str.encode("utf-8")
+    sock.sendall(struct.pack(">I", len(body)) + body)
+
+
+def uds_recv_frame(sock):
+    """Read one length-prefixed frame and return its body as a ``str``.
+
+    The inverse of :func:`uds_send_frame`: read the 4-byte big-endian length,
+    then read exactly that many body bytes, then decode UTF-8. Mirrors uds.clj
+    read-frame.
+    """
+    (length,) = struct.unpack(">I", _recv_exactly(sock, 4))
+    return _recv_exactly(sock, length).decode("utf-8")
+
+
+# ---------------------------------------------------------------------------
 # Runnable recipe:  the full Lemma round-trip
 #
 # This is the third and final layer the module docstring promised. It is a
@@ -834,7 +907,105 @@ def main(base=DEFAULT_BASE):
           f"  done?={edn_write(body.get(Keyword(':done?')))}")
 
 
+def main_uds(socket_path=DEFAULT_SOCKET):
+    """Run the same propose/assert/query round-trip over a Unix domain socket.
+
+    Step for step this is the HTTP :func:`main` -- hello, enter a world,
+    propose a fact, assert it, query it back -- but spoken over a UDS frame
+    stream. The one protocol difference is session handling: the server binds
+    the session to the connection from the welcome envelope (uds.clj
+    handle-frame), so we do NOT thread the session id into later frames. Every
+    call after hello simply rides the same open socket.
+
+    After each response we check ``:event``; an ``:error`` or ``:rejected``
+    envelope is printed and the sequence stops cleanly rather than crashing.
+    """
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        try:
+            sock.connect(socket_path)
+        except (FileNotFoundError, ConnectionRefusedError, OSError) as err:
+            # No listener at the path: the socket file is missing, or nothing
+            # is accepting on it. Name the path so the failure is actionable.
+            raise ConnectionError(
+                f"could not connect to the Lemma UDS server at {socket_path!r} "
+                f"({err}); is the server running?"
+            ) from err
+
+        # One round-trip: frame out, frame in, decode. The session lives on the
+        # connection -- no id is echoed back, unlike the HTTP transport.
+        def call(form):
+            uds_send_frame(sock, edn_write(form))
+            return edn_read(uds_recv_frame(sock))
+
+        # 1. Anonymous hello. The welcome reply carries the session id, which
+        #    the server has already pinned to this connection for us.
+        body = call(Lst([Symbol("hello")]))
+        if not isinstance(body, dict) or body.get(_EVENT) != Keyword(":welcome"):
+            event = body.get(_EVENT) if isinstance(body, dict) else None
+            print(f"hello: expected :welcome, got {edn_write(event)}"
+                  f" -- {_describe_failure(body)}")
+            return
+        print(f"hello -> :welcome  version={edn_write(body.get(Keyword(':version')))}"
+              f"  session={edn_write(body.get(Keyword(':session')))}"
+              f"  world={edn_write(body.get(Keyword(':world')))}")
+
+        # 2. Enter the world. (use-world #world "default")
+        body = call(Lst([Symbol("use-world"), Tagged("world", "default")]))
+        if _is_failure(body):
+            print(f"use-world refused: {_describe_failure(body)}")
+            return
+        print(f"use-world \"default\" -> {edn_write(body.get(_EVENT))}"
+              f"  world={edn_write(body.get(Keyword(':world')))}")
+
+        # 3. Propose a fact: morningstar is equivalent to venus. The reply hands
+        #    back a #proposal handle we feed straight into the assert.
+        fact = Tagged("fact", {
+            Keyword(":predicate"): Symbol("equivalent"),
+            Keyword(":subject"): Tagged("entity", "morningstar"),
+            Keyword(":object"): Tagged("entity", "venus"),
+        })
+        body = call(Lst([Symbol("propose"), fact]))
+        if _is_failure(body):
+            print(f"propose refused: {_describe_failure(body)}")
+            return
+        proposal = body.get(Keyword(":proposal"))
+        print(f"propose (equivalent morningstar venus) -> {edn_write(body.get(_EVENT))}"
+              f"  proposal={edn_write(proposal)}")
+
+        # 4. Assert the proposed fact into the world.
+        body = call(Lst([Symbol("assert"), proposal]))
+        if _is_failure(body):
+            print(f"assert refused: {_describe_failure(body)}")
+            return
+        print(f"assert proposal -> {edn_write(body.get(_EVENT))}")
+
+        # 5. Query it back. As in the HTTP path, :find / :where are VECTORS
+        #    (Python lists); only the verb head is a Lst.
+        body = call(Lst([Symbol("query"), {
+            Keyword(":find"): [Symbol("?o")],
+            Keyword(":where"): [[Symbol("equivalent"), Tagged("entity", "morningstar"), Symbol("?o")]],
+        }]))
+        if _is_failure(body):
+            print(f"query refused: {_describe_failure(body)}")
+            return
+        print(f"query (equivalent morningstar ?o) -> rows={edn_write(body.get(Keyword(':rows')))}"
+              f"  done?={edn_write(body.get(Keyword(':done?')))}")
+    finally:
+        # Always release the socket, success or failure. Closing it also lets
+        # the server's reader thread observe EOF and drop the session.
+        sock.close()
+
+
 if __name__ == "__main__":
-    # An optional first argument overrides the server base URL; otherwise we
-    # talk to the local default. No network happens at import time -- only here.
-    main(sys.argv[1] if len(sys.argv) > 1 else DEFAULT_BASE)
+    # Transport dispatch. With no arguments we keep the original HTTP behaviour
+    # against the local default. A leading "uds" selects the Unix-domain-socket
+    # transport (with an optional socket path). A leading http(s):// URL still
+    # overrides the HTTP base. No network happens at import time -- only here.
+    args = sys.argv[1:]
+    if args and args[0] == "uds":
+        main_uds(args[1] if len(args) > 1 else DEFAULT_SOCKET)
+    elif args:
+        main(args[0])
+    else:
+        main(DEFAULT_BASE)

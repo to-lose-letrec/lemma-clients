@@ -22,6 +22,8 @@ that leaks between tests.
 """
 
 import io
+import socket
+import struct
 import unittest
 import urllib.error
 import urllib.request
@@ -30,6 +32,7 @@ from contextlib import redirect_stdout
 import lemma_client as lc
 from lemma_client import (
     DEFAULT_BASE,
+    DEFAULT_SOCKET,
     Keyword,
     Lst,
     Symbol,
@@ -37,7 +40,10 @@ from lemma_client import (
     edn_read,
     edn_write,
     main,
+    main_uds,
     post_edn,
+    uds_recv_frame,
+    uds_send_frame,
 )
 
 
@@ -708,6 +714,453 @@ class PostEdnTransportTests(unittest.TestCase):
         self.assertIn("http://down.test:1234", message)
         self.assertIn("Connection refused", message)
         self.assertIn("is the server running?", message)
+
+
+# ===========================================================================
+# (E) UDS framing:  uds_send_frame / uds_recv_frame / _recv_exactly
+#
+# The UDS transport delimits each EDN message with a 4-byte big-endian
+# UNSIGNED length prefix followed by that many UTF-8 body bytes (mirrors
+# Dianoia's transport/uds.clj write-frame / read-frame). These tests exercise
+# the framing in isolation against in-memory fake sockets -- no real socket,
+# no blocking, no sleeps.
+# ===========================================================================
+
+
+def _frame(edn_str):
+    """Build the on-wire bytes for ``edn_str``: >I length prefix + UTF-8 body.
+
+    Uses the same primitives the implementation does so the expectation is a
+    spec, not a re-derivation of the implementation.
+    """
+    body = edn_str.encode("utf-8")
+    return struct.pack(">I", len(body)) + body
+
+
+class _SendRecorderSocket:
+    """A fake socket that records every ``sendall`` payload.
+
+    Only the write side is exercised here; ``sendall`` concatenates each call's
+    bytes both into a per-call list and a single running buffer.
+    """
+
+    def __init__(self):
+        self.sends = []
+
+    def sendall(self, data):
+        self.sends.append(data)
+
+
+class _ScriptedRecvSocket:
+    """A fake socket whose ``recv`` replays a scripted sequence of byte chunks.
+
+    Each ``recv(n)`` pops the next pre-loaded chunk and returns at most ``n``
+    bytes of it, like a real socket (a chunk longer than ``n`` has its tail
+    pushed back for the next read). This lets a single logical frame be
+    delivered across several small pieces, proving the reassembly loop. When
+    the script is exhausted it returns ``b""`` to model the peer having closed
+    the connection.
+    """
+
+    def __init__(self, chunks):
+        self._chunks = list(chunks)
+        self.recv_calls = []
+
+    def recv(self, n):
+        self.recv_calls.append(n)
+        if not self._chunks:
+            return b""
+        chunk = self._chunks.pop(0)
+        if len(chunk) > n:
+            self._chunks.insert(0, chunk[n:])
+            chunk = chunk[:n]
+        return chunk
+
+
+class UdsSendFrameTests(unittest.TestCase):
+    def test_send_frame_emits_exact_length_prefixed_bytes(self):
+        sock = _SendRecorderSocket()
+        form = Lst([Symbol("hello")])
+        edn = edn_write(form)
+
+        uds_send_frame(sock, edn)
+
+        body = edn.encode("utf-8")
+        expected = struct.pack(">I", len(body)) + body
+        # sendall is invoked exactly once with the whole frame.
+        self.assertEqual(sock.sends, [expected])
+
+    def test_send_frame_prefix_is_four_byte_big_endian_length(self):
+        sock = _SendRecorderSocket()
+        edn = '(use-world #world "default")'
+
+        uds_send_frame(sock, edn)
+
+        sent = sock.sends[0]
+        self.assertEqual(sent[:4], struct.pack(">I", len(edn.encode("utf-8"))))
+
+    def test_send_frame_body_is_utf8_encoding_of_edn(self):
+        sock = _SendRecorderSocket()
+        # A non-ASCII payload proves the byte length, not the char length, is
+        # what gets framed.
+        edn = edn_write(Tagged("entity", "vénus"))
+
+        uds_send_frame(sock, edn)
+
+        sent = sock.sends[0]
+        body = edn.encode("utf-8")
+        (length,) = struct.unpack(">I", sent[:4])
+        self.assertEqual(length, len(body))
+        self.assertEqual(sent[4:], body)
+
+
+class UdsRecvFrameTests(unittest.TestCase):
+    def test_recv_frame_reconstructs_edn_string_from_one_chunk(self):
+        edn = '{:event :welcome :version 1}'
+        sock = _ScriptedRecvSocket([_frame(edn)])
+
+        self.assertEqual(uds_recv_frame(sock), edn)
+
+    def test_recv_frame_round_trips_a_sent_frame(self):
+        # Send into a recorder, feed the recorded bytes back through recv.
+        form = Lst([Symbol("query")])
+        sender = _SendRecorderSocket()
+        uds_send_frame(sender, edn_write(form))
+        receiver = _ScriptedRecvSocket([sender.sends[0]])
+
+        got = uds_recv_frame(receiver)
+
+        self.assertEqual(edn_read(got), form)
+
+    def test_recv_frame_reassembles_a_frame_split_across_many_chunks(self):
+        # Deliver the prefix one byte at a time, then the body in two pieces.
+        edn = '{:event :result :rows [["venus"]] :done? true}'
+        frame = _frame(edn)
+        prefix = frame[:4]
+        body = frame[4:]
+        chunks = [prefix[i : i + 1] for i in range(4)]  # 4 single-byte prefix reads
+        chunks.append(body[: len(body) // 2])
+        chunks.append(body[len(body) // 2 :])
+        sock = _ScriptedRecvSocket(chunks)
+
+        self.assertEqual(uds_recv_frame(sock), edn)
+        # The body arrived in multiple pieces, so _recv_exactly must have
+        # looped: more recv calls than the two logical frame reads (prefix,
+        # body) it would take if each returned everything at once.
+        self.assertGreater(len(sock.recv_calls), 2)
+
+
+class RecvExactlyTests(unittest.TestCase):
+    def test_recv_exactly_returns_requested_bytes_across_chunks(self):
+        sock = _ScriptedRecvSocket([b"ab", b"cd", b"ef"])
+
+        self.assertEqual(lc._recv_exactly(sock, 6), b"abcdef")
+
+    def test_recv_exactly_premature_eof_raises_connection_error(self):
+        # Two bytes available, then the peer closes (b"") -- asking for four
+        # must raise rather than hang or return a short read.
+        sock = _ScriptedRecvSocket([b"ab"])
+
+        with self.assertRaises(ConnectionError) as ctx:
+            lc._recv_exactly(sock, 4)
+
+        self.assertIn("connection closed", str(ctx.exception))
+
+    def test_recv_frame_premature_eof_in_body_raises_connection_error(self):
+        # A valid 10-byte length prefix, but the body never fully arrives.
+        sock = _ScriptedRecvSocket([struct.pack(">I", 10), b"short"])
+
+        with self.assertRaises(ConnectionError):
+            uds_recv_frame(sock)
+
+
+# ===========================================================================
+# (F) UDS handshake: drive main_uds() with no real socket.
+#
+# socket.socket is monkeypatched to return a scripted fake that supports
+# connect()/sendall()/recv()/close() and the context-manager protocol. The
+# canned reply frames are built with the real framing primitives so they are
+# byte-correct. Determinism: no real sockets, no sleeps; socket.socket is
+# restored via addCleanup.
+# ===========================================================================
+
+
+class _FakeUdsSocket:
+    """A scripted Unix-domain-socket stand-in for main_uds().
+
+    Construction records the (family, type) the client requested. ``connect``
+    is a no-op that records the path. ``sendall`` records each frame's raw
+    bytes. ``recv`` replays the welcome/world-selected/proposed/asserted/result
+    reply frames, delivered as a single in-memory byte stream so multi-byte
+    reads work naturally. Supports close() and the context-manager protocol.
+    """
+
+    def __init__(self, family, type):
+        self.family = family
+        self.type = type
+        self.connected_path = None
+        self.connect_calls = 0
+        self.sends = []
+        self.closed = False
+        self._recv_buffer = b""
+
+    # -- script the replies the server would send back -----------------------
+
+    def load_replies(self, edn_replies):
+        self._recv_buffer = b"".join(_frame(r) for r in edn_replies)
+
+    # -- socket surface used by main_uds -------------------------------------
+
+    def connect(self, path):
+        self.connect_calls += 1
+        self.connected_path = path
+
+    def sendall(self, data):
+        self.sends.append(data)
+
+    def recv(self, n):
+        chunk = self._recv_buffer[:n]
+        self._recv_buffer = self._recv_buffer[n:]
+        return chunk  # b"" once exhausted, modelling EOF
+
+    def close(self):
+        self.closed = True
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+        return False
+
+
+# Canned UDS reply bodies. The welcome carries the connection-bound session as
+# a #session handle; the rest mirror the HTTP fixtures above.
+_UDS_WELCOME = (
+    '{:event :welcome :version 1 '
+    ':session #session "s-uds-1" :world #world "default" '
+    ':verbs {:core #{hello use-world propose assert query} :extensions {}}}'
+)
+_UDS_WORLD_SELECTED = '{:event :world-selected :world #world "default"}'
+_UDS_PROPOSED = '{:event :proposed :proposal #proposal "p-1"}'
+_UDS_ASSERTED = '{:event :asserted}'
+_UDS_RESULT = '{:event :result :rows [["venus"]] :done? true}'
+
+_UDS_FULL_SEQUENCE = [
+    _UDS_WELCOME,
+    _UDS_WORLD_SELECTED,
+    _UDS_PROPOSED,
+    _UDS_ASSERTED,
+    _UDS_RESULT,
+]
+
+
+class UdsHandshakeBase(unittest.TestCase):
+    def setUp(self):
+        self._orig_socket = socket.socket
+        self.addCleanup(self._restore)
+        self.created = []
+
+    def _restore(self):
+        socket.socket = self._orig_socket
+
+    def install_socket(self, replies):
+        """Patch socket.socket to mint a scripted fake pre-loaded with replies.
+
+        Returns the factory; each created fake is appended to ``self.created``
+        so a test can assert exactly one socket was opened.
+        """
+        created = self.created
+
+        def factory(family, type):
+            fake = _FakeUdsSocket(family, type)
+            fake.load_replies(replies)
+            created.append(fake)
+            return fake
+
+        socket.socket = factory
+        return factory
+
+    def run_main_uds_capturing(self, socket_path=DEFAULT_SOCKET):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            main_uds(socket_path)
+        return out.getvalue()
+
+    def sent_frames_as_edn(self, fake):
+        """Decode every frame the client sent back into EDN strings."""
+        buf = b"".join(fake.sends)
+        forms = []
+        pos = 0
+        while pos < len(buf):
+            (length,) = struct.unpack(">I", buf[pos : pos + 4])
+            pos += 4
+            forms.append(buf[pos : pos + length].decode("utf-8"))
+            pos += length
+        return forms
+
+
+class UdsHandshakeSuccessTests(UdsHandshakeBase):
+    def test_full_sequence_reaches_result_line(self):
+        self.install_socket(_UDS_FULL_SEQUENCE)
+
+        output = self.run_main_uds_capturing()
+
+        self.assertIn("rows=", output)
+        self.assertIn('"venus"', output)
+
+    def test_opens_exactly_one_unix_stream_socket(self):
+        self.install_socket(_UDS_FULL_SEQUENCE)
+
+        self.run_main_uds_capturing()
+
+        self.assertEqual(len(self.created), 1)
+        fake = self.created[0]
+        self.assertEqual(fake.family, socket.AF_UNIX)
+        self.assertEqual(fake.type, socket.SOCK_STREAM)
+
+    def test_connects_once_to_the_given_socket_path(self):
+        self.install_socket(_UDS_FULL_SEQUENCE)
+
+        self.run_main_uds_capturing(socket_path="/run/lemma/custom.sock")
+
+        fake = self.created[0]
+        self.assertEqual(fake.connect_calls, 1)
+        self.assertEqual(fake.connected_path, "/run/lemma/custom.sock")
+
+    def test_default_socket_path_is_used_when_unspecified(self):
+        self.install_socket(_UDS_FULL_SEQUENCE)
+
+        out = io.StringIO()
+        with redirect_stdout(out):
+            main_uds()
+
+        self.assertEqual(self.created[0].connected_path, DEFAULT_SOCKET)
+
+    def test_first_sent_frame_is_anonymous_hello(self):
+        self.install_socket(_UDS_FULL_SEQUENCE)
+
+        self.run_main_uds_capturing()
+
+        sent = self.sent_frames_as_edn(self.created[0])
+        self.assertEqual(sent[0], "(hello)")
+
+    def test_sends_five_frames_one_per_protocol_step(self):
+        self.install_socket(_UDS_FULL_SEQUENCE)
+
+        self.run_main_uds_capturing()
+
+        self.assertEqual(len(self.sent_frames_as_edn(self.created[0])), 5)
+
+    def test_no_frame_after_hello_echoes_the_session_handle(self):
+        # CRITICAL: over UDS the session is bound to the connection by the
+        # server, so the client must NOT re-send the session id in any later
+        # frame. Decode every sent frame and assert none after the hello
+        # carries a #session handle or the session value.
+        self.install_socket(_UDS_FULL_SEQUENCE)
+
+        self.run_main_uds_capturing()
+
+        sent = self.sent_frames_as_edn(self.created[0])
+        for frame in sent[1:]:
+            self.assertNotIn("#session", frame)
+            self.assertNotIn("s-uds-1", frame)
+            self.assertNotIn(":session", frame)
+
+    def test_proposal_handle_is_threaded_into_assert_frame(self):
+        self.install_socket(_UDS_FULL_SEQUENCE)
+
+        self.run_main_uds_capturing()
+
+        sent = self.sent_frames_as_edn(self.created[0])
+        # Frame index 3 is the assert: (assert #proposal "p-1").
+        assert_form = edn_read(sent[3])
+        self.assertIsInstance(assert_form, Lst)
+        self.assertEqual(assert_form.items[0], Symbol("assert"))
+        self.assertEqual(assert_form.items[1], Tagged("proposal", "p-1"))
+
+    def test_socket_is_closed_after_a_successful_run(self):
+        self.install_socket(_UDS_FULL_SEQUENCE)
+
+        self.run_main_uds_capturing()
+
+        self.assertTrue(self.created[0].closed)
+
+
+class UdsHandshakeFailurePathTests(UdsHandshakeBase):
+    def test_non_welcome_first_reply_stops_cleanly(self):
+        self.install_socket(['{:event :error :reason :malformed :message "bad"}'])
+
+        output = self.run_main_uds_capturing()
+
+        self.assertIn(":welcome", output)  # the "expected :welcome" message
+        # Only the hello was sent; no later frames.
+        self.assertEqual(len(self.sent_frames_as_edn(self.created[0])), 1)
+
+    def test_rejected_after_welcome_stops_cleanly(self):
+        self.install_socket(
+            [
+                _UDS_WELCOME,
+                '{:event :rejected :reason :inconsistent '
+                ':violations [#violation "cycle"]}',
+            ]
+        )
+
+        output = self.run_main_uds_capturing()
+
+        self.assertIn("use-world refused", output)
+        self.assertEqual(len(self.sent_frames_as_edn(self.created[0])), 2)
+
+    def test_socket_is_closed_even_when_a_step_is_refused(self):
+        self.install_socket(
+            [_UDS_WELCOME, '{:event :error :reason :malformed :message "bad"}']
+        )
+
+        self.run_main_uds_capturing()
+
+        self.assertTrue(self.created[0].closed)
+
+
+class UdsConnectFailureTests(UdsHandshakeBase):
+    def test_connect_filenotfound_raises_connection_error_naming_path(self):
+        path = "/no/such.sock"
+
+        def factory(family, type):
+            fake = _FakeUdsSocket(family, type)
+
+            def boom(_p):
+                raise FileNotFoundError(2, "No such file or directory")
+
+            fake.connect = boom
+            self.created.append(fake)
+            return fake
+
+        socket.socket = factory
+
+        with self.assertRaises(ConnectionError) as ctx:
+            main_uds(path)
+
+        message = str(ctx.exception)
+        self.assertIn(path, message)
+        self.assertIn("is the server running?", message)
+
+    def test_connect_failure_still_closes_the_socket(self):
+        def factory(family, type):
+            fake = _FakeUdsSocket(family, type)
+
+            def boom(_p):
+                raise FileNotFoundError(2, "No such file or directory")
+
+            fake.connect = boom
+            self.created.append(fake)
+            return fake
+
+        socket.socket = factory
+
+        with self.assertRaises(ConnectionError):
+            main_uds("/no/such.sock")
+
+        self.assertTrue(self.created[0].closed)
 
 
 if __name__ == "__main__":

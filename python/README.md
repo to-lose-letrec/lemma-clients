@@ -2,14 +2,15 @@
 
 A single-file, standard-library-only Python 3 client that demonstrates the
 Lemma wire protocol against a local [Dianoia](https://github.com/to-lose-letrec/lemma)
-server over HTTP. It carries no dependencies: a minimal EDN reader/writer is
-hand-rolled in the same file. Read `lemma_client.py` end to end — it is a
-recipe, not a library.
+server. It speaks **both** transports Dianoia exposes: HTTP (the default) and a
+Unix domain socket. It carries no dependencies: a minimal EDN reader/writer is
+hand-rolled in the same file, and the same codec serializes both transports.
+Read `lemma_client.py` end to end — it is a recipe, not a library.
 
 ## Prerequisites
 
 - Python 3 (standard library only; no `pip install` step).
-- A running Dianoia server reachable over HTTP.
+- A running Dianoia server reachable over HTTP or its Unix domain socket.
 
 ## Boot a local Dianoia
 
@@ -21,9 +22,8 @@ JAVA_HOME=/home/james/.local/share/jdk-21.0.11+10 \
 clj -M -m dianoia.main
 ```
 
-This binds an HTTP listener on `127.0.0.1:8080` and opens the world `default`.
-Dianoia also exposes a Unix-domain-socket transport, but this demo talks plain
-HTTP.
+This binds an HTTP listener on `127.0.0.1:8080`, a Unix-domain-socket listener
+at `/tmp/dianoia.sock`, and opens the world `default`.
 
 The server *discovers* worlds; it does not create them. Before the first boot,
 create the world directory out-of-band under `$LEMMA_HOME/worlds/default/`
@@ -38,21 +38,36 @@ EOF
 : > /tmp/dianoia-worlds/worlds/default/log.edn
 ```
 
-## Run
+## Run (HTTP)
 
 ```sh
 python3 lemma_client.py
 ```
 
 The default base URL is `http://127.0.0.1:8080` (`DEFAULT_BASE`). Pass a
-single argument to override it:
+single URL argument to override it:
 
 ```sh
 python3 lemma_client.py http://host:port
 ```
 
-`main()` reads `sys.argv[1]` when present and otherwise falls back to
-`DEFAULT_BASE`. No network I/O occurs at import time.
+## Run (UDS)
+
+```sh
+python3 lemma_client.py uds
+```
+
+The `uds` argument selects the Unix-domain-socket transport and connects to
+`/tmp/dianoia.sock` (`DEFAULT_SOCKET`). Pass a path after `uds` to override the
+socket:
+
+```sh
+python3 lemma_client.py uds /path/to/dianoia.sock
+```
+
+The `__main__` dispatch reads `sys.argv`: a leading `uds` runs `main_uds(...)`,
+any other argument is an HTTP base URL passed to `main(...)`, and no argument
+falls back to `main(DEFAULT_BASE)`. No network I/O occurs at import time.
 
 ## What it does
 
@@ -87,7 +102,10 @@ plain string — hence `rows=[["venus"]]`, not a tagged `#entity` literal.
 Tagged handles such as `#world` and `#proposal` do appear in the other replies
 shown above.
 
-## How it maps to the wire
+`main_uds()` runs the identical verb sequence and prints the same per-step
+lines; only the transport differs.
+
+## How HTTP maps to the wire
 
 | Concern | Implementation |
 |---|---|
@@ -96,6 +114,31 @@ shown above.
 | Anonymous call | `POST /v1/messages` with `(hello)` |
 | Named call | `POST /v1/sessions/{id}/messages`, echoing the id in the `x-lemma-session` request header |
 | Session id | Read from the `X-Lemma-Session` response header |
+
+## How UDS maps to the wire
+
+UDS carries the same EDN over a single persistent connection, with explicit
+framing instead of an HTTP envelope: a **4-byte big-endian length** prefix
+followed by that many **UTF-8 bytes** of EDN. `uds_send_frame` writes the frame
+(`struct.pack(">I", len(body))` then the body); `uds_recv_frame` reads the
+length, then exactly that many body bytes, then decodes UTF-8.
+
+The session handling is the key contrast with HTTP. Over UDS the **session is
+bound to the connection**: the server captures the id from the `:welcome`
+envelope and pins it to the socket, so the client sends no `X-Lemma-Session`
+header and never echoes a session id back — it just keeps sending frames on the
+same socket. (Over HTTP the id is threaded explicitly through the
+`X-Lemma-Session` header and the named `/v1/sessions/{id}/messages` endpoint.)
+
+| Concern | Implementation |
+|---|---|
+| Body format | EDN text, encoded UTF-8 by `uds_send_frame` |
+| Framing | 4-byte big-endian length prefix, then the body bytes |
+| Connection | One persistent `AF_UNIX` socket for every frame |
+| Anonymous call | `(hello)` as the first frame |
+| Session id | Bound to the connection by the server; never echoed by the client |
+
+## EDN codec
 
 Verb forms are EDN **lists** `( ... )`, modeled by the `Lst` wrapper so the
 writer emits parentheses. Arguments are **vectors** (plain Python `list`),
@@ -111,8 +154,8 @@ special-casing.
 
 A non-2xx response still carries a valid Lemma EDN error envelope; `post_edn`
 parses and returns it rather than raising, so the caller can inspect `:event`.
-A connection-level failure is re-raised as a `ConnectionError` naming the base
-URL.
+A connection-level failure is re-raised as a `ConnectionError`: `post_edn` names
+the base URL, and `main_uds` names the socket path.
 
 ## Tests
 
@@ -130,6 +173,8 @@ transport so the handshake is verified without a live server.
 
 ## References
 
-- `lemma_client.py` — the client, codec, transport, and runnable `main()`.
+- `lemma_client.py` — the codec, both transports (`post_edn` for HTTP,
+  `uds_send_frame`/`uds_recv_frame` for UDS), and the runnable `main()` /
+  `main_uds()` round-trips.
 - `../README.md` — project framing: these are from-scratch single-file
   recipes, not libraries.
