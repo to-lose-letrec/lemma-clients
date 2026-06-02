@@ -1,15 +1,24 @@
 # Python Lemma Client
 
-A single-file, standard-library-only Python 3 client that demonstrates the
-Lemma wire protocol against a local [Dianoia](https://github.com/to-lose-letrec/lemma)
-server. It speaks **both** transports Dianoia exposes: HTTP (the default) and a
-Unix domain socket. It carries no dependencies: a minimal EDN reader/writer is
-hand-rolled in the same file, and the same codec serializes both transports.
-Read `lemma_client.py` end to end — it is a recipe, not a library.
+A single-file Python 3 client that demonstrates the Lemma wire protocol against
+a local [Dianoia](https://github.com/to-lose-letrec/lemma) server. It speaks
+**both** transports Dianoia exposes: HTTP (the default) and a Unix domain
+socket. It leans on one third-party library — the `edn_format` EDN
+reader/writer — for the wire codec; everything else is the standard library.
+The same `edn_format.loads` / `edn_format.dumps` codec serializes both
+transports. Read `lemma_client.py` end to end — it is a recipe, not a library.
 
 ## Prerequisites
 
-- Python 3 (standard library only; no `pip install` step).
+- Python 3.
+- `edn_format`, the only third-party dependency:
+
+  ```sh
+  pip install edn_format
+  ```
+
+  Everything else the client uses is the standard library. This matches the
+  parent project's "standard library plus one EDN reader" demo budget.
 - A running Dianoia server reachable over HTTP or its Unix domain socket.
 
 ## Boot a local Dianoia
@@ -138,19 +147,43 @@ same socket. (Over HTTP the id is threaded explicitly through the
 | Anonymous call | `(hello)` as the first frame |
 | Session id | Bound to the connection by the server; never echoed by the client |
 
-## EDN codec
+## EDN encoding
 
-Verb forms are EDN **lists** `( ... )`, modeled by the `Lst` wrapper so the
-writer emits parentheses. Arguments are **vectors** (plain Python `list`),
-maps, and tagged literals (`Tagged`) — never lists. For example `:find [?o]`
-and `:where [[...]]` are vectors; only the verb head is an `Lst`.
+The client does not hand-roll a parser. It calls `edn_format.dumps` to encode
+Python values to EDN text and `edn_format.loads` to parse responses back. The
+Python-to-EDN type mapping is:
 
-The codec lives in the same file: `edn_write` serializes Python values to EDN,
-and `edn_read` / the `_Reader` recursive-descent parser turns EDN responses
-back into Python values. Keywords, symbols, and tagged literals map to the
-`Keyword`, `Symbol`, and `Tagged` types. Every `#tag payload` is wrapped
-uniformly as `Tagged`, so unknown tags (e.g. `#inst`) round-trip without
-special-casing.
+| EDN | Python (`edn_format`) |
+|---|---|
+| List `( ... )` — verb forms only | `tuple` |
+| Vector `[ ... ]` — the common case | `list` |
+| Map `{ k v }` | `dict` (read back as `ImmutableDict`) |
+| Keyword `:event` | `edn_format.Keyword` |
+| Symbol `equivalent`, `?o` | `edn_format.Symbol` |
+| Tagged literal `#tag payload` | `edn_format.TaggedElement` |
+
+The list/vector split is the one design decision the codec leans on: a **list**
+`( ... )` appears only as the top-level verb form (`(propose ...)`,
+`(query ...)`, `(hello)`), so it maps to a Python `tuple`; every collection
+inside the arguments is a **vector** `[ ... ]`, mapping to a Python `list`.
+For example `:find [?o]` and `:where [[...]]` are lists (vectors); only the
+verb head is a tuple.
+
+The ten core Lemma tagged literals — `#entity #world #fact #violation
+#proposal #tx #ref #cursor #watch #session` — are registered as
+`TaggedElement` classes so they round-trip in both directions: `loads`
+reconstructs the object from wire text and `dumps` re-emits the exact wire
+text. The eight string-payload tags (`#entity`, `#world`, `#proposal`, `#tx`,
+`#ref`, `#cursor`, `#watch`, `#session`) share one `_Handle` class; `#fact` and
+`#violation` carry a map. Tags that are not registered (e.g. `#inst`) fall back
+to `edn_format`'s built-in handlers, so an unexpected tag never breaks a
+response.
+
+Thin constructor helpers keep the round-trip code readable: `entity(name)` and
+`world(name)` build the corresponding `#entity` / `#world` handles, and
+`fact(predicate, subject, object)` builds a `#fact{...}` binary fact whose
+`:predicate` is a `Symbol` and whose `:subject` / `:object` are typically
+`#entity` handles.
 
 A non-2xx response still carries a valid Lemma EDN error envelope; `post_edn`
 parses and returns it rather than raising, so the caller can inspect `:event`.
@@ -159,22 +192,25 @@ the base URL, and `main_uds` names the socket path.
 
 ## Tests
 
-`test_lemma_client.py` is a standard-library `unittest` suite (no third-party
-dependency — it exercises the hand-rolled codec directly). From this `python/`
+`test_lemma_client.py` is a `unittest` suite. It imports `lemma_client`, so
+`edn_format` must be installed (see Prerequisites). From this `python/`
 directory:
 
 ```sh
 python3 -m unittest test_lemma_client
 ```
 
-It covers the EDN writer and reader (including round-trips, real response
-envelopes, and the unknown-tag fallback) and drives `main()` over a mocked
-transport so the handshake is verified without a live server.
+It covers the `edn_format` round-trips (including real response envelopes and
+the unregistered-tag fallback) and drives `main()` over a mocked transport so
+the handshake is verified without a live server.
 
 ## References
 
-- `lemma_client.py` — the codec, both transports (`post_edn` for HTTP,
-  `uds_send_frame`/`uds_recv_frame` for UDS), and the runnable `main()` /
-  `main_uds()` round-trips.
+- `lemma_client.py` — the `edn_format` tag registrations and constructor
+  helpers, both transports (`post_edn` for HTTP, `uds_send_frame` /
+  `uds_recv_frame` for UDS), and the runnable `main()` / `main_uds()`
+  round-trips.
+- [`edn_format`](https://pypi.org/project/edn_format/) — the EDN reader/writer
+  the codec is built on.
 - `../README.md` — project framing: these are from-scratch single-file
   recipes, not libraries.

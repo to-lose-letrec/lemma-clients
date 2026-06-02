@@ -1,28 +1,30 @@
 #!/usr/bin/env python3
-"""A single-file, stdlib-only Python client for the Lemma wire protocol.
+"""A single-file Python client for the Lemma wire protocol.
 
 This module is a *recipe*, not a library: it is meant to be read end to end.
 The first thing any Lemma client needs is a way to turn Python values into the
 EDN text the server speaks, and to turn the server's EDN responses back into
-Python values. That codec is all that lives in this file today; later additions
-(an HTTP transport and a runnable ``main()``) build directly on top of it.
+Python values. Rather than hand-roll that codec, this client leans on the
+``edn_format`` library (the one third-party dependency); everything else is
+stdlib. On top of the codec sit an HTTP transport, a UDS transport, and a
+runnable ``main()`` that walks the full propose/assert/query round-trip.
 
 EDN in a nutshell
 -----------------
 EDN (Extensible Data Notation) is Clojure's data syntax. Lemma uses a small,
 well-defined subset of it (see ``lemma/grammar/lemma.lark``). The pieces we
-care about:
+care about and their ``edn_format`` Python mappings:
 
-    nil true false              -- the three literals
-    42  -3  3.14  3.14e2         -- integers and floats
-    "a string\n"                -- double-quoted, backslash escapes
-    :event  :verbs/core         -- keywords (a leading ``:``)
-    equivalent  member-of  ?o   -- symbols (a bare name; ``?``-vars are symbols)
-    ( a b c )                   -- a LIST
-    [ a b c ]                   -- a VECTOR
-    { k v, k v }                -- a MAP (commas are whitespace)
-    #{ a b c }                  -- a SET
-    #tag payload                -- a TAGGED LITERAL, e.g. #entity "alice"
+    nil true false              -- None / True / False
+    42  -3  3.14  3.14e2         -- int / float
+    "a string\n"                -- str
+    :event  :verbs/core         -- edn_format.Keyword
+    equivalent  member-of  ?o   -- edn_format.Symbol (``?``-vars are symbols)
+    ( a b c )                   -- a Python TUPLE   (an EDN LIST)
+    [ a b c ]                   -- a Python LIST    (an EDN VECTOR)
+    { k v, k v }                -- a Python dict    (an EDN MAP)
+    #{ a b c }                  -- a Python set / frozenset
+    #tag payload                -- an edn_format.TaggedElement
 
 Lists versus vectors -- the one design decision
 -----------------------------------------------
@@ -32,607 +34,184 @@ verb form -- ``(propose ...)``, ``(query ...)``, ``(hello)``. Everywhere inside
 the arguments, collections are *vectors* (``:find [?x]``, ``:where [[...]]``),
 maps, or sets -- never lists.
 
-Python has no separate list/vector types, so we must choose a mapping:
+``edn_format`` already encodes this distinction in the Python type system, so
+we simply use it rather than inventing a wrapper:
 
-    * Python ``list``  -> EDN VECTOR ``[ ... ]``   (the overwhelmingly common case)
-    * the ``Lst`` wrapper in this module -> EDN LIST ``( ... )``  (verb forms only)
+    * Python ``tuple`` -> EDN LIST ``( ... )``   (verb forms only)
+    * Python ``list``  -> EDN VECTOR ``[ ... ]`` (the overwhelmingly common case)
 
-This keeps the two distinct and round-trippable, and makes the rare list
-(the verb form) explicit at the call site:
-
-    >>> edn_write(Lst([Symbol('use-world'), Tagged('world', 'default')]))
+    >>> dumps((Symbol("use-world"), world("default")))
     '(use-world #world "default")'
 
-On the read side the inverse holds: ``( ... )`` reads back as ``Lst``, and
-``[ ... ]`` reads back as a plain Python ``list``.
+On the read side ``edn_format.loads`` yields the inverse, so a verb form reads
+back as a tuple and a vector as a list.
 
-Unknown tags
-------------
-The reader is deliberately tolerant of tags. The ten core Lemma tags are
-``#fact #violation #entity #proposal #tx #ref #cursor #watch #session
-#world``, but responses also carry e.g. ``#inst "..."``. Rather than special-
-casing each, *every* ``#tag payload`` is wrapped uniformly as
-``Tagged(tag, payload)`` -- the same behaviour as Clojure's
-``{:default tagged-literal}``. This means an unknown tag never breaks parsing
-and always round-trips clean.
+Tagged literals
+---------------
+The ten core Lemma tags are ``#fact #violation #entity #proposal #tx #ref
+#cursor #watch #session #world`` (grammar §5). We register each as a
+``TaggedElement`` subclass so it round-trips in BOTH directions: ``loads``
+reconstructs the object from wire text, and ``dumps`` re-emits the exact wire
+text. ``#entity``, ``#world`` and the rest carry a string payload; ``#fact``
+and ``#violation`` carry a map. Tags we do not register (e.g. ``#inst``) are
+still parsed by ``edn_format``'s built-in handlers, so an unexpected tag never
+breaks a response.
+
+Importing this module performs no network I/O -- only ``main`` / ``main_uds``
+(and the ``__main__`` guard) touch the network.
 """
 
 from __future__ import annotations
 
-from typing import Any
+import edn_format
+from edn_format import Keyword, Symbol, TaggedElement, dumps, loads
+
+# ``loads`` returns an ImmutableDict for EDN maps, which is NOT a subclass of
+# dict; we test against both so the envelope-inspection helpers work on parsed
+# responses as well as on dicts we build ourselves.
+_MAPPING_TYPES = (dict, edn_format.ImmutableDict)
 
 
 # ---------------------------------------------------------------------------
-# Value types
+# Tagged literals:  #tag payload  <->  TaggedElement
 #
-# EDN has a few scalar kinds that Python lacks: keywords, symbols, and tagged
-# literals. We model each as a tiny immutable wrapper. Keyword and Symbol must
-# be hashable because they show up as map keys and set members.
+# A TaggedElement subclass needs two things: a ``name`` (the tag, sans ``#``)
+# and a ``__str__`` that renders the full ``#tag payload`` wire text. We split
+# the ten core tags by payload kind -- string handles versus map-bearing
+# #fact / #violation -- and register a reader for each so responses parse back
+# into these same objects.
+#
+# Note the space in ``#fact {...}`` / ``#tag "x"``: it is wire-valid (clojure
+# .edn ignores whitespace between a tag and its payload) and keeps the output
+# readable. The grammar's ``#fact{...}`` (no space) is equally legal on input.
 # ---------------------------------------------------------------------------
 
+# The eight tags whose payload is a single string (grammar §5, §5.3).
+_STRING_TAGS = ("entity", "world", "proposal", "tx", "ref", "cursor", "watch", "session")
 
-class Keyword:
-    """An EDN keyword: a ``:``-prefixed name such as ``:event`` or ``:verbs/core``.
 
-    The stored ``name`` always includes the leading colon, so it is exactly the
-    text that appears on the wire.
+class _Handle(TaggedElement):
+    """A string-payload tag such as ``#entity "alice"`` or ``#world "default"``.
+
+    ``name`` is the tag without the leading ``#``; ``value`` is the string
+    payload. The single class backs all eight string-payload tags -- which tag
+    a given instance represents is just its ``name``.
     """
 
-    __slots__ = ("name",)
-
-    def __init__(self, name: str) -> None:
-        if not name.startswith(":"):
-            raise ValueError(f"keyword name must start with ':', got {name!r}")
+    def __init__(self, name, value):
         self.name = name
-
-    def __eq__(self, other: object) -> bool:
-        return isinstance(other, Keyword) and other.name == self.name
-
-    def __hash__(self) -> int:
-        # Tag the hash with the type so a Keyword and a Symbol of the "same"
-        # spelling never collide in a dict or set.
-        return hash(("Keyword", self.name))
-
-    def __repr__(self) -> str:
-        return f"Keyword({self.name!r})"
-
-
-class Symbol:
-    """An EDN symbol: a bare name such as ``equivalent``, ``member-of``, or ``?o``.
-
-    Query variables (``?x``) are ordinary symbols whose name happens to start
-    with ``?``; no separate type is needed.
-    """
-
-    __slots__ = ("name",)
-
-    def __init__(self, name: str) -> None:
-        if not name:
-            raise ValueError("symbol name must be non-empty")
-        self.name = name
-
-    def __eq__(self, other: object) -> bool:
-        return isinstance(other, Symbol) and other.name == self.name
-
-    def __hash__(self) -> int:
-        return hash(("Symbol", self.name))
-
-    def __repr__(self) -> str:
-        return f"Symbol({self.name!r})"
-
-
-class Tagged:
-    """An EDN tagged literal: ``#tag payload``.
-
-    ``tag`` is the tag name *without* the leading ``#`` (e.g. ``"entity"``,
-    ``"world"``, ``"fact"``). ``value`` is the already-parsed payload, which may
-    be any EDN value -- a string for ``#entity "alice"``, a map for
-    ``#fact{...}``, and so on.
-    """
-
-    __slots__ = ("tag", "value")
-
-    def __init__(self, tag: str, value: Any) -> None:
-        if not tag:
-            raise ValueError("tag name must be non-empty")
-        self.tag = tag
         self.value = value
 
-    def __eq__(self, other: object) -> bool:
+    def __str__(self):
+        return f"#{self.name} {dumps(self.value)}"
+
+    def __eq__(self, other):
         return (
-            isinstance(other, Tagged)
-            and other.tag == self.tag
+            isinstance(other, _Handle)
+            and other.name == self.name
             and other.value == self.value
         )
 
-    def __hash__(self) -> int:
-        # Hashable when the payload is; mirrors EDN where tagged literals can
-        # appear as set members / map keys (e.g. #entity "alice").
-        return hash(("Tagged", self.tag, _hashable(self.value)))
+    def __hash__(self):
+        return hash(("_Handle", self.name, self.value))
 
-    def __repr__(self) -> str:
-        return f"Tagged({self.tag!r}, {self.value!r})"
+    def __repr__(self):
+        return f"_Handle({self.name!r}, {self.value!r})"
 
 
-class Lst:
-    """An EDN list ``( ... )`` -- used *only* for the top-level verb form.
+# Register a reader for each string-payload tag. The inner factory binds the
+# tag name per-iteration so every handler builds a _Handle with the right name.
+for _tag in _STRING_TAGS:
+    edn_format.add_tag(_tag, (lambda t: (lambda v: _Handle(t, v)))(_tag))
 
-    Wrap the items of a verb call in this so the writer emits parentheses
-    rather than the vector brackets a plain Python ``list`` produces. See the
-    module docstring for the full rationale.
 
-        >>> Lst([Symbol('hello')])
-        Lst([Symbol('hello')])
+class _Fact(TaggedElement):
+    """The ``#fact{...}`` tag (grammar §5.1) -- a map payload.
+
+    The map carries some combination of ``:predicate`` / ``:subject`` /
+    ``:object`` / ``:args``; we keep it verbatim and let the server enforce the
+    legal shapes.
     """
 
-    __slots__ = ("items",)
+    name = "fact"
 
-    def __init__(self, items: Any = ()) -> None:
-        self.items = list(items)
+    def __init__(self, value):
+        self.value = value
 
-    def __eq__(self, other: object) -> bool:
-        return isinstance(other, Lst) and other.items == self.items
+    def __str__(self):
+        return f"#fact {dumps(self.value)}"
 
-    def __iter__(self):
-        return iter(self.items)
+    def __eq__(self, other):
+        return isinstance(other, _Fact) and other.value == self.value
 
-    def __len__(self) -> int:
-        return len(self.items)
-
-    def __repr__(self) -> str:
-        return f"Lst({self.items!r})"
+    def __repr__(self):
+        return f"_Fact({self.value!r})"
 
 
-def _hashable(value: Any) -> Any:
-    """Best-effort coercion of an EDN payload into something hashable.
+class _Violation(TaggedElement):
+    """The ``#violation{...}`` tag (grammar §5.2) -- a server-emitted map payload.
 
-    Only needed so a ``Tagged`` wrapping a non-hashable payload (a map, say)
-    can still report *a* hash. Lists/maps become their repr; everything else is
-    returned as-is.
+    Registered so a violation in a response parses into an object that
+    round-trips cleanly back onto the wire if an agent feeds it into a later
+    query or argument position.
     """
-    try:
-        hash(value)
-        return value
-    except TypeError:
-        return repr(value)
+
+    name = "violation"
+
+    def __init__(self, value):
+        self.value = value
+
+    def __str__(self):
+        return f"#violation {dumps(self.value)}"
+
+    def __eq__(self, other):
+        return isinstance(other, _Violation) and other.value == self.value
+
+    def __repr__(self):
+        return f"_Violation({self.value!r})"
+
+
+edn_format.add_tag("fact", _Fact)
+edn_format.add_tag("violation", _Violation)
 
 
 # ---------------------------------------------------------------------------
-# Writer:  Python value  ->  EDN text
-# ---------------------------------------------------------------------------
-
-# String escapes, per the grammar's STRING terminal. We escape the backslash
-# first so we never double-process an escape we just introduced.
-_STRING_ESCAPES = {
-    "\\": "\\\\",
-    '"': '\\"',
-    "\n": "\\n",
-    "\t": "\\t",
-    "\r": "\\r",
-}
-
-
-def _write_string(s: str) -> str:
-    """Render a Python ``str`` as a double-quoted EDN string with escapes."""
-    out = ['"']
-    for ch in s:
-        out.append(_STRING_ESCAPES.get(ch, ch))
-    out.append('"')
-    return "".join(out)
-
-
-def edn_write(value: Any) -> str:
-    """Serialize a Python value to canonical EDN text.
-
-    Supported inputs and their renderings:
-
-        None / True / False    -> nil / true / false
-        int / float            -> their literal text
-        str                    -> "..."  (with \\ " \\n \\t \\r escaped)
-        Keyword(':event')      -> :event
-        Symbol('equivalent')   -> equivalent
-        list  [a, b, c]        -> [a b c]      (EDN VECTOR)
-        Lst([a, b, c])         -> (a b c)      (EDN LIST -- verb forms only)
-        tuple (a, b, c)        -> [a b c]      (treated as a vector too)
-        dict  {k: v}           -> {k v k v}
-        set / frozenset        -> #{a b c}
-        Tagged(tag, payload)   -> #tag <payload>
-    """
-    # Order matters: bool is a subclass of int, so test it first.
-    if value is None:
-        return "nil"
-    if value is True:
-        return "true"
-    if value is False:
-        return "false"
-    if isinstance(value, (int, float)):
-        return repr(value)
-    if isinstance(value, str):
-        return _write_string(value)
-    if isinstance(value, Keyword):
-        return value.name
-    if isinstance(value, Symbol):
-        return value.name
-    if isinstance(value, Tagged):
-        return _write_tagged(value)
-    if isinstance(value, Lst):
-        return "(" + " ".join(edn_write(v) for v in value.items) + ")"
-    if isinstance(value, (list, tuple)):
-        return "[" + " ".join(edn_write(v) for v in value) + "]"
-    if isinstance(value, dict):
-        parts = []
-        for k, v in value.items():
-            parts.append(edn_write(k))
-            parts.append(edn_write(v))
-        return "{" + " ".join(parts) + "}"
-    if isinstance(value, (set, frozenset)):
-        return "#{" + " ".join(edn_write(v) for v in value) + "}"
-    raise TypeError(f"cannot EDN-encode value of type {type(value).__name__}: {value!r}")
-
-
-def _write_tagged(t: Tagged) -> str:
-    """Render ``#tag payload``.
-
-    EDN wants a separator between the tag and a scalar/symbol payload
-    (``#entity "alice"``), but a collection payload may abut the tag directly
-    (``#fact{...}``). We emit a space before anything that does not open with
-    its own delimiter, which keeps the output both legal and tidy.
-    """
-    payload = edn_write(t.value)
-    sep = "" if payload[:1] in ("{", "[", "(") else " "
-    return f"#{t.tag}{sep}{payload}"
-
-
-# ---------------------------------------------------------------------------
-# Reader:  EDN text  ->  Python value
+# Constructor helpers
 #
-# A small recursive-descent reader over the subset above. It keeps a cursor
-# (an index into the source) and advances it as it consumes tokens.
+# Thin wrappers so the round-trip code below reads as prose rather than as a
+# wall of tag-class constructions. They mirror the grammar's payload shapes.
 # ---------------------------------------------------------------------------
 
-# Characters that may begin or be part of a symbol/keyword name. We are a touch
-# more permissive than the grammar's exact class -- enough to read everything
-# the server emits without re-deriving the regex character classes here.
-_SYMBOL_CHARS = set(
-    "abcdefghijklmnopqrstuvwxyz"
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-    "0123456789"
-    "_*!?+-=<>$&./:"
-)
 
-# EDN treats commas as whitespace.
-_WHITESPACE = set(" \t\r\n,")
-
-# String escapes recognised by the reader, inverse of the writer's table plus
-# the extra forms the grammar permits (\b, \f).
-_READ_ESCAPES = {
-    '"': '"',
-    "\\": "\\",
-    "n": "\n",
-    "t": "\t",
-    "r": "\r",
-    "b": "\b",
-    "f": "\f",
-}
+def entity(name):
+    """Build an ``#entity "<name>"`` handle (grammar §5.3)."""
+    return _Handle("entity", name)
 
 
-class EDNReadError(ValueError):
-    """Raised when the reader encounters input it cannot parse."""
+def world(name):
+    """Build a ``#world "<name>"`` handle (grammar §5)."""
+    return _Handle("world", name)
 
 
-class _Reader:
-    """Stateful cursor over an EDN source string."""
+def fact(predicate, subject, object):
+    """Build a ``#fact{...}`` binary fact: ``(predicate subject object)``.
 
-    def __init__(self, text: str) -> None:
-        self.text = text
-        self.pos = 0
-        self.len = len(text)
-
-    # -- low-level cursor helpers ------------------------------------------
-
-    def _peek(self) -> str:
-        return self.text[self.pos] if self.pos < self.len else ""
-
-    def _next(self) -> str:
-        ch = self.text[self.pos]
-        self.pos += 1
-        return ch
-
-    def _error(self, msg: str) -> EDNReadError:
-        return EDNReadError(f"{msg} at position {self.pos}")
-
-    def _skip_ws(self) -> None:
-        """Consume whitespace, commas, and ``;`` line comments."""
-        while self.pos < self.len:
-            ch = self.text[self.pos]
-            if ch in _WHITESPACE:
-                self.pos += 1
-            elif ch == ";":
-                # Line comment: skip to end of line (or end of input).
-                while self.pos < self.len and self.text[self.pos] != "\n":
-                    self.pos += 1
-            else:
-                break
-
-    # -- the value dispatcher ----------------------------------------------
-
-    def read_value(self) -> Any:
-        """Read and return the next complete EDN value."""
-        self._skip_ws()
-        if self.pos >= self.len:
-            raise self._error("unexpected end of input")
-
-        ch = self._peek()
-
-        if ch == "(":
-            return self._read_seq("(", ")", Lst)
-        if ch == "[":
-            return self._read_seq("[", "]", list)
-        if ch == "{":
-            return self._read_map()
-        if ch == '"':
-            return self._read_string()
-        if ch == ":":
-            return self._read_keyword()
-        if ch == "#":
-            return self._read_dispatch()
-        if ch == "^":
-            return self._read_metadata()
-        if ch == "\\":
-            return self._read_char()
-        if ch == "-" or ch == "+" or ch.isdigit():
-            return self._read_number_or_symbol()
-        if ch in _SYMBOL_CHARS or ch == "?":
-            return self._read_symbol_or_literal()
-
-        raise self._error(f"unexpected character {ch!r}")
-
-    def _read_metadata(self) -> Any:
-        """Read ``^{...}`` metadata and return the value it adorns.
-
-        The grammar (§3) admits metadata as an optional prefix on any value. It
-        is a client-side adornment the server may ignore, so the reader parses
-        the metadata map for well-formedness and discards it, returning the
-        value that follows.
-        """
-        assert self._next() == "^"
-        self._skip_ws()
-        if self._peek() != "{":
-            raise self._error("expected '{' after metadata '^'")
-        self._read_map()  # parse and discard the metadata map
-        return self.read_value()
-
-    def _read_char(self) -> str:
-        r"""Read an EDN character literal: ``\newline``, ``\space``, ``\uXXXX``,
-        or ``\<single char>``. Returned as a one-character Python ``str``."""
-        assert self._next() == "\\"
-        named = {
-            "newline": "\n",
-            "space": " ",
-            "tab": "\t",
-            "return": "\r",
-            "formfeed": "\f",
-            "backspace": "\b",
-        }
-        # Unicode escape: \uXXXX
-        if self._peek() == "u" and self.text[self.pos + 1 : self.pos + 5].isalnum() \
-                and len(self.text[self.pos + 1 : self.pos + 5]) == 4:
-            hexits = self.text[self.pos + 1 : self.pos + 5]
-            if all(c in "0123456789abcdefABCDEF" for c in hexits):
-                self.pos += 5
-                return chr(int(hexits, 16))
-        # Named character: read the alphabetic run and look it up.
-        start = self.pos
-        while self.pos < self.len and self.text[self.pos].isalpha():
-            self.pos += 1
-        word = self.text[start : self.pos]
-        if len(word) > 1 and word in named:
-            return named[word]
-        # Single-character literal: rewind to just the first char.
-        self.pos = start + 1
-        if start >= self.len:
-            raise self._error("expected a character after '\\'")
-        return self.text[start]
-
-    # -- collections --------------------------------------------------------
-
-    def _read_seq(self, open_ch: str, close_ch: str, ctor) -> Any:
-        """Read a delimited sequence of values into ``ctor(items)``.
-
-        Used for both lists ``( )`` -> ``Lst`` and vectors ``[ ]`` -> ``list``.
-        """
-        assert self._next() == open_ch
-        items = []
-        while True:
-            self._skip_ws()
-            if self.pos >= self.len:
-                raise self._error(f"unterminated sequence, expected {close_ch!r}")
-            if self._peek() == close_ch:
-                self.pos += 1
-                return ctor(items)
-            items.append(self.read_value())
-
-    def _read_map(self) -> dict:
-        """Read a ``{ k v, k v }`` map. Keys keep their parsed type."""
-        assert self._next() == "{"
-        result: dict = {}
-        while True:
-            self._skip_ws()
-            if self.pos >= self.len:
-                raise self._error("unterminated map, expected '}'")
-            if self._peek() == "}":
-                self.pos += 1
-                return result
-            key = self.read_value()
-            self._skip_ws()
-            if self.pos >= self.len or self._peek() == "}":
-                raise self._error("map key without a value")
-            result[key] = self.read_value()
-
-    def _read_set(self) -> set:
-        """Read a ``#{ a b c }`` set (the leading ``#`` is already consumed)."""
-        assert self._next() == "{"
-        items = []
-        while True:
-            self._skip_ws()
-            if self.pos >= self.len:
-                raise self._error("unterminated set, expected '}'")
-            if self._peek() == "}":
-                self.pos += 1
-                return set(items)
-            items.append(self.read_value())
-
-    # -- scalars ------------------------------------------------------------
-
-    def _read_string(self) -> str:
-        """Read a double-quoted string, decoding escapes incl. ``\\uXXXX``."""
-        assert self._next() == '"'
-        out = []
-        while True:
-            if self.pos >= self.len:
-                raise self._error("unterminated string")
-            ch = self._next()
-            if ch == '"':
-                return "".join(out)
-            if ch == "\\":
-                if self.pos >= self.len:
-                    raise self._error("unterminated escape in string")
-                esc = self._next()
-                if esc == "u":
-                    hexits = self.text[self.pos : self.pos + 4]
-                    if len(hexits) != 4 or any(
-                        c not in "0123456789abcdefABCDEF" for c in hexits
-                    ):
-                        raise self._error("malformed \\u escape")
-                    self.pos += 4
-                    out.append(chr(int(hexits, 16)))
-                elif esc in _READ_ESCAPES:
-                    out.append(_READ_ESCAPES[esc])
-                else:
-                    raise self._error(f"unknown escape \\{esc}")
-            else:
-                out.append(ch)
-
-    def _read_keyword(self) -> Keyword:
-        """Read a ``:``-prefixed keyword. Keeps the colon in ``name``."""
-        start = self.pos
-        self.pos += 1  # consume ':'
-        while self.pos < self.len and self.text[self.pos] in _SYMBOL_CHARS:
-            self.pos += 1
-        name = self.text[start : self.pos]
-        if name == ":":
-            raise self._error("empty keyword")
-        return Keyword(name)
-
-    def _read_token(self) -> str:
-        """Consume a run of symbol/keyword characters and return it."""
-        start = self.pos
-        while self.pos < self.len and self.text[self.pos] in _SYMBOL_CHARS:
-            self.pos += 1
-        return self.text[start : self.pos]
-
-    def _read_symbol_or_literal(self) -> Any:
-        """Read a bare token: ``nil`` / ``true`` / ``false`` or a Symbol.
-
-        ``?``-prefixed query variables arrive here too and become Symbols.
-        """
-        if self._peek() == "?":
-            # Variable: the leading '?' then a run of symbol characters.
-            start = self.pos
-            self.pos += 1  # consume '?'
-            while self.pos < self.len and self.text[self.pos] in _SYMBOL_CHARS:
-                self.pos += 1
-            return Symbol(self.text[start : self.pos])
-
-        token = self._read_token()
-        if token == "nil":
-            return None
-        if token == "true":
-            return True
-        if token == "false":
-            return False
-        if token == "":
-            raise self._error("expected a symbol")
-        return Symbol(token)
-
-    def _read_number_or_symbol(self) -> Any:
-        """Read a numeric literal, or a symbol that merely starts with a sign.
-
-        Bare ``-`` / ``+`` (as in the symbol ``member-of``'s head, or a lone
-        operator) is not a number; we only treat the token as numeric when it
-        parses as one.
-        """
-        token = self._read_token()
-        as_num = _parse_number(token)
-        if as_num is not None:
-            return as_num
-        # Not numeric -- it is a symbol (e.g. a sign-led operator name).
-        if token in ("", "+", "-"):
-            # A standalone sign is a legal symbol head in EDN operator names,
-            # but with nothing following it is just that symbol.
-            if token == "":
-                raise self._error("expected a number or symbol")
-        return Symbol(token)
-
-    # -- dispatch (#) -------------------------------------------------------
-
-    def _read_dispatch(self) -> Any:
-        """Handle ``#``-led forms: ``#{ ... }`` sets and ``#tag payload``."""
-        assert self._next() == "#"
-        if self._peek() == "{":
-            return self._read_set()
-        # Tagged literal: read the tag name, then its payload value.
-        tag = self._read_token()
-        if not tag:
-            raise self._error("expected a tag name after '#'")
-        payload = self.read_value()
-        return Tagged(tag, payload)
-
-
-def _parse_number(token: str):
-    """Return an int or float for ``token``, or ``None`` if it is not numeric.
-
-    Tolerates the EDN bigint/bigdecimal suffixes ``N`` and ``M`` by stripping a
-    single trailing one before delegating to Python's own parsers.
+    ``predicate`` is a Symbol; ``subject`` / ``object`` are typically
+    ``#entity`` handles. The keys are the grammar's reserved fact keys.
     """
-    if not token:
-        return None
-    body = token
-    if body[-1] in ("N", "M"):
-        body = body[:-1]
-    # Reject things that are clearly not numbers fast.
-    if not any(c.isdigit() for c in body):
-        return None
-    try:
-        return int(body)
-    except ValueError:
-        pass
-    try:
-        return float(body)
-    except ValueError:
-        return None
-
-
-def edn_read(text: str) -> Any:
-    """Parse one EDN value from ``text`` and return the Python representation.
-
-    Trailing whitespace and comments are tolerated; trailing *data* is an
-    error (a single message is one value).
-    """
-    reader = _Reader(text)
-    value = reader.read_value()
-    reader._skip_ws()
-    if reader.pos != reader.len:
-        raise reader._error("unexpected trailing data")
-    return value
+    return _Fact({
+        Keyword("predicate"): predicate,
+        Keyword("subject"): subject,
+        Keyword("object"): object,
+    })
 
 
 # ---------------------------------------------------------------------------
 # HTTP transport:  EDN form  ->  POST  ->  parsed EDN response
 #
 # With the codec in hand, talking to a Lemma server is just "encode, POST,
-# decode". This is the second layer the module docstring promised: a flat
-# stdlib-only helper, not an abstraction. The session protocol (SPEC §3) is:
+# decode". A flat stdlib-only helper, not an abstraction. The session protocol
+# (SPEC §3) is:
 #
 #   * The first call is anonymous: POST /v1/messages with (hello). The
 #     :welcome response carries the new session id in the X-Lemma-Session
@@ -657,10 +236,10 @@ DEFAULT_BASE = "http://127.0.0.1:8080"
 def post_edn(path, form, session=None, base=DEFAULT_BASE):
     """POST an EDN ``form`` to ``base + path`` and return ``(body, session_id)``.
 
-    ``form`` is any value ``edn_write`` accepts -- typically a ``Lst`` verb
-    call such as ``Lst([Symbol('hello')])``. It is encoded to EDN text, sent
+    ``form`` is any value ``edn_format.dumps`` accepts -- typically a tuple
+    verb call such as ``(Symbol("hello"),)``. It is encoded to EDN text, sent
     as ``application/edn`` UTF-8 bytes, and the response body is parsed back
-    into Python values with ``edn_read``.
+    into Python values with ``edn_format.loads``.
 
     Parameters
     ----------
@@ -690,7 +269,7 @@ def post_edn(path, form, session=None, base=DEFAULT_BASE):
     from an error. A connection-level failure (server down, refused) is
     re-raised as a ``ConnectionError`` that names the ``base`` URL.
     """
-    payload = edn_write(form).encode("utf-8")
+    payload = dumps(form).encode("utf-8")
 
     headers = {"content-type": "application/edn"}
     if session is not None:
@@ -710,7 +289,7 @@ def post_edn(path, form, session=None, base=DEFAULT_BASE):
         # and surface the session header if the server set one.
         raw = err.read().decode("utf-8")
         session_id = err.headers.get("X-Lemma-Session")
-        return edn_read(raw), session_id
+        return loads(raw), session_id
     except urllib.error.URLError as err:
         # No HTTP status at all -- we never reached a Lemma server. Name the
         # endpoint so the failure is actionable rather than a bare errno.
@@ -719,7 +298,7 @@ def post_edn(path, form, session=None, base=DEFAULT_BASE):
             "is the server running?"
         ) from err
 
-    return edn_read(raw), session_id
+    return loads(raw), session_id
 
 
 # ---------------------------------------------------------------------------
@@ -741,7 +320,8 @@ def post_edn(path, form, session=None, base=DEFAULT_BASE):
 #     must NOT echo the session id into later frames -- it just keeps sending
 #     on the same socket, and the server already knows who it is.
 #
-# Stdlib only: socket for the connection, struct for the length prefix.
+# Stdlib only for the plumbing: socket for the connection, struct for the
+# length prefix; the EDN codec is edn_format.
 # ---------------------------------------------------------------------------
 
 import socket
@@ -798,22 +378,20 @@ def uds_recv_frame(sock):
 # ---------------------------------------------------------------------------
 # Runnable recipe:  the full Lemma round-trip
 #
-# This is the third and final layer the module docstring promised. It is a
-# flat, linear retelling of examples/hello-http.clj: say hello, enter a world,
-# propose a fact, assert it, query it back. Each step prints one human-readable
-# line so a reader can follow the wire conversation by running the file.
-#
-# Everything network-y lives here (or in the __main__ guard) -- importing the
-# module performs no I/O.
+# A flat, linear retelling of examples/hello-http.clj: say hello, enter a
+# world, propose a fact, assert it, query it back. Each step prints one
+# human-readable line so a reader can follow the wire conversation by running
+# the file. Everything network-y lives here (or in the __main__ guard) --
+# importing the module performs no I/O.
 # ---------------------------------------------------------------------------
 
 import sys
 
 # The fields every reply may carry. Pulled out so the step-by-step code below
 # reads as prose rather than a wall of Keyword(...) constructions.
-_EVENT = Keyword(":event")
-_ERROR = Keyword(":error")
-_REJECTED = Keyword(":rejected")
+_EVENT = Keyword("event")
+_ERROR = Keyword("error")
+_REJECTED = Keyword("rejected")
 
 
 def _is_failure(body):
@@ -823,7 +401,7 @@ def _is_failure(body):
     server refused the request: ``:error`` (malformed / illegal) and
     ``:rejected`` (well-formed but disallowed, e.g. a consistency violation).
     """
-    event = body.get(_EVENT) if isinstance(body, dict) else None
+    event = body.get(_EVENT) if isinstance(body, _MAPPING_TYPES) else None
     return event if event in (_ERROR, _REJECTED) else None
 
 
@@ -834,10 +412,10 @@ def _describe_failure(body):
     included; these are the fields that explain *why* a call was refused.
     """
     parts = []
-    for key in (":reason", ":message", ":violations"):
-        value = body.get(Keyword(key)) if isinstance(body, dict) else None
+    for key in ("reason", "message", "violations"):
+        value = body.get(Keyword(key)) if isinstance(body, _MAPPING_TYPES) else None
         if value is not None:
-            parts.append(f"{key} {edn_write(value)}")
+            parts.append(f":{key} {dumps(value)}")
     return "; ".join(parts) if parts else "(no detail provided)"
 
 
@@ -850,14 +428,14 @@ def main(base=DEFAULT_BASE):
     """
     # 1. Anonymous hello. The welcome reply carries the new session id in the
     #    X-Lemma-Session response header, which post_edn surfaces for us.
-    body, sid = post_edn("/v1/messages", Lst([Symbol("hello")]), base=base)
-    if not isinstance(body, dict) or body.get(_EVENT) != Keyword(":welcome"):
-        event = body.get(_EVENT) if isinstance(body, dict) else None
-        print(f"hello: expected :welcome, got {edn_write(event)}"
+    body, sid = post_edn("/v1/messages", (Symbol("hello"),), base=base)
+    if not isinstance(body, _MAPPING_TYPES) or body.get(_EVENT) != Keyword("welcome"):
+        event = body.get(_EVENT) if isinstance(body, _MAPPING_TYPES) else None
+        print(f"hello: expected :welcome, got {dumps(event)}"
               f" -- {_describe_failure(body)}")
         return
-    print(f"hello -> :welcome  version={edn_write(body.get(Keyword(':version')))}"
-          f"  session={sid}  world={edn_write(body.get(Keyword(':world')))}")
+    print(f"hello -> :welcome  version={dumps(body.get(Keyword('version')))}"
+          f"  session={sid}  world={dumps(body.get(Keyword('world')))}")
 
     # 2. Every later call rides the same session, on the named endpoint.
     named = lambda form: post_edn(
@@ -865,46 +443,42 @@ def main(base=DEFAULT_BASE):
     )
 
     # 3. Enter the world. (use-world #world "default")
-    body, _ = named(Lst([Symbol("use-world"), Tagged("world", "default")]))
+    body, _ = named((Symbol("use-world"), world("default")))
     if _is_failure(body):
         print(f"use-world refused: {_describe_failure(body)}")
         return
-    print(f"use-world \"default\" -> {edn_write(body.get(_EVENT))}"
-          f"  world={edn_write(body.get(Keyword(':world')))}")
+    print(f"use-world \"default\" -> {dumps(body.get(_EVENT))}"
+          f"  world={dumps(body.get(Keyword('world')))}")
 
     # 4. Propose a fact: morningstar is equivalent to venus. The reply hands
     #    back a #proposal handle we feed straight into the assert.
-    fact = Tagged("fact", {
-        Keyword(":predicate"): Symbol("equivalent"),
-        Keyword(":subject"): Tagged("entity", "morningstar"),
-        Keyword(":object"): Tagged("entity", "venus"),
-    })
-    body, _ = named(Lst([Symbol("propose"), fact]))
+    f = fact(Symbol("equivalent"), entity("morningstar"), entity("venus"))
+    body, _ = named((Symbol("propose"), f))
     if _is_failure(body):
         print(f"propose refused: {_describe_failure(body)}")
         return
-    proposal = body.get(Keyword(":proposal"))
-    print(f"propose (equivalent morningstar venus) -> {edn_write(body.get(_EVENT))}"
-          f"  proposal={edn_write(proposal)}")
+    proposal = body.get(Keyword("proposal"))
+    print(f"propose (equivalent morningstar venus) -> {dumps(body.get(_EVENT))}"
+          f"  proposal={dumps(proposal)}")
 
     # 5. Assert the proposed fact into the world.
-    body, _ = named(Lst([Symbol("assert"), proposal]))
+    body, _ = named((Symbol("assert"), proposal))
     if _is_failure(body):
         print(f"assert refused: {_describe_failure(body)}")
         return
-    print(f"assert proposal -> {edn_write(body.get(_EVENT))}")
+    print(f"assert proposal -> {dumps(body.get(_EVENT))}")
 
     # 6. Query it back. Note :find / :where are VECTORS (Python lists), and the
-    #    where-clause is a vector of vectors; only the verb head is a Lst.
-    body, _ = named(Lst([Symbol("query"), {
-        Keyword(":find"): [Symbol("?o")],
-        Keyword(":where"): [[Symbol("equivalent"), Tagged("entity", "morningstar"), Symbol("?o")]],
-    }]))
+    #    where-clause is a vector of vectors; only the verb head is a tuple.
+    body, _ = named((Symbol("query"), {
+        Keyword("find"): [Symbol("?o")],
+        Keyword("where"): [[Symbol("equivalent"), entity("morningstar"), Symbol("?o")]],
+    }))
     if _is_failure(body):
         print(f"query refused: {_describe_failure(body)}")
         return
-    print(f"query (equivalent morningstar ?o) -> rows={edn_write(body.get(Keyword(':rows')))}"
-          f"  done?={edn_write(body.get(Keyword(':done?')))}")
+    print(f"query (equivalent morningstar ?o) -> rows={dumps(body.get(Keyword('rows')))}"
+          f"  done?={dumps(body.get(Keyword('done?')))}")
 
 
 def main_uds(socket_path=DEFAULT_SOCKET):
@@ -935,62 +509,58 @@ def main_uds(socket_path=DEFAULT_SOCKET):
         # One round-trip: frame out, frame in, decode. The session lives on the
         # connection -- no id is echoed back, unlike the HTTP transport.
         def call(form):
-            uds_send_frame(sock, edn_write(form))
-            return edn_read(uds_recv_frame(sock))
+            uds_send_frame(sock, dumps(form))
+            return loads(uds_recv_frame(sock))
 
         # 1. Anonymous hello. The welcome reply carries the session id, which
         #    the server has already pinned to this connection for us.
-        body = call(Lst([Symbol("hello")]))
-        if not isinstance(body, dict) or body.get(_EVENT) != Keyword(":welcome"):
-            event = body.get(_EVENT) if isinstance(body, dict) else None
-            print(f"hello: expected :welcome, got {edn_write(event)}"
+        body = call((Symbol("hello"),))
+        if not isinstance(body, _MAPPING_TYPES) or body.get(_EVENT) != Keyword("welcome"):
+            event = body.get(_EVENT) if isinstance(body, _MAPPING_TYPES) else None
+            print(f"hello: expected :welcome, got {dumps(event)}"
                   f" -- {_describe_failure(body)}")
             return
-        print(f"hello -> :welcome  version={edn_write(body.get(Keyword(':version')))}"
-              f"  session={edn_write(body.get(Keyword(':session')))}"
-              f"  world={edn_write(body.get(Keyword(':world')))}")
+        print(f"hello -> :welcome  version={dumps(body.get(Keyword('version')))}"
+              f"  session={dumps(body.get(Keyword('session')))}"
+              f"  world={dumps(body.get(Keyword('world')))}")
 
         # 2. Enter the world. (use-world #world "default")
-        body = call(Lst([Symbol("use-world"), Tagged("world", "default")]))
+        body = call((Symbol("use-world"), world("default")))
         if _is_failure(body):
             print(f"use-world refused: {_describe_failure(body)}")
             return
-        print(f"use-world \"default\" -> {edn_write(body.get(_EVENT))}"
-              f"  world={edn_write(body.get(Keyword(':world')))}")
+        print(f"use-world \"default\" -> {dumps(body.get(_EVENT))}"
+              f"  world={dumps(body.get(Keyword('world')))}")
 
         # 3. Propose a fact: morningstar is equivalent to venus. The reply hands
         #    back a #proposal handle we feed straight into the assert.
-        fact = Tagged("fact", {
-            Keyword(":predicate"): Symbol("equivalent"),
-            Keyword(":subject"): Tagged("entity", "morningstar"),
-            Keyword(":object"): Tagged("entity", "venus"),
-        })
-        body = call(Lst([Symbol("propose"), fact]))
+        f = fact(Symbol("equivalent"), entity("morningstar"), entity("venus"))
+        body = call((Symbol("propose"), f))
         if _is_failure(body):
             print(f"propose refused: {_describe_failure(body)}")
             return
-        proposal = body.get(Keyword(":proposal"))
-        print(f"propose (equivalent morningstar venus) -> {edn_write(body.get(_EVENT))}"
-              f"  proposal={edn_write(proposal)}")
+        proposal = body.get(Keyword("proposal"))
+        print(f"propose (equivalent morningstar venus) -> {dumps(body.get(_EVENT))}"
+              f"  proposal={dumps(proposal)}")
 
         # 4. Assert the proposed fact into the world.
-        body = call(Lst([Symbol("assert"), proposal]))
+        body = call((Symbol("assert"), proposal))
         if _is_failure(body):
             print(f"assert refused: {_describe_failure(body)}")
             return
-        print(f"assert proposal -> {edn_write(body.get(_EVENT))}")
+        print(f"assert proposal -> {dumps(body.get(_EVENT))}")
 
         # 5. Query it back. As in the HTTP path, :find / :where are VECTORS
-        #    (Python lists); only the verb head is a Lst.
-        body = call(Lst([Symbol("query"), {
-            Keyword(":find"): [Symbol("?o")],
-            Keyword(":where"): [[Symbol("equivalent"), Tagged("entity", "morningstar"), Symbol("?o")]],
-        }]))
+        #    (Python lists); only the verb head is a tuple.
+        body = call((Symbol("query"), {
+            Keyword("find"): [Symbol("?o")],
+            Keyword("where"): [[Symbol("equivalent"), entity("morningstar"), Symbol("?o")]],
+        }))
         if _is_failure(body):
             print(f"query refused: {_describe_failure(body)}")
             return
-        print(f"query (equivalent morningstar ?o) -> rows={edn_write(body.get(Keyword(':rows')))}"
-              f"  done?={edn_write(body.get(Keyword(':done?')))}")
+        print(f"query (equivalent morningstar ?o) -> rows={dumps(body.get(Keyword('rows')))}"
+              f"  done?={dumps(body.get(Keyword('done?')))}")
     finally:
         # Always release the socket, success or failure. Closing it also lets
         # the server's reader thread observe EOF and drop the session.
