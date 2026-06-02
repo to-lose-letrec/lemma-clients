@@ -687,16 +687,27 @@ class PostEdnTransportTests(unittest.TestCase):
 
     # --- (c) URLError: re-raised as a ConnectionError naming base ----------
 
-    def test_url_error_raises_connection_error_naming_base(self):
+    def test_url_error_is_translated_to_actionable_connection_error(self):
+        original = urllib.error.URLError("Connection refused")
+
         def fake_urlopen(request):
-            raise urllib.error.URLError("Connection refused")
+            raise original
 
         self._patch_urlopen(fake_urlopen)
 
         with self.assertRaises(ConnectionError) as ctx:
             post_edn("/v1/messages", Lst([Symbol("hello")]), base="http://down.test:1234")
 
-        self.assertIn("http://down.test:1234", str(ctx.exception))
+        exc = ctx.exception
+        # Chained from the original URLError (raised `from err`), so the
+        # underlying cause is preserved for debugging.
+        self.assertIs(exc.__cause__, original)
+        # The message names the unreachable base, surfaces the underlying
+        # reason, and stays actionable -- independent of how base is formatted.
+        message = str(exc)
+        self.assertIn("http://down.test:1234", message)
+        self.assertIn("Connection refused", message)
+        self.assertIn("is the server running?", message)
 
 
 if __name__ == "__main__":
