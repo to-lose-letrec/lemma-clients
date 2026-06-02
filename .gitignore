@@ -1,0 +1,6 @@
+# Local secrets (Fireworks key for the adversary watcher) — never commit.
+.env
+
+# Python
+__pycache__/
+*.pyc
