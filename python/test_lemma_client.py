@@ -564,10 +564,7 @@ class PostEdnTransportTests(unittest.TestCase):
             '{:event :welcome :version 1 '
             ':session #session "s-77" :world #world "default"}'
         )
-        captured = {}
-
         def fake_urlopen(request):
-            captured["request"] = request
             return _FakeResponse(canned.encode("utf-8"), "s-77")
 
         self._patch_urlopen(fake_urlopen)
