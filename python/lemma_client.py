@@ -997,15 +997,21 @@ def main_uds(socket_path=DEFAULT_SOCKET):
         sock.close()
 
 
-if __name__ == "__main__":
-    # Transport dispatch. With no arguments we keep the original HTTP behaviour
-    # against the local default. A leading "uds" selects the Unix-domain-socket
-    # transport (with an optional socket path). A leading http(s):// URL still
-    # overrides the HTTP base. No network happens at import time -- only here.
-    args = sys.argv[1:]
-    if args and args[0] == "uds":
-        main_uds(args[1] if len(args) > 1 else DEFAULT_SOCKET)
-    elif args:
-        main(args[0])
+def _dispatch(argv):
+    """Route CLI arguments (``sys.argv[1:]``) to a transport.
+
+    With no arguments we keep the original HTTP behaviour against the local
+    default. A leading ``"uds"`` selects the Unix-domain-socket transport (with
+    an optional socket path). Any other leading argument is an HTTP base URL.
+    """
+    if argv and argv[0] == "uds":
+        main_uds(argv[1] if len(argv) > 1 else DEFAULT_SOCKET)
+    elif argv:
+        main(argv[0])
     else:
         main(DEFAULT_BASE)
+
+
+if __name__ == "__main__":
+    # No network happens at import time -- only here.
+    _dispatch(sys.argv[1:])

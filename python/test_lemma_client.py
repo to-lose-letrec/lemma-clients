@@ -1163,5 +1163,46 @@ class UdsConnectFailureTests(UdsHandshakeBase):
         self.assertTrue(self.created[0].closed)
 
 
+# ===========================================================================
+# (D) CLI dispatch: argv -> transport selection, with no network.
+# ===========================================================================
+
+
+class CliDispatchTests(unittest.TestCase):
+    """_dispatch(argv) routes to main()/main_uds() without performing I/O."""
+
+    def setUp(self):
+        self._orig_main = lc.main
+        self._orig_main_uds = lc.main_uds
+        self.calls = []
+        lc.main = lambda *a, **k: self.calls.append(("main", a, k))
+        lc.main_uds = lambda *a, **k: self.calls.append(("main_uds", a, k))
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        lc.main = self._orig_main
+        lc.main_uds = self._orig_main_uds
+
+    def test_no_args_runs_http_main_with_default_base(self):
+        lc._dispatch([])
+        self.assertEqual(self.calls, [("main", (DEFAULT_BASE,), {})])
+
+    def test_url_arg_runs_http_main_with_that_base(self):
+        lc._dispatch(["http://host:9999"])
+        self.assertEqual(self.calls, [("main", ("http://host:9999",), {})])
+
+    def test_uds_arg_runs_main_uds_with_default_socket(self):
+        lc._dispatch(["uds"])
+        self.assertEqual(self.calls, [("main_uds", (DEFAULT_SOCKET,), {})])
+
+    def test_uds_with_path_runs_main_uds_with_that_path(self):
+        lc._dispatch(["uds", "/tmp/custom.sock"])
+        self.assertEqual(self.calls, [("main_uds", ("/tmp/custom.sock",), {})])
+
+    def test_uds_selection_does_not_invoke_http_main(self):
+        lc._dispatch(["uds"])
+        self.assertNotIn("main", [name for name, _, _ in self.calls])
+
+
 if __name__ == "__main__":
     unittest.main()
