@@ -207,6 +207,104 @@ def fact(predicate, subject, object):
 
 
 # ---------------------------------------------------------------------------
+# Capabilities & limits:  the :welcome surface  ->  ServerInfo
+#
+# Every session opens with a (hello) whose :welcome reply advertises what the
+# server can do (SPEC §10): a :capabilities set of namespaced flag keywords, a
+# :limits map of resource caps, and the :verbs / :predicates the world exposes.
+# A well-behaved client reads this once and tailors itself to it -- skipping
+# features the server doesn't advertise and staying under the byte caps it
+# enforces. ServerInfo is the parsed, queryable form of that surface; it is a
+# plain data record (not a new abstraction layer), so the round-trip code below
+# can ask "does this server paginate?" or "is my message small enough?" in one
+# readable call.
+# ---------------------------------------------------------------------------
+
+from typing import NamedTuple
+
+
+class ServerInfo(NamedTuple):
+    """The parsed :welcome surface: what this server advertises (SPEC §10).
+
+    Fields mirror the welcome map. ``capabilities`` is a frozenset of Keyword
+    flags (e.g. ``Keyword("lemma/cursor-pagination")``); ``limits`` is a plain
+    dict of Keyword -> value resource caps; ``verbs`` and ``predicates`` are
+    flat sets of Symbol names with the :core and :extensions surfaces merged.
+    """
+
+    version: object
+    capabilities: frozenset
+    limits: dict
+    verbs: set
+    predicates: set
+
+    def supports(self, capability):
+        """True iff ``capability`` (a Keyword) is in the advertised set."""
+        return capability in self.capabilities
+
+    @property
+    def max_message_bytes(self):
+        """The :max-message-bytes limit, or None if the server didn't advertise one.
+
+        A ``None`` value means "unadvertised" -- treated as unlimited by
+        :func:`within_message_limit`.
+        """
+        return self.limits.get(Keyword("max-message-bytes"))
+
+
+def _flatten_surface(surface):
+    """Merge a ``{:core #{…} :extensions {pack #{…}}}`` map into one flat set.
+
+    The :verbs and :predicates entries of a welcome split names into a :core
+    set plus per-pack :extensions sets (SPEC §10). A client mostly just wants
+    "every name this server understands", so we union :core with all the
+    extension sets. Missing keys default to empty -- a minimal welcome need not
+    carry every section.
+    """
+    if not isinstance(surface, _MAPPING_TYPES):
+        return set()
+    names = set(surface.get(Keyword("core")) or ())
+    extensions = surface.get(Keyword("extensions"))
+    if isinstance(extensions, _MAPPING_TYPES):
+        for pack_names in extensions.values():
+            names.update(pack_names or ())
+    return names
+
+
+def read_welcome(body):
+    """Parse a :welcome envelope into a :class:`ServerInfo`.
+
+    ``body`` is the parsed welcome map (an ImmutableDict from
+    ``edn_format.loads``). We pull :version, :capabilities (a set of Keyword),
+    :limits (an ImmutableDict, copied into a plain dict so callers can treat it
+    as ordinary data), and the flattened :verbs / :predicates surfaces. Every
+    key is optional: a server that omits a section yields an empty default
+    rather than an error, so this stays robust against minimal welcomes.
+    """
+    capabilities = frozenset(body.get(Keyword("capabilities")) or ())
+    limits = dict(body.get(Keyword("limits")) or {})
+    return ServerInfo(
+        version=body.get(Keyword("version")),
+        capabilities=capabilities,
+        limits=limits,
+        verbs=_flatten_surface(body.get(Keyword("verbs"))),
+        predicates=_flatten_surface(body.get(Keyword("predicates"))),
+    )
+
+
+def within_message_limit(info, edn_text):
+    """True iff ``edn_text`` fits under the server's :max-message-bytes cap.
+
+    The limit is measured in UTF-8 bytes (SPEC §10). An unadvertised limit
+    (``max_message_bytes is None``) means unlimited, so any message passes.
+    """
+    cap = info.max_message_bytes
+    if cap is None:
+        return True
+    return len(edn_text.encode("utf-8")) <= cap
+
+
+# ---------------------------------------------------------------------------
 # HTTP transport:  EDN form  ->  POST  ->  parsed EDN response
 #
 # With the codec in hand, talking to a Lemma server is just "encode, POST,
@@ -474,6 +572,12 @@ def main(base=DEFAULT_BASE):
     print(f"hello -> :welcome  version={dumps(body.get(Keyword('version')))}"
           f"  session={sid}  world={dumps(body.get(Keyword('world')))}")
 
+    # 1a. Read the advertised capabilities and limits once, up front, so the
+    #     rest of the round-trip can tailor itself to this server (SPEC §10).
+    info = read_welcome(body)
+    caps = ", ".join(sorted(c.name for c in info.capabilities))
+    print(f"server: caps={{{caps}}} max-message-bytes={info.max_message_bytes}")
+
     # 2. Every later call rides the same session, on the named endpoint.
     named = lambda form: post_edn(
         f"/v1/sessions/{sid}/messages", form, session=sid, base=base
@@ -517,43 +621,56 @@ def main(base=DEFAULT_BASE):
     print(f"query (equivalent morningstar ?o) -> rows={dumps(body.get(Keyword('rows')))}"
           f"  done?={dumps(body.get(Keyword('done?')))}")
 
-    # 7. Seed three subset-of facts in one propose, then assert the batch, so
-    #    the paginated query below has more rows than a single page holds.
-    #    subset-of is a pure-EDB (stored-fact) predicate, so a query over it
-    #    has stable (tx-id, ref-id) ordering and can be paginated; a rule-headed
-    #    predicate like member-of cannot be the sole outer :where pattern (the
-    #    server rejects it :bad-args :unsupported-rule-call-ordering).
-    f1 = fact(Symbol("subset-of"), entity("sub-a"), entity("group"))
-    f2 = fact(Symbol("subset-of"), entity("sub-b"), entity("group"))
-    f3 = fact(Symbol("subset-of"), entity("sub-c"), entity("group"))
-    body, _ = named((Symbol("propose"), f1, f2, f3))
-    if _is_failure(body):
-        print(f"propose (3x subset-of) refused: {_describe_failure(body)}")
-        return
-    proposal = body.get(Keyword("proposal"))
-    print(f"propose (3x subset-of ? group) -> {dumps(body.get(_EVENT))}"
-          f"  proposal={dumps(proposal)}")
-    body, _ = named((Symbol("assert"), proposal))
-    if _is_failure(body):
-        print(f"assert (3x subset-of) refused: {_describe_failure(body)}")
-        return
-    print(f"assert proposal -> {dumps(body.get(_EVENT))}")
+    # 7. The paginated section is gated on the server advertising cursor
+    #    pagination -- without it, draining pages via (continue #cursor ...)
+    #    is unsupported, so we skip the whole block rather than guess.
+    if info.supports(Keyword("lemma/cursor-pagination")):
+        # Seed three subset-of facts in one propose, then assert the batch, so
+        # the paginated query below has more rows than a single page holds.
+        # subset-of is a pure-EDB (stored-fact) predicate, so a query over it
+        # has stable (tx-id, ref-id) ordering and can be paginated; a rule-headed
+        # predicate like member-of cannot be the sole outer :where pattern (the
+        # server rejects it :bad-args :unsupported-rule-call-ordering).
+        f1 = fact(Symbol("subset-of"), entity("sub-a"), entity("group"))
+        f2 = fact(Symbol("subset-of"), entity("sub-b"), entity("group"))
+        f3 = fact(Symbol("subset-of"), entity("sub-c"), entity("group"))
+        propose_form = (Symbol("propose"), f1, f2, f3)
+        # The batch propose is the largest representative message we send, so
+        # it is the one worth checking against :max-message-bytes. A real
+        # client checks every outbound message; this demo checks this one.
+        if not within_message_limit(info, dumps(propose_form)):
+            print("limit-exceeded: message exceeds max-message-bytes; skipping")
+            return
+        body, _ = named(propose_form)
+        if _is_failure(body):
+            print(f"propose (3x subset-of) refused: {_describe_failure(body)}")
+            return
+        proposal = body.get(Keyword("proposal"))
+        print(f"propose (3x subset-of ? group) -> {dumps(body.get(_EVENT))}"
+              f"  proposal={dumps(proposal)}")
+        body, _ = named((Symbol("assert"), proposal))
+        if _is_failure(body):
+            print(f"assert (3x subset-of) refused: {_describe_failure(body)}")
+            return
+        print(f"assert proposal -> {dumps(body.get(_EVENT))}")
 
-    # 8. Paginated query: :limit 2 over 3 matching rows yields two pages
-    #    (2 + 1). query_all drains them via (continue #cursor ...).
-    qform = (Symbol("query"), {
-        Keyword("find"): [Symbol("?x")],
-        Keyword("where"): [[Symbol("subset-of"), Symbol("?x"), entity("group")]],
-        Keyword("limit"): 2,
-    })
-    # query_all wants a form -> body closure; named returns (body, sid), so we
-    # adapt it by dropping the (connection-stable) session id.
-    rows, pages, failure = query_all(lambda form: named(form)[0], qform)
-    if failure:
-        print(f"paged query refused: {_describe_failure(failure)}")
-        return
-    print(f"paged query (subset-of ? group), limit 2 -> {len(rows)} rows over "
-          f"{pages} page(s): {dumps(rows)}")
+        # 8. Paginated query: :limit 2 over 3 matching rows yields two pages
+        #    (2 + 1). query_all drains them via (continue #cursor ...).
+        qform = (Symbol("query"), {
+            Keyword("find"): [Symbol("?x")],
+            Keyword("where"): [[Symbol("subset-of"), Symbol("?x"), entity("group")]],
+            Keyword("limit"): 2,
+        })
+        # query_all wants a form -> body closure; named returns (body, sid), so we
+        # adapt it by dropping the (connection-stable) session id.
+        rows, pages, failure = query_all(lambda form: named(form)[0], qform)
+        if failure:
+            print(f"paged query refused: {_describe_failure(failure)}")
+            return
+        print(f"paged query (subset-of ? group), limit 2 -> {len(rows)} rows over "
+              f"{pages} page(s): {dumps(rows)}")
+    else:
+        print("server does not advertise cursor pagination; skipping paged query")
 
 
 def main_uds(socket_path=DEFAULT_SOCKET):
@@ -599,6 +716,12 @@ def main_uds(socket_path=DEFAULT_SOCKET):
               f"  session={dumps(body.get(Keyword('session')))}"
               f"  world={dumps(body.get(Keyword('world')))}")
 
+        # 1a. Read the advertised capabilities and limits once, up front, so the
+        #     rest of the round-trip can tailor itself to this server (SPEC §10).
+        info = read_welcome(body)
+        caps = ", ".join(sorted(c.name for c in info.capabilities))
+        print(f"server: caps={{{caps}}} max-message-bytes={info.max_message_bytes}")
+
         # 2. Enter the world. (use-world #world "default")
         body = call((Symbol("use-world"), world("default")))
         if _is_failure(body):
@@ -637,41 +760,54 @@ def main_uds(socket_path=DEFAULT_SOCKET):
         print(f"query (equivalent morningstar ?o) -> rows={dumps(body.get(Keyword('rows')))}"
               f"  done?={dumps(body.get(Keyword('done?')))}")
 
-        # 6. Seed three subset-of facts in one propose, then assert the batch,
-        #    so the paginated query below spans more than one page. subset-of is
-        #    a pure-EDB predicate (stable tx-id/ref-id ordering), so it can be
-        #    paginated; a rule-headed predicate like member-of cannot be the sole
-        #    outer :where pattern (server :bad-args :unsupported-rule-call-ordering).
-        f1 = fact(Symbol("subset-of"), entity("sub-a"), entity("group"))
-        f2 = fact(Symbol("subset-of"), entity("sub-b"), entity("group"))
-        f3 = fact(Symbol("subset-of"), entity("sub-c"), entity("group"))
-        body = call((Symbol("propose"), f1, f2, f3))
-        if _is_failure(body):
-            print(f"propose (3x subset-of) refused: {_describe_failure(body)}")
-            return
-        proposal = body.get(Keyword("proposal"))
-        print(f"propose (3x subset-of ? group) -> {dumps(body.get(_EVENT))}"
-              f"  proposal={dumps(proposal)}")
-        body = call((Symbol("assert"), proposal))
-        if _is_failure(body):
-            print(f"assert (3x subset-of) refused: {_describe_failure(body)}")
-            return
-        print(f"assert proposal -> {dumps(body.get(_EVENT))}")
+        # 6. The paginated section is gated on the server advertising cursor
+        #    pagination -- without it, draining pages via (continue #cursor ...)
+        #    is unsupported, so we skip the whole block rather than guess.
+        if info.supports(Keyword("lemma/cursor-pagination")):
+            # Seed three subset-of facts in one propose, then assert the batch,
+            # so the paginated query below spans more than one page. subset-of is
+            # a pure-EDB predicate (stable tx-id/ref-id ordering), so it can be
+            # paginated; a rule-headed predicate like member-of cannot be the sole
+            # outer :where pattern (server :bad-args :unsupported-rule-call-ordering).
+            f1 = fact(Symbol("subset-of"), entity("sub-a"), entity("group"))
+            f2 = fact(Symbol("subset-of"), entity("sub-b"), entity("group"))
+            f3 = fact(Symbol("subset-of"), entity("sub-c"), entity("group"))
+            propose_form = (Symbol("propose"), f1, f2, f3)
+            # The batch propose is the largest representative message we send, so
+            # it is the one worth checking against :max-message-bytes. A real
+            # client checks every outbound message; this demo checks this one.
+            if not within_message_limit(info, dumps(propose_form)):
+                print("limit-exceeded: message exceeds max-message-bytes; skipping")
+                return
+            body = call(propose_form)
+            if _is_failure(body):
+                print(f"propose (3x subset-of) refused: {_describe_failure(body)}")
+                return
+            proposal = body.get(Keyword("proposal"))
+            print(f"propose (3x subset-of ? group) -> {dumps(body.get(_EVENT))}"
+                  f"  proposal={dumps(proposal)}")
+            body = call((Symbol("assert"), proposal))
+            if _is_failure(body):
+                print(f"assert (3x subset-of) refused: {_describe_failure(body)}")
+                return
+            print(f"assert proposal -> {dumps(body.get(_EVENT))}")
 
-        # 7. Paginated query: :limit 2 over 3 matching rows yields two pages
-        #    (2 + 1). query_all drains them via (continue #cursor ...). The UDS
-        #    call closure is already form -> body, so it is passed directly.
-        qform = (Symbol("query"), {
-            Keyword("find"): [Symbol("?x")],
-            Keyword("where"): [[Symbol("subset-of"), Symbol("?x"), entity("group")]],
-            Keyword("limit"): 2,
-        })
-        rows, pages, failure = query_all(call, qform)
-        if failure:
-            print(f"paged query refused: {_describe_failure(failure)}")
-            return
-        print(f"paged query (subset-of ? group), limit 2 -> {len(rows)} rows over "
-              f"{pages} page(s): {dumps(rows)}")
+            # 7. Paginated query: :limit 2 over 3 matching rows yields two pages
+            #    (2 + 1). query_all drains them via (continue #cursor ...). The UDS
+            #    call closure is already form -> body, so it is passed directly.
+            qform = (Symbol("query"), {
+                Keyword("find"): [Symbol("?x")],
+                Keyword("where"): [[Symbol("subset-of"), Symbol("?x"), entity("group")]],
+                Keyword("limit"): 2,
+            })
+            rows, pages, failure = query_all(call, qform)
+            if failure:
+                print(f"paged query refused: {_describe_failure(failure)}")
+                return
+            print(f"paged query (subset-of ? group), limit 2 -> {len(rows)} rows over "
+                  f"{pages} page(s): {dumps(rows)}")
+        else:
+            print("server does not advertise cursor pagination; skipping paged query")
     finally:
         # Always release the socket, success or failure. Closing it also lets
         # the server's reader thread observe EOF and drop the session.

@@ -47,13 +47,16 @@ import lemma_client as lc
 from lemma_client import (
     DEFAULT_BASE,
     DEFAULT_SOCKET,
+    ServerInfo,
     entity,
     fact,
     main,
     main_uds,
     post_edn,
+    read_welcome,
     uds_recv_frame,
     uds_send_frame,
+    within_message_limit,
     world,
 )
 
@@ -313,6 +316,9 @@ class PostEdnTransportTests(unittest.TestCase):
 _WELCOME = (
     '{:event :welcome :version 1 '
     ':session #session "s-77" :world #world "default" '
+    ':capabilities #{:lemma/v1 :lemma/cursor-pagination :lemma/watch '
+    ':lemma/import :lemma/export} '
+    ':limits {:max-message-bytes 1048576} '
     ':verbs {:core #{hello use-world propose assert query} :extensions {}}}'
 )
 _WORLD_SELECTED = '{:event :world-selected :world #world "default"}'
@@ -678,6 +684,9 @@ class _FakeUdsSocket:
 _UDS_WELCOME = (
     '{:event :welcome :version 1 '
     ':session #session "s-uds-1" :world #world "default" '
+    ':capabilities #{:lemma/v1 :lemma/cursor-pagination :lemma/watch '
+    ':lemma/import :lemma/export} '
+    ':limits {:max-message-bytes 1048576} '
     ':verbs {:core #{hello use-world propose assert query} :extensions {}}}'
 )
 _UDS_WORLD_SELECTED = '{:event :world-selected :world #world "default"}'
@@ -1108,6 +1117,233 @@ class QueryAllTests(unittest.TestCase):
         self.assertIsNotNone(failure)
         self.assertEqual(failure[Keyword("event")], Keyword("error"))
         self.assertEqual(send.call_count, 1)
+
+
+# ===========================================================================
+# (H) read_welcome / ServerInfo: parse the :welcome surface (SPEC §10).
+#
+# read_welcome turns a parsed :welcome map into a queryable ServerInfo: a
+# frozenset of capability Keywords, a :limits dict (with max_message_bytes
+# convenience), and FLATTENED :verbs / :predicates Symbol sets (core unioned
+# with every :extensions pack). Every section is optional -- a minimal welcome
+# must not crash. The fixtures here are parsed with edn_format.loads so the
+# objects match exactly what the live transports hand read_welcome.
+# ===========================================================================
+
+
+# A realistic welcome advertising three capabilities, a byte cap, and split
+# core/extensions verb + predicate surfaces.
+_REALISTIC_WELCOME = (
+    '{:event :welcome :version 1 :session #session "s-1" :world nil '
+    ':capabilities #{:lemma/v1 :lemma/cursor-pagination :lemma/watch} '
+    ':limits {:max-message-bytes 1048576} '
+    ':predicates {:core #{equivalent subset-of} :extensions {}} '
+    ':verbs {:core #{hello query continue} :extensions {}}}'
+)
+
+
+class ReadWelcomeTests(unittest.TestCase):
+    def test_supports_returns_true_for_an_advertised_capability(self):
+        info = read_welcome(loads(_REALISTIC_WELCOME))
+        self.assertTrue(info.supports(Keyword("lemma/cursor-pagination")))
+
+    def test_supports_returns_false_for_an_unadvertised_capability(self):
+        info = read_welcome(loads(_REALISTIC_WELCOME))
+        self.assertFalse(info.supports(Keyword("lemma/nope")))
+
+    def test_max_message_bytes_reads_the_advertised_limit(self):
+        info = read_welcome(loads(_REALISTIC_WELCOME))
+        self.assertEqual(info.max_message_bytes, 1048576)
+
+    def test_verbs_surface_contains_the_core_symbols(self):
+        info = read_welcome(loads(_REALISTIC_WELCOME))
+        self.assertIn(Symbol("hello"), info.verbs)
+        self.assertIn(Symbol("query"), info.verbs)
+        self.assertIn(Symbol("continue"), info.verbs)
+
+    def test_predicates_surface_contains_the_core_symbols(self):
+        info = read_welcome(loads(_REALISTIC_WELCOME))
+        self.assertIn(Symbol("equivalent"), info.predicates)
+        self.assertIn(Symbol("subset-of"), info.predicates)
+
+    def test_missing_limits_yields_none_max_message_bytes_without_crashing(self):
+        # A welcome that omits :limits entirely must parse cleanly and report an
+        # unadvertised (None) byte cap rather than raising.
+        welcome = (
+            '{:event :welcome :version 1 :session #session "s-1" :world nil '
+            ':capabilities #{:lemma/v1}}'
+        )
+        info = read_welcome(loads(welcome))
+        self.assertIsNone(info.max_message_bytes)
+
+    def test_verb_extensions_packs_are_flattened_into_the_verb_set(self):
+        # :verbs splits into :core plus per-pack :extensions; read_welcome unions
+        # them, so an extension verb (foo) appears alongside the core ones.
+        welcome = (
+            '{:event :welcome :version 1 :session #session "s-1" :world nil '
+            ':verbs {:core #{hello} :extensions {somepack #{foo}}}}'
+        )
+        info = read_welcome(loads(welcome))
+        self.assertIn(Symbol("foo"), info.verbs)
+        self.assertIn(Symbol("hello"), info.verbs)
+
+
+# ===========================================================================
+# (I) within_message_limit: is an EDN message under the server's byte cap?
+#
+# The cap is :max-message-bytes, measured in UTF-8 bytes (SPEC §10). An
+# unadvertised cap (None) means unlimited, so any message passes.
+# ===========================================================================
+
+
+class WithinMessageLimitTests(unittest.TestCase):
+    def test_small_payload_is_within_a_one_megabyte_limit(self):
+        info = ServerInfo(
+            version=1,
+            capabilities=frozenset(),
+            limits={Keyword("max-message-bytes"): 1048576},
+            verbs=set(),
+            predicates=set(),
+        )
+        self.assertTrue(within_message_limit(info, "(hello)"))
+
+    def test_oversized_payload_against_a_tiny_limit_is_rejected(self):
+        info = ServerInfo(
+            version=1,
+            capabilities=frozenset(),
+            limits={Keyword("max-message-bytes"): 4},
+            verbs=set(),
+            predicates=set(),
+        )
+        # Eight bytes against a four-byte cap.
+        self.assertFalse(within_message_limit(info, "(hello!!)"[:8]))
+
+    def test_no_advertised_limit_always_passes(self):
+        info = ServerInfo(
+            version=1,
+            capabilities=frozenset(),
+            limits={},
+            verbs=set(),
+            predicates=set(),
+        )
+        self.assertIsNone(info.max_message_bytes)
+        # An arbitrarily large payload still passes when no cap is advertised.
+        self.assertTrue(within_message_limit(info, "x" * 10_000_000))
+
+
+# ===========================================================================
+# (J) Capability gating in the handshake: the paginated tail is gated on the
+#     server advertising :lemma/cursor-pagination (SPEC §10). Without it,
+#     main()/main_uds() must SKIP the seed-propose / paged-query block and
+#     issue only the five base messages, printing the skip note. With it (the
+#     default fixtures), the full nine-step paginated path runs.
+# ===========================================================================
+
+
+# A welcome WITHOUT cursor-pagination: it advertises other caps but omits the
+# one that gates the paged tail.
+_WELCOME_NO_PAGINATION = (
+    '{:event :welcome :version 1 '
+    ':session #session "s-77" :world #world "default" '
+    ':capabilities #{:lemma/v1 :lemma/watch} '
+    ':limits {:max-message-bytes 1048576} '
+    ':verbs {:core #{hello use-world propose assert query} :extensions {}}}'
+)
+_UDS_WELCOME_NO_PAGINATION = (
+    '{:event :welcome :version 1 '
+    ':session #session "s-uds-1" :world #world "default" '
+    ':capabilities #{:lemma/v1 :lemma/watch} '
+    ':limits {:max-message-bytes 1048576} '
+    ':verbs {:core #{hello use-world propose assert query} :extensions {}}}'
+)
+
+# The first five base steps a gated run still issues: hello, use-world,
+# propose, assert, query.
+_BASE_SEQUENCE = [
+    _WELCOME_NO_PAGINATION,
+    _WORLD_SELECTED,
+    _PROPOSED,
+    _ASSERTED,
+    _RESULT,
+]
+_UDS_BASE_SEQUENCE = [
+    _UDS_WELCOME_NO_PAGINATION,
+    _UDS_WORLD_SELECTED,
+    _UDS_PROPOSED,
+    _UDS_ASSERTED,
+    _UDS_RESULT,
+]
+
+
+class HttpCapabilityGatingTests(HandshakeBase):
+    def test_missing_pagination_capability_skips_the_paged_query(self):
+        fake = self.install(FakePostEdn(_BASE_SEQUENCE))
+
+        self.run_main_capturing()
+
+        # Only the five base messages were issued -- the seed-propose, its
+        # assert, and the two-page query/continue were all skipped.
+        self.assertEqual(len(fake.calls), 5)
+
+    def test_missing_pagination_capability_prints_the_skip_note(self):
+        self.install(FakePostEdn(_BASE_SEQUENCE))
+
+        output = self.run_main_capturing()
+
+        self.assertIn("does not advertise cursor pagination", output)
+
+    def test_missing_pagination_capability_issues_no_continue(self):
+        fake = self.install(FakePostEdn(_BASE_SEQUENCE))
+
+        self.run_main_capturing()
+
+        # No frame after the gate carries a (continue ...) verb head.
+        for _path, form, _session, _base in fake.calls:
+            self.assertNotEqual(dumps(form).split(" ", 1)[0], "(continue")
+            self.assertFalse(dumps(form).startswith("(continue"))
+
+    def test_present_pagination_capability_runs_the_full_nine_step_path(self):
+        # The default fixture advertises :lemma/cursor-pagination, so the full
+        # paginated path runs end to end.
+        fake = self.install(FakePostEdn(_FULL_SEQUENCE))
+
+        self.run_main_capturing()
+
+        self.assertEqual(len(fake.calls), 9)
+
+
+class UdsCapabilityGatingTests(UdsHandshakeBase):
+    def test_missing_pagination_capability_skips_the_paged_query(self):
+        self.install_socket(_UDS_BASE_SEQUENCE)
+
+        self.run_main_uds_capturing()
+
+        sent = self.sent_frames_as_edn(self.created[0])
+        # Only the five base frames -- the paged tail is gated out.
+        self.assertEqual(len(sent), 5)
+
+    def test_missing_pagination_capability_prints_the_skip_note(self):
+        self.install_socket(_UDS_BASE_SEQUENCE)
+
+        output = self.run_main_uds_capturing()
+
+        self.assertIn("does not advertise cursor pagination", output)
+
+    def test_missing_pagination_capability_issues_no_continue(self):
+        self.install_socket(_UDS_BASE_SEQUENCE)
+
+        self.run_main_uds_capturing()
+
+        sent = self.sent_frames_as_edn(self.created[0])
+        for frame in sent:
+            self.assertFalse(frame.startswith("(continue"))
+
+    def test_present_pagination_capability_runs_the_full_nine_step_path(self):
+        self.install_socket(_UDS_FULL_SEQUENCE)
+
+        self.run_main_uds_capturing()
+
+        self.assertEqual(len(self.sent_frames_as_edn(self.created[0])), 9)
 
 
 if __name__ == "__main__":

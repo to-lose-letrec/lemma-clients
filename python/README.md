@@ -85,7 +85,9 @@ line per step:
 
 1. `(hello)` — anonymous `POST /v1/messages`. The `:welcome` reply carries the
    new session id in the `X-Lemma-Session` response header, surfaced by
-   `post_edn`.
+   `post_edn`. `read_welcome` parses the reply into a `ServerInfo`, and a
+   `server: caps=… max-message-bytes=…` summary line is printed (see
+   [Capabilities and limits](#capabilities-and-limits)).
 2. `(use-world #world "default")` — enter the world on the session.
 3. `(propose #fact{...})` — propose `equivalent morningstar venus`. The reply
    returns a `#proposal` handle.
@@ -94,10 +96,16 @@ line per step:
    query it back and print `:rows` and `:done?`.
 6. `(propose #fact{...} #fact{...} #fact{...})` — batch-propose three
    `subset-of` facts in one call, then `(assert <proposal>)` the batch, so the
-   next query has more rows than a single page holds.
+   next query has more rows than a single page holds. Gated on
+   `info.supports(Keyword("lemma/cursor-pagination"))`; before sending, the
+   batch is checked against `:max-message-bytes` with `within_message_limit`.
 7. `(query {... :limit 2})` — run a paginated query through `query_all`, which
    drains every page via `(continue #cursor ...)` and prints the total row
    count and page count.
+
+Steps 6–7 run only when the server advertises `:lemma/cursor-pagination`;
+otherwise the client prints `server does not advertise cursor pagination;
+skipping paged query` and stops there.
 
 After every response the code inspects `:event`; an `:error` or `:rejected`
 envelope is printed via `_describe_failure` and the sequence stops cleanly.
@@ -106,6 +114,7 @@ Expected output (the session and proposal ids increment per run):
 
 ```text
 hello -> :welcome  version=1  session=s-1  world=nil
+server: caps={lemma/cursor-pagination, lemma/export, lemma/import, lemma/watch} max-message-bytes=1048576
 use-world "default" -> :world-selected  world=#world "default"
 propose (equivalent morningstar venus) -> :proposed  proposal=#proposal "p-1"
 assert proposal -> :asserted
@@ -122,6 +131,40 @@ shown above.
 
 `main_uds()` runs the identical verb sequence and prints the same per-step
 lines; only the transport differs.
+
+## Capabilities and limits
+
+The `:welcome` envelope advertises what the server can do: a `:capabilities`
+set of namespaced flag keywords (e.g. `:lemma/cursor-pagination`, `:lemma/watch`,
+`:lemma/import`, `:lemma/export`), a `:limits` map of resource caps (e.g.
+`:max-message-bytes`), and `:verbs` / `:predicates` each shaped as
+`{:core #{...} :extensions {pack #{...}}}`.
+
+`read_welcome(body)` parses that surface into a `ServerInfo`:
+
+| Field / method | Meaning |
+|---|---|
+| `capabilities` | frozenset of `Keyword` flags |
+| `limits` | dict of `Keyword` → cap value |
+| `verbs`, `predicates` | flat sets with `:core` and all `:extensions` merged |
+| `supports(capability)` | `True` iff the `Keyword` capability is advertised |
+| `max_message_bytes` | the `:max-message-bytes` limit, or `None` if unadvertised |
+
+Every section is optional; an omitted one yields an empty default rather than an
+error. The client reads the welcome once and tailors itself to it:
+
+- It prints the `server: caps=… max-message-bytes=…` summary line after the
+  hello line.
+- It gates the paginated-query demo on
+  `info.supports(Keyword("lemma/cursor-pagination"))`, skipping the block with
+  `server does not advertise cursor pagination; skipping paged query` when the
+  server does not advertise it.
+- Before sending the batch-propose it checks the message against
+  `:max-message-bytes` with `within_message_limit(info, dumps(form))`, which
+  compares the UTF-8 byte length to the cap (`None` means unlimited). This
+  respects the limit locally rather than relying on a `:limit-exceeded`
+  rejection. The demo checks only the representative batch-propose; a real
+  client checks every outbound message.
 
 ## Pagination
 
@@ -242,9 +285,10 @@ the handshake is verified without a live server.
 ## References
 
 - `lemma_client.py` — the `edn_format` tag registrations and constructor
-  helpers, both transports (`post_edn` for HTTP, `uds_send_frame` /
-  `uds_recv_frame` for UDS), and the runnable `main()` / `main_uds()`
-  round-trips.
+  helpers, the `:welcome` parsing (`read_welcome`, `ServerInfo`,
+  `within_message_limit`), both transports (`post_edn` for HTTP,
+  `uds_send_frame` / `uds_recv_frame` for UDS), and the runnable `main()` /
+  `main_uds()` round-trips.
 - [`edn_format`](https://pypi.org/project/edn_format/) — the EDN reader/writer
   the codec is built on.
 - `../README.md` — project framing: these are from-scratch single-file
