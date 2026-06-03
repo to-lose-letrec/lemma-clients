@@ -1,0 +1,13 @@
+{
+  "name": "lemma-client-ts",
+  "version": "0.1.0",
+  "description": "Single-file TypeScript recipe for the Lemma wire protocol (hello/propose/assert/query over HTTP).",
+  "type": "module",
+  "main": "lemma_client.ts",
+  "scripts": {
+    "start": "node lemma_client.ts"
+  },
+  "dependencies": {
+    "jsedn": "^0.4.1"
+  }
+}

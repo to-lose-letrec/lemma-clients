@@ -1,0 +1,22 @@
+{
+  "lockfileVersion": 1,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "dependencies": {
+        "jsedn": "^0.4.1",
+      },
+    },
+  },
+  "packages": {
+    "commander": ["commander@15.0.0", "", {}, "sha512-z67u4ZhzCL/Tydu1lJARtEZYWbWaN7oYLHbsuzocr6y4N6WZAagG3RQ4FW61V1/0+jImpj293XfrcYnd1qxtPg=="],
+
+    "equals": ["equals@1.0.5", "", { "dependencies": { "jkroso-type": "1" } }, "sha512-wI15a6ZoaaXPv+55+Vh2Kqn3+efKRv8QPtcGTjW5xmanMnQzESdAt566jevtMZyt3W/jwLDTzXpMph5ECDJ2zg=="],
+
+    "jkroso-type": ["jkroso-type@1.1.1", "", {}, "sha512-zZgay+fPG6PgMUrpyFADmQmvLo39+AZa7Gc5pZhev2RhDxwANEq2etwD8d0e6rTg5NkwOIlQmaEmns3draC6Ng=="],
+
+    "jsedn": ["jsedn@0.4.1", "", { "dependencies": { "commander": "latest", "equals": "latest", "type-component": "latest" }, "bin": { "jsedn": "./bin/jsedn" } }, "sha512-ZzdF1smvJyiydoBJFYbXLx52wz6VIaAyDT4fGTmtdP6B7zrGCBzUI/0+QFIKoUmwgbHPSpzljdjkbHQHKWf8CQ=="],
+
+    "type-component": ["type-component@0.0.1", "", {}, "sha512-mDZRBQS2yZkwRQKfjJvQ8UIYJeBNNWCq+HBNstl9N5s9jZ4dkVYXEGkVPsSCEh5Ld4JM1kmrZTzjnrqSAIQ7dw=="],
+  }
+}
