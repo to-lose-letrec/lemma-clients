@@ -419,6 +419,43 @@ def _describe_failure(body):
     return "; ".join(parts) if parts else "(no detail provided)"
 
 
+# The pagination keys a (query …)/(continue …) result envelope carries
+# (SPEC §8). A query with :limit returns a full first page with :done? false
+# plus a #cursor; continue carries :rows/:cursor/:done? until :done? is true.
+_ROWS = Keyword("rows")
+_DONE = Keyword("done?")
+_CURSOR = Keyword("cursor")
+
+
+def query_all(send, query_form):
+    """Run a (query ...) and drain every page via (continue #cursor ...).
+
+    `send` is a `form -> body` callable (the per-transport closure). Returns
+    (rows, pages, failure) where `failure` is None on success or the offending
+    error/rejection body. A query with :limit returns a full first page with
+    :done? false and a #cursor; we (continue #cursor) until :done? is true.
+    """
+    body = send(query_form)
+    if _is_failure(body):
+        return ([], 0, body)
+
+    rows = list(body[_ROWS])
+    pages = 1
+    while not body[_DONE]:
+        # :cursor is present exactly when :done? is false -- the server omits
+        # it on a single-page (already-done) result, so we only read it here.
+        # An expired cursor (server idle TTL ~300s, SPEC §8) comes back as
+        # :error :unknown-handle; this demo propagates that failure, whereas a
+        # real client would re-issue the original query to start a fresh page.
+        cursor = body[_CURSOR]
+        body = send((Symbol("continue"), cursor))
+        if _is_failure(body):
+            return (rows, pages, body)
+        rows.extend(body[_ROWS])
+        pages += 1
+    return (rows, pages, None)
+
+
 def main(base=DEFAULT_BASE):
     """Run the full propose/assert/query round-trip against a Lemma server.
 
@@ -479,6 +516,44 @@ def main(base=DEFAULT_BASE):
         return
     print(f"query (equivalent morningstar ?o) -> rows={dumps(body.get(Keyword('rows')))}"
           f"  done?={dumps(body.get(Keyword('done?')))}")
+
+    # 7. Seed three subset-of facts in one propose, then assert the batch, so
+    #    the paginated query below has more rows than a single page holds.
+    #    subset-of is a pure-EDB (stored-fact) predicate, so a query over it
+    #    has stable (tx-id, ref-id) ordering and can be paginated; a rule-headed
+    #    predicate like member-of cannot be the sole outer :where pattern (the
+    #    server rejects it :bad-args :unsupported-rule-call-ordering).
+    f1 = fact(Symbol("subset-of"), entity("sub-a"), entity("group"))
+    f2 = fact(Symbol("subset-of"), entity("sub-b"), entity("group"))
+    f3 = fact(Symbol("subset-of"), entity("sub-c"), entity("group"))
+    body, _ = named((Symbol("propose"), f1, f2, f3))
+    if _is_failure(body):
+        print(f"propose (3x subset-of) refused: {_describe_failure(body)}")
+        return
+    proposal = body.get(Keyword("proposal"))
+    print(f"propose (3x subset-of ? group) -> {dumps(body.get(_EVENT))}"
+          f"  proposal={dumps(proposal)}")
+    body, _ = named((Symbol("assert"), proposal))
+    if _is_failure(body):
+        print(f"assert (3x subset-of) refused: {_describe_failure(body)}")
+        return
+    print(f"assert proposal -> {dumps(body.get(_EVENT))}")
+
+    # 8. Paginated query: :limit 2 over 3 matching rows yields two pages
+    #    (2 + 1). query_all drains them via (continue #cursor ...).
+    qform = (Symbol("query"), {
+        Keyword("find"): [Symbol("?x")],
+        Keyword("where"): [[Symbol("subset-of"), Symbol("?x"), entity("group")]],
+        Keyword("limit"): 2,
+    })
+    # query_all wants a form -> body closure; named returns (body, sid), so we
+    # adapt it by dropping the (connection-stable) session id.
+    rows, pages, failure = query_all(lambda form: named(form)[0], qform)
+    if failure:
+        print(f"paged query refused: {_describe_failure(failure)}")
+        return
+    print(f"paged query (subset-of ? group), limit 2 -> {len(rows)} rows over "
+          f"{pages} page(s): {dumps(rows)}")
 
 
 def main_uds(socket_path=DEFAULT_SOCKET):
@@ -561,6 +636,42 @@ def main_uds(socket_path=DEFAULT_SOCKET):
             return
         print(f"query (equivalent morningstar ?o) -> rows={dumps(body.get(Keyword('rows')))}"
               f"  done?={dumps(body.get(Keyword('done?')))}")
+
+        # 6. Seed three subset-of facts in one propose, then assert the batch,
+        #    so the paginated query below spans more than one page. subset-of is
+        #    a pure-EDB predicate (stable tx-id/ref-id ordering), so it can be
+        #    paginated; a rule-headed predicate like member-of cannot be the sole
+        #    outer :where pattern (server :bad-args :unsupported-rule-call-ordering).
+        f1 = fact(Symbol("subset-of"), entity("sub-a"), entity("group"))
+        f2 = fact(Symbol("subset-of"), entity("sub-b"), entity("group"))
+        f3 = fact(Symbol("subset-of"), entity("sub-c"), entity("group"))
+        body = call((Symbol("propose"), f1, f2, f3))
+        if _is_failure(body):
+            print(f"propose (3x subset-of) refused: {_describe_failure(body)}")
+            return
+        proposal = body.get(Keyword("proposal"))
+        print(f"propose (3x subset-of ? group) -> {dumps(body.get(_EVENT))}"
+              f"  proposal={dumps(proposal)}")
+        body = call((Symbol("assert"), proposal))
+        if _is_failure(body):
+            print(f"assert (3x subset-of) refused: {_describe_failure(body)}")
+            return
+        print(f"assert proposal -> {dumps(body.get(_EVENT))}")
+
+        # 7. Paginated query: :limit 2 over 3 matching rows yields two pages
+        #    (2 + 1). query_all drains them via (continue #cursor ...). The UDS
+        #    call closure is already form -> body, so it is passed directly.
+        qform = (Symbol("query"), {
+            Keyword("find"): [Symbol("?x")],
+            Keyword("where"): [[Symbol("subset-of"), Symbol("?x"), entity("group")]],
+            Keyword("limit"): 2,
+        })
+        rows, pages, failure = query_all(call, qform)
+        if failure:
+            print(f"paged query refused: {_describe_failure(failure)}")
+            return
+        print(f"paged query (subset-of ? group), limit 2 -> {len(rows)} rows over "
+              f"{pages} page(s): {dumps(rows)}")
     finally:
         # Always release the socket, success or failure. Closing it also lets
         # the server's reader thread observe EOF and drop the session.

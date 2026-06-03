@@ -92,6 +92,12 @@ line per step:
 4. `(assert <proposal>)` — assert the proposed fact into the world.
 5. `(query {:find [?o] :where [[equivalent #entity "morningstar" ?o]]})` —
    query it back and print `:rows` and `:done?`.
+6. `(propose #fact{...} #fact{...} #fact{...})` — batch-propose three
+   `subset-of` facts in one call, then `(assert <proposal>)` the batch, so the
+   next query has more rows than a single page holds.
+7. `(query {... :limit 2})` — run a paginated query through `query_all`, which
+   drains every page via `(continue #cursor ...)` and prints the total row
+   count and page count.
 
 After every response the code inspects `:event`; an `:error` or `:rejected`
 envelope is printed via `_describe_failure` and the sequence stops cleanly.
@@ -104,6 +110,9 @@ use-world "default" -> :world-selected  world=#world "default"
 propose (equivalent morningstar venus) -> :proposed  proposal=#proposal "p-1"
 assert proposal -> :asserted
 query (equivalent morningstar ?o) -> rows=[["venus"]]  done?=true
+propose (3x subset-of ? group) -> :proposed  proposal=#proposal "p-2"
+assert proposal -> :asserted
+paged query (subset-of ? group), limit 2 -> 3 rows over 2 page(s): [["sub-a"] ["sub-b"] ["sub-c"]]
 ```
 
 The query binds `?o` to the matching entity's name, which Dianoia returns as a
@@ -113,6 +122,32 @@ shown above.
 
 `main_uds()` runs the identical verb sequence and prints the same per-step
 lines; only the transport differs.
+
+## Pagination
+
+A `(query ...)` with `:limit N` returns a first page. If the page is full the
+reply carries `:done? false` and a `#cursor` handle; the client sends
+`(continue #cursor "...")` to fetch each next page until a reply has
+`:done? true`. A short result (fewer than `N` rows) or a query without `:limit`
+comes back with `:done? true` and no `#cursor`.
+
+`query_all(send, query_form)` is the transport-agnostic helper that drains all
+pages. `send` is a `form -> body` callable; the helper concatenates `:rows`
+across pages and returns `(rows, pages, failure)`, where `failure` is `None` on
+success or the offending error/rejection envelope. Each transport adapts its
+own call into the `send` closure: HTTP's `named` returns `(body, sid)`, so
+`main` passes `lambda form: named(form)[0]`; UDS's `call` is already
+`form -> body`, so `main_uds` passes it directly.
+
+A `#cursor` is a server-side bookmark with a ~300-second idle TTL, refreshed on
+each `(continue ...)`. An expired cursor returns `:error :unknown-handle`; a
+real client re-issues the original query to start a fresh page, but this demo
+propagates the failure through `query_all`'s third return value.
+
+Pagination needs a **stably ordered** result, which requires at least one
+pure-EDB (stored-fact) predicate at the outer `:where` level. The demo paginates
+over `subset-of` for that reason; a rule-headed predicate such as `member-of` as
+the sole pattern is rejected `:bad-args :unsupported-rule-call-ordering`.
 
 ## How HTTP maps to the wire
 

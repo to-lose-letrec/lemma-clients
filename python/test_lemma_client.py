@@ -321,6 +321,32 @@ _ASSERTED = '{:event :asserted}'
 # Query rows bind ?o to the entity name as a plain string (see live Dianoia).
 _RESULT = '{:event :result :rows [["venus"]] :done? true}'
 
+# The seed-and-paginate tail main() now runs after the first query: a second
+# propose (three member-of facts), its assert, then a :limit 2 query that comes
+# back as a full first page (:done? false + #cursor) followed by a continue
+# that drains the rest (:done? true). query_all is what stitches those two
+# pages together inside main().
+_PROPOSED_3X = '{:event :proposed :proposal #proposal "p-2"}'
+_PAGE1 = (
+    '{:event :result :rows [[#entity "alice"] [#entity "bob"]] '
+    ':done? false :cursor #cursor "c-1"}'
+)
+_PAGE2 = '{:event :result :rows [[#entity "carol"]] :done? true :cursor #cursor "c-1"}'
+
+# The full nine-step main() sequence: hello, use-world, propose, assert, query,
+# propose(3x), assert, paged-query(page1), continue(page2).
+_FULL_SEQUENCE = [
+    _WELCOME,
+    _WORLD_SELECTED,
+    _PROPOSED,
+    _ASSERTED,
+    _RESULT,
+    _PROPOSED_3X,
+    _ASSERTED,
+    _PAGE1,
+    _PAGE2,
+]
+
 _ERROR = '{:event :error :reason :malformed :message "bad verb form"}'
 _REJECTED = (
     '{:event :rejected :reason :inconsistent '
@@ -376,20 +402,17 @@ class HandshakeBase(unittest.TestCase):
 
 class HandshakeSuccessTests(HandshakeBase):
     def test_full_sequence_reaches_result_without_raising(self):
-        fake = self.install(
-            FakePostEdn([_WELCOME, _WORLD_SELECTED, _PROPOSED, _ASSERTED, _RESULT])
-        )
+        fake = self.install(FakePostEdn(_FULL_SEQUENCE))
         output = self.run_main_capturing()
-        # All five protocol steps were issued.
-        self.assertEqual(len(fake.calls), 5)
+        # All nine protocol steps were issued (the tail is the paginated query
+        # plus its continue).
+        self.assertEqual(len(fake.calls), 9)
         # The conversation reached the query/result line.
         self.assertIn("rows=", output)
         self.assertIn('"venus"', output)
 
     def test_first_call_is_anonymous_hello_on_messages_endpoint(self):
-        fake = self.install(
-            FakePostEdn([_WELCOME, _WORLD_SELECTED, _PROPOSED, _ASSERTED, _RESULT])
-        )
+        fake = self.install(FakePostEdn(_FULL_SEQUENCE))
         self.run_main_capturing()
         first_path, first_form, first_session, _ = fake.calls[0]
         self.assertEqual(first_path, "/v1/messages")
@@ -397,12 +420,7 @@ class HandshakeSuccessTests(HandshakeBase):
         self.assertEqual(dumps(first_form), "(hello)")
 
     def test_session_id_from_header_is_used_in_named_endpoint_path(self):
-        fake = self.install(
-            FakePostEdn(
-                [_WELCOME, _WORLD_SELECTED, _PROPOSED, _ASSERTED, _RESULT],
-                welcome_session="s-77",
-            )
-        )
+        fake = self.install(FakePostEdn(_FULL_SEQUENCE, welcome_session="s-77"))
         self.run_main_capturing()
         # Every call after the hello must target the named-session endpoint
         # built from the X-Lemma-Session header value, and echo it back.
@@ -411,17 +429,13 @@ class HandshakeSuccessTests(HandshakeBase):
             self.assertEqual(session, "s-77")
 
     def test_base_url_is_threaded_through(self):
-        fake = self.install(
-            FakePostEdn([_WELCOME, _WORLD_SELECTED, _PROPOSED, _ASSERTED, _RESULT])
-        )
+        fake = self.install(FakePostEdn(_FULL_SEQUENCE))
         self.run_main_capturing(base="http://example.test:9999")
         for _path, _form, _session, base in fake.calls:
             self.assertEqual(base, "http://example.test:9999")
 
     def test_proposal_handle_is_threaded_into_assert(self):
-        fake = self.install(
-            FakePostEdn([_WELCOME, _WORLD_SELECTED, _PROPOSED, _ASSERTED, _RESULT])
-        )
+        fake = self.install(FakePostEdn(_FULL_SEQUENCE))
         self.run_main_capturing()
         # Call index 3 is the assert; its form is (assert <proposal>) and the
         # proposal must be the #proposal handle returned by the propose reply.
@@ -671,12 +685,27 @@ _UDS_PROPOSED = '{:event :proposed :proposal #proposal "p-1"}'
 _UDS_ASSERTED = '{:event :asserted}'
 _UDS_RESULT = '{:event :result :rows [["venus"]] :done? true}'
 
+# The seed-and-paginate tail (mirrors the HTTP fixtures): a second propose,
+# its assert, then the two-page paginated query that query_all drains.
+_UDS_PROPOSED_3X = '{:event :proposed :proposal #proposal "p-2"}'
+_UDS_PAGE1 = (
+    '{:event :result :rows [[#entity "alice"] [#entity "bob"]] '
+    ':done? false :cursor #cursor "c-1"}'
+)
+_UDS_PAGE2 = (
+    '{:event :result :rows [[#entity "carol"]] :done? true :cursor #cursor "c-1"}'
+)
+
 _UDS_FULL_SEQUENCE = [
     _UDS_WELCOME,
     _UDS_WORLD_SELECTED,
     _UDS_PROPOSED,
     _UDS_ASSERTED,
     _UDS_RESULT,
+    _UDS_PROPOSED_3X,
+    _UDS_ASSERTED,
+    _UDS_PAGE1,
+    _UDS_PAGE2,
 ]
 
 
@@ -770,12 +799,12 @@ class UdsHandshakeSuccessTests(UdsHandshakeBase):
         sent = self.sent_frames_as_edn(self.created[0])
         self.assertEqual(sent[0], "(hello)")
 
-    def test_sends_five_frames_one_per_protocol_step(self):
+    def test_sends_nine_frames_one_per_protocol_step(self):
         self.install_socket(_UDS_FULL_SEQUENCE)
 
         self.run_main_uds_capturing()
 
-        self.assertEqual(len(self.sent_frames_as_edn(self.created[0])), 5)
+        self.assertEqual(len(self.sent_frames_as_edn(self.created[0])), 9)
 
     def test_no_frame_after_hello_echoes_the_session_handle(self):
         # CRITICAL: over UDS the session is bound to the connection by the
@@ -927,6 +956,158 @@ class CliDispatchTests(unittest.TestCase):
     def test_uds_selection_does_not_invoke_http_main(self):
         lc._dispatch(["uds"])
         self.assertNotIn("main", [name for name, _, _ in self.calls])
+
+
+# ===========================================================================
+# (G) Cursor pagination: query_all(send, query_form) -> (rows, pages, failure)
+#
+# query_all is transport-agnostic: it takes a `form -> body` callable and
+# drains a paginated query by following the #cursor through (continue ...)
+# until :done? is true. We drive it with a purely in-memory scripted fake --
+# no socket, no urlopen -- that pops canned `:result`/`:error` bodies and
+# records the form it was handed each call. The canned bodies are built with
+# `edn_format.loads` so a `#cursor "c-1"` parses into the same `_Handle` the
+# loop feeds back into (continue #cursor ...).
+# ===========================================================================
+
+
+class _ScriptedSend:
+    """A scripted `form -> body` stand-in for query_all's `send` callable.
+
+    Holds a list of canned EDN body strings; each call parses the next one with
+    ``edn_format.loads`` and returns it, recording the `form` it was handed in
+    ``forms``. Running past the script raises (a test that over-drives the send
+    is a bug worth surfacing, not a silent empty read).
+    """
+
+    def __init__(self, bodies):
+        self._bodies = [loads(b) for b in bodies]
+        self._next = 0
+        self.forms = []
+
+    def __call__(self, form):
+        self.forms.append(form)
+        body = self._bodies[self._next]
+        self._next += 1
+        return body
+
+    @property
+    def call_count(self):
+        return len(self.forms)
+
+
+# A representative initial (query ...) form. query_all never inspects it -- it
+# just hands it to send unchanged on the first call -- so its shape only needs
+# to be plausible, not server-validated.
+_QFORM = (
+    Symbol("query"),
+    {
+        Keyword("find"): [Symbol("?x")],
+        Keyword("where"): [[Symbol("member-of"), Symbol("?x"), entity("team")]],
+        Keyword("limit"): 2,
+    },
+)
+
+
+class QueryAllTests(unittest.TestCase):
+    # --- (A) Multi-page drain ----------------------------------------------
+
+    def test_multi_page_drain_concatenates_rows_in_order(self):
+        send = _ScriptedSend([
+            '{:event :result :rows [[#entity "alice"] [#entity "bob"]] '
+            ':done? false :cursor #cursor "c-1"}',
+            '{:event :result :rows [[#entity "carol"]] :done? true '
+            ':cursor #cursor "c-1"}',
+        ])
+
+        rows, pages, failure = lc.query_all(send, _QFORM)
+
+        self.assertIsNone(failure)
+        self.assertEqual(pages, 2)
+        self.assertEqual(
+            rows,
+            [[entity("alice")], [entity("bob")], [entity("carol")]],
+        )
+
+    def test_multi_page_drain_second_call_is_continue_carrying_the_cursor(self):
+        send = _ScriptedSend([
+            '{:event :result :rows [[#entity "alice"] [#entity "bob"]] '
+            ':done? false :cursor #cursor "c-1"}',
+            '{:event :result :rows [[#entity "carol"]] :done? true '
+            ':cursor #cursor "c-1"}',
+        ])
+
+        lc.query_all(send, _QFORM)
+
+        # The first form is the original query; the second is the continue that
+        # carries the exact #cursor handle the first page returned.
+        self.assertEqual(send.forms[0], _QFORM)
+        self.assertEqual(
+            send.forms[1],
+            (Symbol("continue"), lc._Handle("cursor", "c-1")),
+        )
+
+    # --- (B) Single page ---------------------------------------------------
+
+    def test_single_page_done_true_returns_one_page_without_continue(self):
+        send = _ScriptedSend([
+            '{:event :result :rows [[#entity "alice"]] :done? true}',
+        ])
+
+        rows, pages, failure = lc.query_all(send, _QFORM)
+
+        self.assertIsNone(failure)
+        self.assertEqual(pages, 1)
+        self.assertEqual(rows, [[entity("alice")]])
+
+    def test_single_page_invokes_send_exactly_once(self):
+        # :done? true on the first page means the continue branch -- and the
+        # :cursor read it depends on -- is never reached, so a body with NO
+        # :cursor key must not raise KeyError.
+        send = _ScriptedSend([
+            '{:event :result :rows [[#entity "alice"]] :done? true}',
+        ])
+
+        lc.query_all(send, _QFORM)
+
+        self.assertEqual(send.call_count, 1)
+        self.assertEqual(send.forms, [_QFORM])
+
+    # --- (C) Failure propagation (expired cursor) --------------------------
+
+    def test_continue_error_propagates_as_failure_with_rows_so_far(self):
+        send = _ScriptedSend([
+            '{:event :result :rows [[#entity "alice"] [#entity "bob"]] '
+            ':done? false :cursor #cursor "c-1"}',
+            '{:event :error :reason :unknown-handle '
+            ':message "cursor c-1 has expired"}',
+        ])
+
+        rows, pages, failure = lc.query_all(send, _QFORM)
+
+        # The error body is returned verbatim as `failure` -- no exception.
+        self.assertIsNotNone(failure)
+        self.assertEqual(failure[Keyword("event")], Keyword("error"))
+        self.assertEqual(failure[Keyword("reason")], Keyword("unknown-handle"))
+        # The rows gathered before the cursor expired are preserved.
+        self.assertEqual(rows, [[entity("alice")], [entity("bob")]])
+        # pages counts only the successfully-drained first page.
+        self.assertEqual(pages, 1)
+
+    def test_first_call_error_returns_empty_rows_and_zero_pages(self):
+        # A query that fails outright (before any page lands) reports no rows,
+        # zero pages, and the error body -- and never issues a continue.
+        send = _ScriptedSend([
+            '{:event :error :reason :malformed :message "bad query form"}',
+        ])
+
+        rows, pages, failure = lc.query_all(send, _QFORM)
+
+        self.assertEqual(rows, [])
+        self.assertEqual(pages, 0)
+        self.assertIsNotNone(failure)
+        self.assertEqual(failure[Keyword("event")], Keyword("error"))
+        self.assertEqual(send.call_count, 1)
 
 
 if __name__ == "__main__":
