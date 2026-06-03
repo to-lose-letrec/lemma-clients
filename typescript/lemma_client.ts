@@ -535,6 +535,375 @@ export function uds_recv_frame(reader: FrameReader): Promise<string> {
   return reader.recv();
 }
 
+/**
+ * Read framed replies until a `:watch-event` arrives; return it (or `null`).
+ *
+ * Over UDS there is no separate event channel: watch pushes interleave with
+ * ordinary command responses on the *same* frame stream (uds.clj fans both onto
+ * the one connection). So after triggering a change we read frames in a loop,
+ * skipping command replies (the `:asserted` echo, etc.) until we see the
+ * `:watch-event` envelope, demultiplexing the push out of the command stream
+ * with the same `FrameReader`. The loop is bounded by `maxFrames` and by the
+ * socket's timeout (the caller arms `socket.setTimeout` before triggering), so
+ * a missing push can never hang -- a timeout/EOF rejects `recv()` and we return
+ * `null`, which the caller reports as "no event observed".
+ *
+ * `reader` is the connection's `FrameReader`; `maxFrames` caps how many frames
+ * we will drain before giving up. The parsed `:watch-event` map is returned, or
+ * `null` if none arrived within the budget.
+ */
+export async function uds_await_watch_event(
+  reader: FrameReader,
+  maxFrames: number = 8,
+): Promise<unknown> {
+  for (let i = 0; i < maxFrames; i += 1) {
+    let body: unknown;
+    try {
+      body = edn.parse(await uds_recv_frame(reader));
+    } catch {
+      // Socket timeout, EOF, or a parse failure: no push is coming on this
+      // connection within the budget. Report "no event observed".
+      return null;
+    }
+    if (isKeyword(eventOf(body), ":watch-event")) return body;
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Watch over HTTP:  the SSE event stream  ->  parsed :watch-event envelopes
+//
+// A (watch-pattern ...) call registers a standing query; matching changes are
+// then *pushed* to the session rather than polled. Over HTTP those pushes
+// arrive on a separate Server-Sent-Events stream, GET /v1/sessions/{id}/events
+// (SPEC §9). SSE is a one-way text stream: each event is one or more `data:`
+// lines terminated by a blank line; `:`-prefixed lines are keep-alive comments
+// to be ignored.
+//
+// Why a raw socket instead of `fetch`? Dianoia (http-kit) serves the stream
+// with `Transfer-Encoding: chunked` and writes an immediate size-0 chunk to
+// flush the response headers before any event exists. A standard chunked reader
+// -- including the WHATWG stream behind `fetch(...).body` on both Node and Bun
+// -- treats that size-0 chunk as end-of-body and reports EOF, closing the
+// stream before the first event ever arrives. So we speak HTTP by hand over a
+// raw node:net socket -- the same plumbing the UDS transport already uses --
+// and treat a size-0 chunk as a keep-alive flush (skip it, keep reading) rather
+// than as the end of the stream. Every read is bounded by `timeout` so a quiet
+// stream can never hang the demo.
+//
+// ORDERING IS LOAD-BEARING. Dianoia registers the per-session SSE sink LAZILY,
+// at the moment the GET /events connection's headers are written -- and the
+// watch dispatcher delivers a :watch-event only to sinks present at emit time,
+// with NO backlog replay. So the stream must be OPENED (sink registered) BEFORE
+// the change that triggers the event, or the push races ahead of the sink and
+// is lost. We therefore split the work in two:
+//
+//   * open_sse_stream -- connect, send the GET, read PAST the status line and
+//     headers (writing the request + draining headers is what makes Dianoia
+//     register the sink), and hand back an open handle. Call this BEFORE the
+//     trigger.
+//   * read_sse_events -- drain parsed events from an already-open handle, AFTER
+//     the trigger. Bounded by the handle's read timeout.
+//
+// This is read-only and single-threaded by design. The only plumbing
+// dependency is node:net; the EDN codec is still jsedn.
+// ---------------------------------------------------------------------------
+
+/**
+ * An open SSE connection: a raw socket whose bytes are buffered as they arrive,
+ * exposed as awaitable line/byte reads with a per-read timeout.
+ *
+ * Node delivers `'data'` as arbitrary Buffer chunks, so -- exactly as
+ * `FrameReader` does for length-prefixed frames -- we accumulate every byte and
+ * peel structure off the front on demand. `open_sse_stream` builds one
+ * (connection live, headers consumed, server sink registered); `read_sse_events`
+ * drains events from it; `close` releases the socket so the server drops the
+ * stream. The chunked-transfer and SSE decoding both run against this one
+ * buffer, so no bytes read past one boundary are lost before the next.
+ *
+ * A read parks a single waiter until either enough bytes are buffered to
+ * satisfy it, the per-read `timeout` elapses, or the peer closes (`'end'` /
+ * `'close'` / `'error'`). Timeout and EOF both reject the pending read so a
+ * quiet or torn-down stream surfaces as an error the reader turns into "no
+ * events", never a hang. At most one read may be outstanding at a time, which
+ * matches the strictly sequential decode in `read_sse_events`.
+ */
+export class SSEStream {
+  private chunks: Buffer = Buffer.alloc(0);
+  private pending: {
+    want: number | "line";
+    resolve: (buf: Buffer) => void;
+    reject: (err: Error) => void;
+    timer: ReturnType<typeof setTimeout>;
+  } | null = null;
+  private failure: Error | null = null;
+  private readonly timeoutMs: number;
+
+  constructor(private readonly socket: net.Socket, timeoutMs: number) {
+    this.timeoutMs = timeoutMs;
+    socket.on("data", (chunk: Buffer) => {
+      this.chunks = Buffer.concat([this.chunks, chunk]);
+      this.deliver();
+    });
+    socket.on("end", () => this.fail("connection closed by peer (EOF)"));
+    socket.on("close", () => this.fail("connection closed"));
+    socket.on("error", (err: Error) => this.fail(err.message));
+  }
+
+  /** Buffer the bytes already read past the header terminator (see open). */
+  prime(initial: Buffer): void {
+    if (initial.length) {
+      this.chunks = Buffer.concat([this.chunks, initial]);
+    }
+  }
+
+  /** Resolve with the next CRLF-delimited line (without the CRLF). */
+  readLine(): Promise<Buffer> {
+    return this.read("line");
+  }
+
+  /** Resolve with exactly `n` bytes off the wire. */
+  readN(n: number): Promise<Buffer> {
+    return this.read(n);
+  }
+
+  /** Release the socket, letting the server tear down the stream. */
+  close(): void {
+    this.socket.destroy();
+  }
+
+  private read(want: number | "line"): Promise<Buffer> {
+    if (this.pending) {
+      return Promise.reject(
+        new Error("SSEStream.read() called while a read is already pending"),
+      );
+    }
+    return new Promise<Buffer>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (this.pending) {
+          this.pending = null;
+          reject(new Error("SSE read timed out"));
+        }
+      }, this.timeoutMs);
+      this.pending = { want, resolve, reject, timer };
+      // Bytes may already be buffered; try to satisfy immediately. Otherwise we
+      // may already have seen EOF/error -- fail now rather than wait forever.
+      if (!this.deliver() && this.failure) {
+        clearTimeout(timer);
+        this.pending = null;
+        reject(this.failure);
+      }
+    });
+  }
+
+  /** If a waiter is parked and its bytes are buffered, hand them over. */
+  private deliver(): boolean {
+    if (!this.pending) return false;
+    const { want } = this.pending;
+
+    if (want === "line") {
+      const idx = this.chunks.indexOf("\r\n", 0, "latin1");
+      if (idx < 0) return false;
+      const line = this.chunks.subarray(0, idx);
+      this.chunks = this.chunks.subarray(idx + 2);
+      return this.settle(line);
+    }
+
+    if (this.chunks.length < want) return false;
+    const out = this.chunks.subarray(0, want);
+    this.chunks = this.chunks.subarray(want);
+    return this.settle(out);
+  }
+
+  private settle(buf: Buffer): boolean {
+    const waiter = this.pending!;
+    this.pending = null;
+    clearTimeout(waiter.timer);
+    waiter.resolve(buf);
+    return true;
+  }
+
+  /** Record an EOF/error and reject any parked read with it. */
+  private fail(message: string): void {
+    if (!this.failure) this.failure = new Error(message);
+    if (this.pending) {
+      const waiter = this.pending;
+      this.pending = null;
+      clearTimeout(waiter.timer);
+      waiter.reject(this.failure);
+    }
+  }
+}
+
+/**
+ * Open the SSE event stream for `sessionId` and return an open `SSEStream`.
+ *
+ * Connects a raw socket to the host/port parsed from `base` (e.g.
+ * `"http://127.0.0.1:8080"`), issues `GET /v1/sessions/{id}/events` with an
+ * `Accept: text/event-stream` header, and reads PAST the status line and
+ * response headers -- stopping at the blank line that begins the body. It does
+ * NOT read any event bodies; that is `read_sse_events`'s job. Bytes already
+ * read past the header terminator are primed onto the handle so the chunked
+ * decoder does not lose them.
+ *
+ * The split matters because writing the GET and draining its headers is what
+ * makes Dianoia register this session's SSE sink, and the watch dispatcher only
+ * delivers to sinks that exist when an event is emitted (no replay). So a caller
+ * must open the stream BEFORE triggering the change it wants to observe, then
+ * read AFTER -- otherwise the push races ahead of the sink and is lost.
+ *
+ * `timeout` (seconds) is the per-read budget stored on the handle, so the
+ * subsequent `read_sse_events` inherits it. The returned handle must be closed
+ * by the caller when done. If the server closes the connection before the header
+ * terminator arrives, the returned handle is still valid but empty; the
+ * subsequent read sees EOF and yields no events.
+ */
+export async function open_sse_stream(
+  base: string,
+  sessionId: string,
+  timeout: number = 10.0,
+): Promise<SSEStream> {
+  const url = new URL(base);
+  const host = url.hostname;
+  const port = url.port ? Number(url.port) : 80;
+  const timeoutMs = timeout * 1000;
+
+  const socket = net.createConnection({ host, port });
+  // Buffer header bytes ourselves until the blank-line terminator: we cannot
+  // hand the socket to SSEStream's 'data' handler yet, or it would swallow the
+  // header read. We attach a temporary collector, then transfer leftovers.
+  let header = Buffer.alloc(0);
+  const onConnect = new Promise<void>((resolve, reject) => {
+    socket.once("connect", () => resolve());
+    socket.once("error", (err: Error) =>
+      reject(
+        new Error(
+          `could not reach the Lemma server at ${base} (${err.message}); ` +
+            "is the server running?",
+        ),
+      ),
+    );
+  });
+  await onConnect;
+
+  const request =
+    `GET /v1/sessions/${sessionId}/events HTTP/1.1\r\n` +
+    `Host: ${host}:${port}\r\n` +
+    `Accept: text/event-stream\r\n` +
+    `X-Lemma-Session: ${sessionId}\r\n` +
+    `Connection: keep-alive\r\n\r\n`;
+  socket.write(request);
+
+  // Read PAST the status line and headers; the body starts after the blank
+  // line. Draining the headers here is the act that registers the server-side
+  // sink. Bounded by the same timeout so a stalled handshake cannot hang.
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      cleanup();
+      // A quiet handshake: hand back whatever we have (likely nothing). The
+      // later read will see EOF/timeout and report no events.
+      resolve();
+    }, timeoutMs);
+    const onData = (chunk: Buffer) => {
+      header = Buffer.concat([header, chunk]);
+      if (header.indexOf("\r\n\r\n", 0, "latin1") >= 0) {
+        cleanup();
+        resolve();
+      }
+    };
+    const onClose = () => {
+      cleanup();
+      // Server closed before headers completed: resolve with an empty body so
+      // the caller's try/finally can close the handle uniformly.
+      resolve();
+    };
+    const onError = (err: Error) => {
+      cleanup();
+      reject(
+        new Error(
+          `could not reach the Lemma server at ${base} (${err.message}); ` +
+            "is the server running?",
+        ),
+      );
+    };
+    function cleanup() {
+      clearTimeout(timer);
+      socket.removeListener("data", onData);
+      socket.removeListener("close", onClose);
+      socket.removeListener("error", onError);
+    }
+    socket.on("data", onData);
+    socket.on("close", onClose);
+    socket.on("error", onError);
+  });
+
+  const stream = new SSEStream(socket, timeoutMs);
+  const sep = header.indexOf("\r\n\r\n", 0, "latin1");
+  if (sep >= 0) {
+    // Hand any bytes already read past the header terminator to the handle so
+    // the chunked decoder picks up exactly where the header read stopped.
+    stream.prime(header.subarray(sep + 4));
+  }
+  return stream;
+}
+
+/**
+ * Drain up to `maxEvents` parsed envelopes from an open `SSEStream`.
+ *
+ * `stream` is the handle returned by `open_sse_stream` (its socket is live and
+ * its headers already consumed). This transfer-decodes the chunked body and
+ * parses Server-Sent Events out of it: each event's `data:` lines are
+ * concatenated and run through `edn.parse`, so the return value is a list of
+ * parsed envelopes (typically `:watch-event` maps).
+ *
+ * A size-0 chunk is http-kit's header-flush keep-alive, NOT end-of-stream, so
+ * we skip it and keep reading. A genuine connection close or the per-read
+ * timeout ends the read and returns whatever arrived so far -- a quiet stream
+ * degrades to an empty list rather than hanging. The caller owns the socket and
+ * closes it; this only reads.
+ */
+export async function read_sse_events(
+  stream: SSEStream,
+  maxEvents: number = 1,
+): Promise<unknown[]> {
+  const events: unknown[] = [];
+  let text = ""; // decoded body bytes awaiting SSE framing
+
+  try {
+    while (events.length < maxEvents) {
+      const sizeLine = (await stream.readLine()).toString("latin1").trim();
+      if (sizeLine === "") continue; // stray blank line between chunks
+      const size = parseInt(sizeLine, 16);
+      if (Number.isNaN(size)) break; // not a chunk-size line -- give up cleanly
+      if (size === 0) continue; // header-flush keep-alive, not end-of-stream
+      text += (await stream.readN(size)).toString("utf-8");
+      await stream.readN(2); // the CRLF that trails every chunk body
+
+      // An SSE event is the run of lines up to the next blank line. Concatenate
+      // its `data:` payloads (dropping `:` comments) and parse the result as one
+      // EDN envelope.
+      let nl = text.indexOf("\n\n");
+      while (nl >= 0) {
+        const block = text.slice(0, nl);
+        text = text.slice(nl + 2);
+        const data = block
+          .split("\n")
+          .filter((line) => line.startsWith("data:"))
+          .map((line) => line.slice("data:".length).replace(/^\s+/, ""));
+        if (data.length) {
+          events.push(edn.parse(data.join("\n")));
+          if (events.length >= maxEvents) break;
+        }
+        nl = text.indexOf("\n\n");
+      }
+    }
+  } catch {
+    // End of stream or a quiet period (read timeout / EOF): return what we
+    // gathered. The caller treats an empty list as "no event observed in time".
+  }
+  return events;
+}
+
 // ---------------------------------------------------------------------------
 // Cursor pagination:  drain a (query :limit N) across (continue #cursor) pages
 //
@@ -777,6 +1146,91 @@ export async function main(base: string = DEFAULT_BASE): Promise<void> {
   } else {
     console.log("server does not advertise cursor pagination; skipping paged query");
   }
+
+  // 8. Watch: register a standing pattern and observe a matching change pushed
+  //    back on the SSE event stream. Gated on the server advertising
+  //    :lemma/watch -- without it the (watch-pattern ...) verb is unsupported.
+  if (info.supports(":lemma/watch")) {
+    // (watch-pattern :pattern [[subset-of ?x #entity "group"]]) -- the args are
+    // FLAT keyword args (the :pattern keyword then the where-vector), not a
+    // wrapping map. The reply hands back a #watch handle to unwatch with.
+    const pattern = new edn.Vector([
+      new edn.Vector([
+        new edn.Symbol("subset-of"),
+        new edn.Symbol("?x"),
+        entity("group"),
+      ]),
+    ]);
+    res = await named(
+      new edn.List([new edn.Symbol("watch-pattern"), new edn.Keyword(":pattern"), pattern]),
+    );
+    if (isFailure(res.body)) {
+      console.log(`watch-pattern refused: ${describeFailure(res.body)}`);
+      return;
+    }
+    const watch = field(res.body, ":watch");
+    console.log(
+      `watch (subset-of ? group) -> ${kwText(eventOf(res.body))}` +
+        `  watch=${kwText(watch)}`,
+    );
+
+    // Ordering is load-bearing: Dianoia registers this session's SSE sink
+    // lazily, when the GET /events headers are written, and delivers a
+    // :watch-event only to sinks present at emit time (no backlog replay). So
+    // OPEN the stream first (registering the sink), THEN trigger the change,
+    // THEN drain -- otherwise the push can fire within milliseconds of the
+    // assert, before our sink exists, and be silently lost.
+    const stream = await open_sse_stream(base, sid!, 10.0);
+    try {
+      // The server pushes only DELTAS, so the change must be new: a fact
+      // re-asserted verbatim is a no-op and fires nothing. We key the probe
+      // entity to this process so each run asserts a genuinely fresh fact.
+      const probe = entity(`watch-probe-${process.pid}`);
+      res = await named(
+        new edn.List([
+          new edn.Symbol("propose"),
+          fact(new edn.Symbol("subset-of"), probe, entity("group")),
+        ]),
+      );
+      if (isFailure(res.body)) {
+        console.log(`watch-probe propose refused: ${describeFailure(res.body)}`);
+        return;
+      }
+      res = await named(
+        new edn.List([new edn.Symbol("assert"), field(res.body, ":proposal")]),
+      );
+      if (isFailure(res.body)) {
+        console.log(`watch-probe assert refused: ${describeFailure(res.body)}`);
+        return;
+      }
+
+      const events = await read_sse_events(stream, 1);
+      if (events.length) {
+        const evt = events[0];
+        console.log(
+          `watch (subset-of ? group) -> ${kwText(eventOf(evt))}` +
+            ` type=${kwText(field(evt, ":type"))}` +
+            ` data=${kwText(field(evt, ":data"))}`,
+        );
+      } else {
+        console.log("watch: no event observed before timeout");
+      }
+    } finally {
+      // Release the SSE socket so the server drops the stream, whether or not
+      // an event arrived.
+      stream.close();
+    }
+
+    // Tear the watch down. (unwatch #watch "w-N") -> :ok.
+    res = await named(new edn.List([new edn.Symbol("unwatch"), watch]));
+    if (isFailure(res.body)) {
+      console.log(`unwatch refused: ${describeFailure(res.body)}`);
+      return;
+    }
+    console.log(`unwatch ${kwText(watch)} -> ${kwText(eventOf(res.body))}`);
+  } else {
+    console.log("server does not advertise watch; skipping watch demo");
+  }
 }
 
 /**
@@ -969,6 +1423,83 @@ export async function main_uds(socketPath: string = DEFAULT_SOCKET): Promise<voi
       );
     } else {
       console.log("server does not advertise cursor pagination; skipping paged query");
+    }
+
+    // 7. Watch over UDS. Same standing-pattern idea as the HTTP path, but the
+    //    push has nowhere separate to go: it interleaves with command replies on
+    //    this one socket. Gated on the server advertising :lemma/watch.
+    if (info.supports(":lemma/watch")) {
+      // Bound every subsequent read so a missing push cannot hang the demo.
+      // Node's socket timeout fires a 'timeout' event but does NOT close the
+      // socket; we destroy it so the FrameReader's parked recv() rejects (via
+      // 'close'), which uds_await_watch_event turns into "no event observed".
+      socket.setTimeout(10000, () => socket.destroy());
+
+      // (watch-pattern :pattern [[subset-of ?x #entity "group"]]) -- flat
+      // keyword args, as on HTTP. The reply carries the #watch handle.
+      const pattern = new edn.Vector([
+        new edn.Vector([
+          new edn.Symbol("subset-of"),
+          new edn.Symbol("?x"),
+          entity("group"),
+        ]),
+      ]);
+      body = await call(
+        new edn.List([new edn.Symbol("watch-pattern"), new edn.Keyword(":pattern"), pattern]),
+      );
+      if (isFailure(body)) {
+        console.log(`watch-pattern refused: ${describeFailure(body)}`);
+        return;
+      }
+      const watch = field(body, ":watch");
+      console.log(
+        `watch (subset-of ? group) -> ${kwText(eventOf(body))}` +
+          `  watch=${kwText(watch)}`,
+      );
+
+      // Trigger a fresh delta (a verbatim re-assert is a no-op and fires
+      // nothing), keyed to this process so each run is genuinely new. The
+      // :asserted reply and the :watch-event push both land on this socket; we
+      // read the assert reply here via call(), then demux the push below.
+      const probe = entity(`watch-probe-${process.pid}`);
+      body = await call(
+        new edn.List([
+          new edn.Symbol("propose"),
+          fact(new edn.Symbol("subset-of"), probe, entity("group")),
+        ]),
+      );
+      if (isFailure(body)) {
+        console.log(`watch-probe propose refused: ${describeFailure(body)}`);
+        return;
+      }
+      body = await call(
+        new edn.List([new edn.Symbol("assert"), field(body, ":proposal")]),
+      );
+      if (isFailure(body)) {
+        console.log(`watch-probe assert refused: ${describeFailure(body)}`);
+        return;
+      }
+
+      const evt = await uds_await_watch_event(reader);
+      if (evt !== null) {
+        console.log(
+          `watch (subset-of ? group) -> ${kwText(eventOf(evt))}` +
+            ` type=${kwText(field(evt, ":type"))}` +
+            ` data=${kwText(field(evt, ":data"))}`,
+        );
+      } else {
+        console.log("watch: no event observed before timeout");
+      }
+
+      // Tear the watch down. (unwatch #watch "w-N") -> :ok.
+      body = await call(new edn.List([new edn.Symbol("unwatch"), watch]));
+      if (isFailure(body)) {
+        console.log(`unwatch refused: ${describeFailure(body)}`);
+        return;
+      }
+      console.log(`unwatch ${kwText(watch)} -> ${kwText(eventOf(body))}`);
+    } else {
+      console.log("server does not advertise watch; skipping watch demo");
     }
   } finally {
     // Always release the socket, success or failure. Closing it also lets the

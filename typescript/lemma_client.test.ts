@@ -48,10 +48,19 @@ import * as edn from "jsedn";
 class FakeSocket extends EventEmitter {
   writes: Buffer[] = [];
   destroyed = false;
+  // The watch demo arms a socket-level read timeout. We record the requested
+  // timeout but never fire it (tests are deterministic and feed every frame), so
+  // a real timer can never leak across tests or stall the suite.
+  socketTimeoutMs: number | null = null;
 
   write(chunk: Buffer | string): boolean {
     this.writes.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
     return true;
+  }
+
+  setTimeout(ms: number, _onTimeout?: () => void): this {
+    this.socketTimeoutMs = ms;
+    return this;
   }
 
   destroy(): this {
@@ -65,19 +74,94 @@ class FakeSocket extends EventEmitter {
   }
 }
 
-// The fake `createConnection` returns. Set per test before invoking the client.
+/**
+ * A self-driving stand-in for the SSE side's raw socket.
+ *
+ * The HTTP watch path connects with `net.createConnection({ host, port })`,
+ * waits for `'connect'`, writes a `GET .../events` request, drains response
+ * headers up to the blank line, then reads a chunked body. Unlike the UDS
+ * `FakeSocket` (which tests drive by hand), `main()` runs the SSE handshake
+ * with no seam to step it, so this fake DRIVES ITSELF: it emits `'connect'`
+ * once a connect listener attaches, and emits its canned chunked HTTP response
+ * as `'data'` once the client has written the GET. Everything is scheduled on
+ * the microtask queue, so it stays deterministic (no timers, no sleeps).
+ *
+ * `response` is the exact bytes to hand back after the GET (status line +
+ * headers + `\r\n\r\n` + chunked body). `autoConnect` / `autoRespond` can be
+ * disabled to exercise the connect-error and quiet-stream branches by hand.
+ */
+class FakeSSESocket extends EventEmitter {
+  writes: Buffer[] = [];
+  destroyed = false;
+  autoConnect = true;
+  autoRespond = true;
+  responded = false;
+
+  constructor(public response: Buffer = Buffer.alloc(0)) {
+    super();
+  }
+
+  // The impl does `socket.once("connect", ...)`. Fire 'connect' on a microtask
+  // as soon as a listener is registered so the awaited connect resolves.
+  once(event: string | symbol, listener: (...args: unknown[]) => void): this {
+    super.once(event, listener);
+    if (event === "connect" && this.autoConnect) {
+      queueMicrotask(() => this.emit("connect"));
+    }
+    return this;
+  }
+
+  // After the client writes its GET request, hand back the canned response so
+  // the header drain (and the subsequent chunked read) can proceed.
+  write(chunk: Buffer | string): boolean {
+    this.writes.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    if (this.autoRespond && !this.responded && this.response.length) {
+      this.responded = true;
+      queueMicrotask(() => this.emit("data", this.response));
+    }
+    return true;
+  }
+
+  destroy(): this {
+    this.destroyed = true;
+    return this;
+  }
+
+  written(): Buffer {
+    return Buffer.concat(this.writes);
+  }
+}
+
+// The fake `createConnection` returns for a UDS dial. Set per test.
 let currentSocket: FakeSocket | null = null;
-// The path the client most recently asked `createConnection` to dial.
+// The fake `createConnection` returns for an SSE (host/port) dial. Set per test.
+let currentSSESocket: FakeSSESocket | null = null;
+// The path the client most recently asked `createConnection` to dial (UDS).
 let lastPath: string | null = null;
-// How many times `createConnection` was called -- proves a UDS connect attempt.
+// The {host, port} the client most recently asked to dial (SSE). null if none.
+let lastHostPort: { host: string; port: number } | null = null;
+// How many times `createConnection` was called for a UDS path connection.
 let connectCalls = 0;
+// How many times `createConnection` was called for an SSE host/port connection.
+let sseConnectCalls = 0;
 
 mock.module("node:net", () => ({
-  createConnection: (opts: { path: string }) => {
-    connectCalls += 1;
-    lastPath = opts.path;
-    const sock = currentSocket ?? new FakeSocket();
-    currentSocket = sock;
+  // Route by connection target. A `{ path }` opts is the UDS transport and
+  // returns the UDS fake; a `{ host, port }` opts is the HTTP SSE GET and
+  // returns the self-driving SSE fake. This keeps BOTH watch transports off any
+  // real socket.
+  createConnection: (opts: { path?: string; host?: string; port?: number }) => {
+    if (opts.path !== undefined) {
+      connectCalls += 1;
+      lastPath = opts.path;
+      const sock = currentSocket ?? new FakeSocket();
+      currentSocket = sock;
+      return sock;
+    }
+    sseConnectCalls += 1;
+    lastHostPort = { host: opts.host!, port: opts.port! };
+    const sock = currentSSESocket ?? new FakeSSESocket();
+    currentSSESocket = sock;
     return sock;
   },
 }));
@@ -91,6 +175,9 @@ import {
   read_welcome,
   within_message_limit,
   uds_send_frame,
+  uds_await_watch_event,
+  open_sse_stream,
+  read_sse_events,
   DEFAULT_BASE,
   DEFAULT_SOCKET,
   entity,
@@ -110,8 +197,11 @@ afterEach(() => {
   console.log = realLog;
   // Reset the net seam between tests so no fake socket / path / counter leaks.
   currentSocket = null;
+  currentSSESocket = null;
   lastPath = null;
+  lastHostPort = null;
   connectCalls = 0;
+  sseConnectCalls = 0;
 });
 
 /** A captured outbound fetch call: its URL and RequestInit. */
@@ -165,6 +255,71 @@ const PAGE_ONE =
 const PAGE_TWO = '{:event :result :rows [["sub-c"]] :done? true}';
 // The four extra replies the paginated tail consumes, in order.
 const PAGED_TAIL = [PROPOSED_BATCH, ASSERTED, PAGE_ONE, PAGE_TWO];
+
+// ---------------------------------------------------------------------------
+// Watch-tail fixtures.
+//
+// The default WELCOME advertises :lemma/watch, so main()/main_uds now run the
+// watch demo after the paginated tail. The COMMAND replies (watch-pattern,
+// probe propose, probe assert, unwatch) ride the normal reply channel -- fetch
+// over HTTP, frames over UDS. The :watch-event itself does NOT: over HTTP it
+// arrives on the mocked SSE socket's chunked body; over UDS it is interleaved
+// as an extra frame among the command replies.
+// ---------------------------------------------------------------------------
+
+// watch-pattern -> :watch-established carrying a #watch handle to unwatch with.
+const WATCH_ESTABLISHED = '{:event :watch-established :watch #watch "w-1"}';
+// The unique probe propose -> a fresh #proposal handle, then its assert -> :ok.
+const WATCH_PROBE_PROPOSED = '{:event :proposed :proposal #proposal "p-probe"}';
+const UNWATCH_OK = '{:event :ok}';
+// The pushed delta the watch fires. Over HTTP it comes via SSE; over UDS it is
+// a frame demuxed out of the command stream by uds_await_watch_event.
+const WATCH_EVENT =
+  '{:event :watch-event :type :asserted' +
+  ' :data #fact {:predicate subset-of :subject #entity "watch-probe-x"' +
+  ' :object #entity "group"}}';
+
+// The HTTP watch tail's four COMMAND replies, in fetch order. The :watch-event
+// is delivered out-of-band on the SSE socket, so it is NOT in this list.
+const HTTP_WATCH_TAIL = [
+  WATCH_ESTABLISHED, WATCH_PROBE_PROPOSED, ASSERTED, UNWATCH_OK,
+];
+// The UDS watch tail interleaves the :watch-event frame after the probe assert
+// (where uds_await_watch_event starts draining) and before the unwatch reply.
+const UDS_WATCH_TAIL = [
+  WATCH_ESTABLISHED, WATCH_PROBE_PROPOSED, ASSERTED, WATCH_EVENT, UNWATCH_OK,
+];
+
+/**
+ * Build a chunked HTTP/1.1 SSE response body for `events`.
+ *
+ * Mirrors how Dianoia (http-kit) serves the stream: a status line, the
+ * event-stream headers, the blank-line terminator, then a `Transfer-Encoding:
+ * chunked` body. The FIRST chunk is a size-0 header-flush keep-alive (which a
+ * naive reader would mistake for EOF -- the impl must treat it as a keep-alive
+ * and keep reading). Each event becomes one chunk whose body is
+ * `data: <edn>\n\n`. A trailing `:`-comment keep-alive chunk is included to
+ * prove comment lines are skipped. No terminating size-0/EOF is written, so the
+ * reader stops on maxEvents, not on stream end.
+ */
+function chunkedSSE(events: string[]): Buffer {
+  const head =
+    "HTTP/1.1 200 OK\r\n" +
+    "Content-Type: text/event-stream\r\n" +
+    "Transfer-Encoding: chunked\r\n" +
+    "\r\n";
+  const parts: string[] = [head];
+  const chunk = (s: string) =>
+    `${Buffer.byteLength(s, "utf-8").toString(16)}\r\n${s}\r\n`;
+  // http-kit's immediate size-0 header-flush keep-alive.
+  parts.push("0\r\n\r\n");
+  for (const evt of events) {
+    parts.push(chunk(`data: ${evt}\n\n`));
+  }
+  // A `:`-comment keep-alive line -- must be ignored, not parsed as an event.
+  parts.push(chunk(": keep-alive\n\n"));
+  return Buffer.from(parts.join(""), "utf-8");
+}
 
 // ===========================================================================
 // (A) post_edn -- request shape, happy path, error-envelope recovery.
@@ -324,16 +479,32 @@ function scriptFetch(captures: Capture[], bodies: string[]): void {
 }
 
 const FULL_SEQUENCE = [
-  WELCOME, WORLD_SELECTED, PROPOSED, ASSERTED, RESULT, ...PAGED_TAIL,
+  WELCOME, WORLD_SELECTED, PROPOSED, ASSERTED, RESULT,
+  ...PAGED_TAIL, ...HTTP_WATCH_TAIL,
 ];
-// The full round-trip now makes nine calls: the original five plus the four
-// paginated-tail calls (batch propose, assert, page one, continue page two).
+// The full round-trip now makes thirteen fetch calls: the original five, the
+// four paginated-tail calls (batch propose, assert, page one, continue page
+// two), and the four watch-tail COMMAND calls (watch-pattern, probe propose,
+// probe assert, unwatch). The :watch-event is delivered out-of-band on the SSE
+// socket, so it is NOT a fetch call.
 const FULL_SEQUENCE_LEN = FULL_SEQUENCE.length;
 
+/**
+ * Arm the SSE seam so the HTTP watch path's `open_sse_stream` gets a
+ * self-driving socket that hands back a one-event chunked stream. Call before
+ * any test that runs main() to completion through the watch demo.
+ */
+function armSSE(events: string[] = [WATCH_EVENT]): FakeSSESocket {
+  const sse = new FakeSSESocket(chunkedSSE(events));
+  currentSSESocket = sse;
+  return sse;
+}
+
 describe("main() handshake", () => {
-  test("completes the full round-trip (handshake + paged query) without throwing", async () => {
+  test("completes the full round-trip (handshake + paged query + watch) without throwing", async () => {
     const captures: Capture[] = [];
     scriptFetch(captures, FULL_SEQUENCE);
+    armSSE();
 
     await expect(main()).resolves.toBeUndefined();
     expect(captures).toHaveLength(FULL_SEQUENCE_LEN);
@@ -346,6 +517,7 @@ describe("main() handshake", () => {
     }) as typeof console.log;
     const captures: Capture[] = [];
     scriptFetch(captures, FULL_SEQUENCE);
+    armSSE();
 
     await main();
 
@@ -364,6 +536,7 @@ describe("main() handshake", () => {
   test("opens with an anonymous (hello) on the /v1/messages endpoint", async () => {
     const captures: Capture[] = [];
     scriptFetch(captures, FULL_SEQUENCE);
+    armSSE();
 
     await main();
 
@@ -377,6 +550,7 @@ describe("main() handshake", () => {
   test("threads the welcome-header session id into the named-session endpoint", async () => {
     const captures: Capture[] = [];
     scriptFetch(captures, FULL_SEQUENCE);
+    armSSE();
 
     await main();
 
@@ -391,6 +565,7 @@ describe("main() handshake", () => {
   test("threads the #proposal handle from the propose reply into the assert body", async () => {
     const captures: Capture[] = [];
     scriptFetch(captures, FULL_SEQUENCE);
+    armSSE();
 
     await main();
 
@@ -406,6 +581,7 @@ describe("main() handshake", () => {
   test("threads the base url through every call", async () => {
     const captures: Capture[] = [];
     scriptFetch(captures, FULL_SEQUENCE);
+    armSSE();
 
     await main("http://example.test:9999");
 
@@ -420,6 +596,7 @@ describe("main() handshake", () => {
       lines.push(args.map(String).join(" "));
     }) as typeof console.log;
     scriptFetch([], FULL_SEQUENCE);
+    armSSE();
 
     await main();
 
@@ -750,9 +927,16 @@ const UDS_WELCOME =
   ' :capabilities #{:lemma/cursor-pagination :lemma/watch :lemma/v1}' +
   ' :limits {:max-message-bytes 1048576}}';
 const UDS_FULL = [
-  UDS_WELCOME, WORLD_SELECTED, PROPOSED, ASSERTED, RESULT, ...PAGED_TAIL,
+  UDS_WELCOME, WORLD_SELECTED, PROPOSED, ASSERTED, RESULT,
+  ...PAGED_TAIL, ...UDS_WATCH_TAIL,
 ];
-const UDS_FULL_LEN = UDS_FULL.length;
+// UDS_FULL is the list of REPLIES the server emits (14: the watch tail's five
+// includes the interleaved :watch-event). The client SENDS one fewer frame than
+// it receives, because uds_await_watch_event reads the :watch-event WITHOUT
+// sending a command for it. So the sent-frame count is 13:
+//   1 hello + 4 handshake + 4 paged tail + 4 watch tail (watch-pattern, probe
+//   propose, probe assert, unwatch).
+const UDS_FULL_SENT = 13;
 
 /** Silence console.log for a test body, restored by the shared afterEach. */
 function muteLog(): void {
@@ -835,15 +1019,16 @@ describe("FrameReader buffering (via main_uds)", () => {
     sock.emit("data", welcome.subarray(9));
 
     // Feed the rest of the round-trip one whole frame per chunk so it completes
-    // (the handshake's four replies plus the paginated tail's four).
-    for (const reply of [WORLD_SELECTED, PROPOSED, ASSERTED, RESULT, ...PAGED_TAIL]) {
+    // (the handshake's four replies, the paginated tail's four, and the watch
+    // tail's five -- the last including the interleaved :watch-event).
+    for (const reply of [WORLD_SELECTED, PROPOSED, ASSERTED, RESULT, ...PAGED_TAIL, ...UDS_WATCH_TAIL]) {
       await Promise.resolve();
       sock.emit("data", frameOf(reply));
     }
 
     await expect(run).resolves.toBeUndefined();
     // All round-trip frames sent and decodable despite the dribbled welcome.
-    expect(decodeFrames(sock.written())).toHaveLength(UDS_FULL_LEN);
+    expect(decodeFrames(sock.written())).toHaveLength(UDS_FULL_SENT);
   });
 
   test("yields ONE frame per recv when TWO frames coalesce in a single chunk", async () => {
@@ -863,14 +1048,14 @@ describe("FrameReader buffering (via main_uds)", () => {
     sock.emit("data", Buffer.concat([frameOf(PROPOSED), frameOf(ASSERTED)]));
     await Promise.resolve();
     sock.emit("data", frameOf(RESULT));
-    // Drive the paginated tail too so the round-trip runs to completion.
-    for (const reply of PAGED_TAIL) {
+    // Drive the paginated tail and watch tail too so the round-trip completes.
+    for (const reply of [...PAGED_TAIL, ...UDS_WATCH_TAIL]) {
       await Promise.resolve();
       sock.emit("data", frameOf(reply));
     }
 
     await expect(run).resolves.toBeUndefined();
-    expect(decodeFrames(sock.written())).toHaveLength(UDS_FULL_LEN);
+    expect(decodeFrames(sock.written())).toHaveLength(UDS_FULL_SENT);
   });
 
   test("rejects (does not hang) on a premature EOF mid-frame via 'close'", async () => {
@@ -928,12 +1113,12 @@ async function driveUds(sock: FakeSocket, replies: string[]): Promise<void> {
 }
 
 describe("main_uds handshake", () => {
-  test("completes the full round-trip (handshake + paged query) without throwing", async () => {
+  test("completes the full round-trip (handshake + paged query + watch) without throwing", async () => {
     const sock = new FakeSocket();
     currentSocket = sock;
 
     await expect(driveUds(sock, UDS_FULL)).resolves.toBeUndefined();
-    expect(decodeFrames(sock.written())).toHaveLength(UDS_FULL_LEN);
+    expect(decodeFrames(sock.written())).toHaveLength(UDS_FULL_SENT);
   });
 
   test("drains the paginated query, threading the #cursor into a (continue ...) frame", async () => {
@@ -1100,6 +1285,7 @@ describe("_dispatch routing", () => {
   test("a URL arg routes to HTTP main and opens NO UDS connection", async () => {
     const captures: Capture[] = [];
     scriptFetch(captures, FULL_SEQUENCE);
+    armSSE();
 
     await _dispatch(["http://example.test:9999"]);
 
@@ -1111,6 +1297,7 @@ describe("_dispatch routing", () => {
   test("no args route to HTTP main against DEFAULT_BASE and open NO UDS connection", async () => {
     const captures: Capture[] = [];
     scriptFetch(captures, FULL_SEQUENCE);
+    armSSE();
 
     await _dispatch([]);
 
@@ -1293,16 +1480,18 @@ describe("within_message_limit", () => {
 // WELCOME / UDS_WELCOME fixtures already driven by the handshake tests above.
 // ===========================================================================
 
-// A welcome advertising :watch but NOT :lemma/cursor-pagination. The single
-// (query ...) still runs; the paginated tail must be gated off.
+// A welcome advertising NEITHER :lemma/cursor-pagination NOR :lemma/watch. The
+// single (query ...) still runs; both the paginated tail AND the watch demo must
+// be gated off, so the whole round-trip is the bare five-call handshake.
 const WELCOME_NO_PAGINATION =
   '{:event :welcome :version 1 :session #session "s-1" :world #world "default"' +
-  ' :capabilities #{:lemma/watch :lemma/v1}' +
+  ' :capabilities #{:lemma/v1}' +
   ' :limits {:max-message-bytes 1048576}}';
 const UDS_WELCOME_NO_PAGINATION = WELCOME_NO_PAGINATION;
 
-// The bare handshake (no paginated tail): hello, use-world, propose, assert,
-// query. Five calls -- what a cursor-pagination-less server should elicit.
+// The bare handshake (no paginated tail, no watch tail): hello, use-world,
+// propose, assert, query. Five calls -- what a server advertising neither
+// optional capability should elicit.
 const HANDSHAKE_ONLY = [WORLD_SELECTED, PROPOSED, ASSERTED, RESULT];
 
 describe("capability gating: cursor-pagination absent", () => {
@@ -1352,10 +1541,10 @@ describe("capability gating: cursor-pagination absent", () => {
     await run;
 
     const sent = decodeFrames(sock.written());
-    // Five frames sent (hello + four handshake), strictly fewer than the nine
-    // of the full paginated run.
+    // Five frames sent (hello + four handshake), strictly fewer than the full
+    // paginated + watch run.
     expect(sent).toHaveLength(5);
-    expect(sent.length).toBeLessThan(UDS_FULL_LEN);
+    expect(sent.length).toBeLessThan(UDS_FULL_SENT);
     const output = lines.join("\n");
     expect(output).toContain("server does not advertise cursor pagination; skipping paged query");
     for (const frame of sent) {
@@ -1388,6 +1577,7 @@ describe("capability gating: cursor-pagination absent", () => {
     }) as typeof console.log;
     const captures: Capture[] = [];
     scriptFetch(captures, FULL_SEQUENCE);
+    armSSE();
 
     await main();
 
@@ -1395,5 +1585,344 @@ describe("capability gating: cursor-pagination absent", () => {
     const output = lines.join("\n");
     expect(output).toContain("paged query (subset-of ? group), limit 2 -> 3 rows over 2 page(s)");
     expect(output).not.toContain("skipping paged query");
+  });
+});
+
+// ===========================================================================
+// (H) SSE reader -- open_sse_stream + read_sse_events over the mocked socket.
+//
+// The HTTP watch path reads pushed :watch-event envelopes off a raw node:net
+// socket carrying a chunked HTTP/1.1 SSE response (Bun's fetch can't stream the
+// chunked body, hence the hand-rolled transport). We drive the real functions
+// against the self-driving FakeSSESocket: open_sse_stream connects, writes the
+// GET, and drains response headers; read_sse_events transfer-decodes the chunked
+// body and parses SSE `data:` lines into envelopes. The canned response embeds
+// a size-0 header-flush chunk and a `:`-comment keep-alive to prove neither is
+// mistaken for EOF or an event. No real socket is ever opened.
+// ===========================================================================
+
+describe("SSE reader (open_sse_stream + read_sse_events)", () => {
+  test("connects to the host/port parsed from the base, never a real socket", async () => {
+    armSSE();
+
+    const stream = await open_sse_stream("http://127.0.0.1:8080", "s-1", 1.0);
+    stream.close();
+
+    expect(sseConnectCalls).toBe(1);
+    expect(lastHostPort).toEqual({ host: "127.0.0.1", port: 8080 });
+    expect(connectCalls).toBe(0); // no UDS path dial
+  });
+
+  test("writes a GET /v1/sessions/{id}/events request with the session header", async () => {
+    const sse = armSSE();
+
+    const stream = await open_sse_stream("http://127.0.0.1:8080", "s-42", 1.0);
+    stream.close();
+
+    const request = sse.written().toString("utf-8");
+    expect(request).toContain("GET /v1/sessions/s-42/events HTTP/1.1");
+    expect(request).toContain("Accept: text/event-stream");
+    expect(request).toContain("X-Lemma-Session: s-42");
+  });
+
+  test("yields the parsed :watch-event envelope (event/type/data)", async () => {
+    armSSE([WATCH_EVENT]);
+
+    const stream = await open_sse_stream("http://127.0.0.1:8080", "s-1", 1.0);
+    const events = await read_sse_events(stream, 1);
+    stream.close();
+
+    expect(events).toHaveLength(1);
+    const evt = events[0];
+    expect(edn.encode((evt as edn.Map).at(new edn.Keyword(":event")))).toBe(
+      ":watch-event",
+    );
+    expect(edn.encode((evt as edn.Map).at(new edn.Keyword(":type")))).toBe(
+      ":asserted",
+    );
+  });
+
+  test("treats the size-0 header-flush chunk as a keep-alive, NOT end-of-stream", async () => {
+    // chunkedSSE() always emits a leading `0\r\n\r\n` chunk before the events. If
+    // read_sse_events mistook it for EOF it would return zero events; getting the
+    // event back proves the size-0 chunk is skipped and reading continues.
+    armSSE([WATCH_EVENT]);
+
+    const stream = await open_sse_stream("http://127.0.0.1:8080", "s-1", 1.0);
+    const events = await read_sse_events(stream, 1);
+    stream.close();
+
+    expect(events).toHaveLength(1);
+  });
+
+  test("skips `:`-comment keep-alive lines rather than parsing them as events", async () => {
+    // The canned response carries a trailing `: keep-alive` comment chunk. With
+    // maxEvents=2 the reader will drain past the one real event and consume the
+    // comment chunk; it must NOT surface the comment as a second event, and must
+    // terminate (the stream ends) rather than hang.
+    armSSE([WATCH_EVENT]);
+
+    // Small read timeout: after the one event and the comment chunk are drained,
+    // the next read finds nothing and times out fast, ending the loop.
+    const stream = await open_sse_stream("http://127.0.0.1:8080", "s-1", 0.05);
+    const events = await read_sse_events(stream, 2);
+    stream.close();
+
+    // Exactly one real event; the comment line produced none.
+    expect(events).toHaveLength(1);
+  });
+
+  test("honors maxEvents: stops at the cap even when more events are available", async () => {
+    armSSE([WATCH_EVENT, WATCH_EVENT, WATCH_EVENT]);
+
+    const stream = await open_sse_stream("http://127.0.0.1:8080", "s-1", 1.0);
+    const events = await read_sse_events(stream, 2);
+    stream.close();
+
+    expect(events).toHaveLength(2);
+  });
+
+  test("returns the events gathered so far and terminates on EOF (no hang)", async () => {
+    // A response that ends after one event with a terminating size-0 chunk and a
+    // socket close: read_sse_events must return that one event and not block.
+    const body =
+      "HTTP/1.1 200 OK\r\n" +
+      "Content-Type: text/event-stream\r\n" +
+      "Transfer-Encoding: chunked\r\n\r\n";
+    const evtChunk = (() => {
+      const s = `data: ${WATCH_EVENT}\n\n`;
+      return `${Buffer.byteLength(s, "utf-8").toString(16)}\r\n${s}\r\n`;
+    })();
+    const sse = new FakeSSESocket(Buffer.from(body + evtChunk, "utf-8"));
+    currentSSESocket = sse;
+
+    const stream = await open_sse_stream("http://127.0.0.1:8080", "s-1", 1.0);
+    // Ask for two but only one is on the wire; after delivering it, close the
+    // socket so the next read sees EOF and the loop ends.
+    const reading = read_sse_events(stream, 2);
+    await Promise.resolve();
+    sse.emit("close");
+    const events = await reading;
+    stream.close();
+
+    expect(events).toHaveLength(1);
+  });
+
+  test("a quiet stream (no events before the per-read timeout) yields an empty list", async () => {
+    // The socket connects and returns headers but no body chunks. The bounded
+    // per-read timeout must fire so read_sse_events returns [] rather than hang.
+    const headersOnly = Buffer.from(
+      "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n",
+      "utf-8",
+    );
+    const sse = new FakeSSESocket(headersOnly);
+    currentSSESocket = sse;
+
+    // Tiny timeout (10ms) so the test is fast and deterministic.
+    const stream = await open_sse_stream("http://127.0.0.1:8080", "s-1", 0.01);
+    const events = await read_sse_events(stream, 1);
+    stream.close();
+
+    expect(events).toEqual([]);
+  });
+});
+
+// ===========================================================================
+// (I) UDS watch demux -- uds_await_watch_event picks the :watch-event out of an
+// interleaved command-reply frame stream.
+//
+// Over UDS the watch push has no separate channel: it interleaves with ordinary
+// command replies on the one socket. uds_await_watch_event(reader, maxFrames)
+// reads frames (via reader.recv()) until it sees a :watch-event, skipping
+// command replies, bounded by maxFrames -- returning null on no-event / EOF /
+// timeout. The function only ever calls reader.recv(), so we drive it with a
+// minimal stub reader over a queue of canned frame bodies (a recv() that
+// resolves the next body, or rejects to simulate a timeout/close). No socket.
+// ===========================================================================
+
+/**
+ * A minimal stand-in for the internal FrameReader: `recv()` resolves the next
+ * canned frame body, or rejects once the queue is exhausted (simulating an EOF /
+ * socket-timeout, which is exactly how the real FrameReader fails a parked recv
+ * after the socket is destroyed). uds_await_watch_event only calls recv(), so
+ * this is a faithful seam without needing the unexported class.
+ */
+function stubReader(frames: string[], rejectMsg = "connection closed"): {
+  recv: () => Promise<string>;
+} {
+  let i = 0;
+  return {
+    recv: () => {
+      if (i < frames.length) {
+        const body = frames[i];
+        i += 1;
+        return Promise.resolve(body);
+      }
+      return Promise.reject(new Error(rejectMsg));
+    },
+  };
+}
+
+describe("uds_await_watch_event demux", () => {
+  test("returns the :watch-event found after skipping command-reply frames", async () => {
+    const reader = stubReader([ASSERTED, PROPOSED, WATCH_EVENT, UNWATCH_OK]);
+
+    const evt = await uds_await_watch_event(reader as never, 8);
+
+    expect(evt).not.toBeNull();
+    expect(edn.encode((evt as edn.Map).at(new edn.Keyword(":event")))).toBe(
+      ":watch-event",
+    );
+  });
+
+  test("returns the :watch-event when it is the very first frame read", async () => {
+    const reader = stubReader([WATCH_EVENT]);
+
+    const evt = await uds_await_watch_event(reader as never, 8);
+
+    expect(edn.encode((evt as edn.Map).at(new edn.Keyword(":type")))).toBe(
+      ":asserted",
+    );
+  });
+
+  test("returns null (does not hang) when no :watch-event arrives within maxFrames", async () => {
+    // Only command replies, more than maxFrames of them: the bounded loop must
+    // give up and return null rather than draining forever.
+    const reader = stubReader([ASSERTED, PROPOSED, ASSERTED, PROPOSED, ASSERTED]);
+
+    const evt = await uds_await_watch_event(reader as never, 3);
+
+    expect(evt).toBeNull();
+  });
+
+  test("stops at maxFrames even though a later frame would have been the event", async () => {
+    // The :watch-event sits at index 3 but maxFrames is 3, so it is never read.
+    const reader = stubReader([ASSERTED, PROPOSED, ASSERTED, WATCH_EVENT]);
+
+    const evt = await uds_await_watch_event(reader as never, 3);
+
+    expect(evt).toBeNull();
+  });
+
+  test("returns null on a premature close (recv rejects) before any event", async () => {
+    // An empty queue makes the first recv() reject (EOF/timeout). The function
+    // must catch that and report null, not propagate the rejection.
+    const reader = stubReader([]);
+
+    const evt = await uds_await_watch_event(reader as never, 8);
+
+    expect(evt).toBeNull();
+  });
+
+  test("returns null when the stream closes after some command replies but no event", async () => {
+    // A few command replies then EOF: recv resolves the replies, then rejects.
+    const reader = stubReader([ASSERTED, PROPOSED]);
+
+    const evt = await uds_await_watch_event(reader as never, 8);
+
+    expect(evt).toBeNull();
+  });
+});
+
+// ===========================================================================
+// (J) Watch capability gating -- the watch demo runs IFF :lemma/watch is
+// advertised. We drive main()/main_uds with a welcome that advertises
+// cursor-pagination but OMITS :lemma/watch and assert the watch block is
+// skipped: the skip note is printed, no (watch-pattern ...) is ever sent, and
+// over HTTP the SSE socket is NEVER opened (sseConnectCalls stays 0).
+// ===========================================================================
+
+// A welcome advertising cursor-pagination but NOT :lemma/watch: the paged tail
+// runs, the watch demo must be gated off.
+const WELCOME_NO_WATCH =
+  '{:event :welcome :version 1 :session #session "s-1" :world #world "default"' +
+  ' :capabilities #{:lemma/cursor-pagination :lemma/v1}' +
+  ' :limits {:max-message-bytes 1048576}}';
+const UDS_WELCOME_NO_WATCH = WELCOME_NO_WATCH;
+
+// The handshake + paged tail but NO watch tail: nine calls/frames.
+const NO_WATCH_SEQUENCE = [
+  WORLD_SELECTED, PROPOSED, ASSERTED, RESULT, ...PAGED_TAIL,
+];
+
+describe("capability gating: watch absent", () => {
+  test("HTTP main() SKIPS the watch demo and NEVER opens the SSE socket", async () => {
+    const lines: string[] = [];
+    console.log = ((...args: unknown[]) => {
+      lines.push(args.map(String).join(" "));
+    }) as typeof console.log;
+    const captures: Capture[] = [];
+    scriptFetch(captures, [WELCOME_NO_WATCH, ...NO_WATCH_SEQUENCE]);
+    // Deliberately do NOT arm the SSE seam: if the watch demo wrongly ran, the
+    // SSE connect attempt would still be counted (and we assert it is zero).
+
+    await main();
+
+    // Nine fetch calls (handshake + paged tail); the four watch-tail calls gone.
+    expect(captures).toHaveLength(9);
+    expect(captures.length).toBeLessThan(FULL_SEQUENCE_LEN);
+    // The SSE socket was never opened -- the load-bearing proof the watch path
+    // was gated, not merely quiet.
+    expect(sseConnectCalls).toBe(0);
+    const output = lines.join("\n");
+    expect(output).toContain("server does not advertise watch; skipping watch demo");
+    // No watch-pattern / unwatch frame ever went out.
+    for (const cap of captures) {
+      const sent = cap.init.body as string;
+      expect(sent).not.toContain("watch-pattern");
+      expect(sent).not.toContain("unwatch");
+    }
+  });
+
+  test("HTTP main() resolves without throwing on the watch-gated path", async () => {
+    muteLog();
+    scriptFetch([], [WELCOME_NO_WATCH, ...NO_WATCH_SEQUENCE]);
+
+    await expect(main()).resolves.toBeUndefined();
+    expect(sseConnectCalls).toBe(0);
+  });
+
+  test("UDS main_uds() SKIPS the watch demo when :lemma/watch is unadvertised", async () => {
+    const sock = new FakeSocket();
+    currentSocket = sock;
+    const lines: string[] = [];
+    const run = main_uds(DEFAULT_SOCKET);
+    console.log = ((...args: unknown[]) => {
+      lines.push(args.map(String).join(" "));
+    }) as typeof console.log;
+    sock.emit("connect");
+    for (const reply of [UDS_WELCOME_NO_WATCH, ...NO_WATCH_SEQUENCE]) {
+      await Promise.resolve();
+      sock.emit("data", frameOf(reply));
+    }
+    await run;
+
+    const sent = decodeFrames(sock.written());
+    // Nine frames (hello + handshake + paged tail), no watch tail.
+    expect(sent).toHaveLength(9);
+    expect(sent.length).toBeLessThan(UDS_FULL_SENT);
+    const output = lines.join("\n");
+    expect(output).toContain("server does not advertise watch; skipping watch demo");
+    for (const frame of sent) {
+      expect(frame).not.toContain("watch-pattern");
+      expect(frame).not.toContain("unwatch");
+    }
+    // No host/port dial either -- UDS never touches the SSE transport.
+    expect(sseConnectCalls).toBe(0);
+  });
+
+  test("UDS main_uds() still closes the socket on the watch-gated path", async () => {
+    const sock = new FakeSocket();
+    currentSocket = sock;
+    const run = main_uds(DEFAULT_SOCKET);
+    muteLog();
+    sock.emit("connect");
+    for (const reply of [UDS_WELCOME_NO_WATCH, ...NO_WATCH_SEQUENCE]) {
+      await Promise.resolve();
+      sock.emit("data", frameOf(reply));
+    }
+    await run;
+
+    expect(sock.destroyed).toBe(true);
   });
 });
