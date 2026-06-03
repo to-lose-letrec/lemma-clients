@@ -20,12 +20,76 @@
  */
 
 import { test, expect, mock, afterEach, describe } from "bun:test";
+import { EventEmitter } from "node:events";
 import * as edn from "jsedn";
+
+// ---------------------------------------------------------------------------
+// node:net seam.
+//
+// The UDS transport reaches the network only through `net.createConnection`.
+// The implementation does `import * as net from "node:net"` and calls
+// `net.createConnection({ path })`, then drives the returned socket as an
+// EventEmitter (`.on('data'|'end'|'close'|'error')`, `.once('connect'|'error')`,
+// `.write(buf)`, `.destroy()`). We replace the whole module with `mock.module`
+// so no real socket is ever opened. A module-level `currentSocket` lets each
+// test hand `createConnection` the fake it wants to drive, and `lastPath`
+// records the path the client asked to connect to.
+//
+// `mock.module` must run before `./lemma_client` is imported, so the import of
+// the module under test comes AFTER this block.
+// ---------------------------------------------------------------------------
+
+/**
+ * An EventEmitter standing in for a `net.Socket`. `.write()` captures the exact
+ * bytes the client put on the wire; `.destroy()` records the close. Tests drive
+ * the lifecycle by emitting `'connect'` / `'data'` / `'end'` / `'close'` /
+ * `'error'` themselves, so every test is fully deterministic.
+ */
+class FakeSocket extends EventEmitter {
+  writes: Buffer[] = [];
+  destroyed = false;
+
+  write(chunk: Buffer | string): boolean {
+    this.writes.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    return true;
+  }
+
+  destroy(): this {
+    this.destroyed = true;
+    return this;
+  }
+
+  /** Concatenate every captured write -- the full outbound byte stream. */
+  written(): Buffer {
+    return Buffer.concat(this.writes);
+  }
+}
+
+// The fake `createConnection` returns. Set per test before invoking the client.
+let currentSocket: FakeSocket | null = null;
+// The path the client most recently asked `createConnection` to dial.
+let lastPath: string | null = null;
+// How many times `createConnection` was called -- proves a UDS connect attempt.
+let connectCalls = 0;
+
+mock.module("node:net", () => ({
+  createConnection: (opts: { path: string }) => {
+    connectCalls += 1;
+    lastPath = opts.path;
+    const sock = currentSocket ?? new FakeSocket();
+    currentSocket = sock;
+    return sock;
+  },
+}));
 
 import {
   post_edn,
   main,
+  main_uds,
+  _dispatch,
+  uds_send_frame,
   DEFAULT_BASE,
+  DEFAULT_SOCKET,
   entity,
   world,
   fact,
@@ -41,6 +105,10 @@ const realLog = console.log;
 afterEach(() => {
   globalThis.fetch = realFetch;
   console.log = realLog;
+  // Reset the net seam between tests so no fake socket / path / counter leaks.
+  currentSocket = null;
+  lastPath = null;
+  connectCalls = 0;
 });
 
 /** A captured outbound fetch call: its URL and RequestInit. */
@@ -383,5 +451,391 @@ describe("EDN tagged-literal encoding", () => {
     expect(encoded).toContain(":predicate equivalent");
     expect(encoded).toContain(':subject #entity "morningstar"');
     expect(encoded).toContain(':object #entity "venus"');
+  });
+});
+
+// ===========================================================================
+// (D) UDS framing helpers and shared fakes.
+// ===========================================================================
+
+/**
+ * Build the on-the-wire frame for an EDN body exactly as `uds_send_frame`
+ * should: a 4-byte big-endian length prefix followed by the UTF-8 body. Used to
+ * synthesise canned server replies and to assert outbound framing.
+ */
+function frameOf(ednStr: string): Buffer {
+  const body = Buffer.from(ednStr, "utf-8");
+  const frame = Buffer.alloc(4 + body.length);
+  frame.writeUInt32BE(body.length, 0);
+  body.copy(frame, 4);
+  return frame;
+}
+
+/** Decode one length-prefixed frame at `offset`, returning body + next offset. */
+function readFrame(buf: Buffer, offset: number): { body: string; next: number } {
+  const length = buf.readUInt32BE(offset);
+  const body = buf.subarray(offset + 4, offset + 4 + length).toString("utf-8");
+  return { body, next: offset + 4 + length };
+}
+
+/** Split a buffer into all frames it contains (assumes well-formed framing). */
+function decodeFrames(buf: Buffer): string[] {
+  const out: string[] = [];
+  let off = 0;
+  while (off < buf.length) {
+    const { body, next } = readFrame(buf, off);
+    out.push(body);
+    off = next;
+  }
+  return out;
+}
+
+// The five canned UDS replies, mirroring the HTTP handshake. Note the UDS
+// welcome carries the session as a #session-tagged field (connection-bound),
+// NOT as a header.
+const UDS_WELCOME =
+  '{:event :welcome :version 1 :session #session "s-1" :world #world "default"}';
+const UDS_FULL = [UDS_WELCOME, WORLD_SELECTED, PROPOSED, ASSERTED, RESULT];
+
+/** Silence console.log for a test body, restored by the shared afterEach. */
+function muteLog(): void {
+  console.log = (() => {}) as typeof console.log;
+}
+
+// ===========================================================================
+// (A) Framing: uds_send_frame byte layout + FrameReader buffering/EOF.
+//
+// The FrameReader is internal, so its split / coalesce / EOF behaviour is
+// exercised through main_uds, which feeds replies into it via 'data' and
+// observes the result. uds_send_frame is exported and tested directly.
+// ===========================================================================
+
+describe("uds_send_frame byte layout", () => {
+  test("writes a 4-byte big-endian length prefix equal to the UTF-8 body length", () => {
+    const sock = new FakeSocket();
+    const form = '{:event :welcome}';
+
+    uds_send_frame(sock as unknown as import("node:net").Socket, form);
+
+    const written = sock.written();
+    const bodyLen = Buffer.from(form, "utf-8").length;
+    expect(written.readUInt32BE(0)).toBe(bodyLen);
+    expect(written.length).toBe(4 + bodyLen);
+  });
+
+  test("writes the UTF-8 body verbatim after the prefix", () => {
+    const sock = new FakeSocket();
+    const form = '(hello)';
+
+    uds_send_frame(sock as unknown as import("node:net").Socket, form);
+
+    const written = sock.written();
+    expect(written.subarray(4).toString("utf-8")).toBe(form);
+  });
+
+  test("frames an edn.encode(form) so the prefix matches the encoded byte length", () => {
+    const sock = new FakeSocket();
+    const form = new edn.List([new edn.Symbol("hello")]);
+    const encoded = edn.encode(form);
+
+    uds_send_frame(sock as unknown as import("node:net").Socket, encoded);
+
+    const written = sock.written();
+    expect(written.readUInt32BE(0)).toBe(Buffer.from(encoded, "utf-8").length);
+    expect(written.subarray(4).toString("utf-8")).toBe(encoded);
+  });
+
+  test("preserves multi-byte UTF-8: prefix counts bytes, not characters", () => {
+    const sock = new FakeSocket();
+    const form = '{:msg "héllo-✓"}'; // contains multi-byte code points
+
+    uds_send_frame(sock as unknown as import("node:net").Socket, form);
+
+    const written = sock.written();
+    const byteLen = Buffer.from(form, "utf-8").length;
+    expect(byteLen).toBeGreaterThan(form.length); // proves multi-byte present
+    expect(written.readUInt32BE(0)).toBe(byteLen);
+    expect(written.subarray(4).toString("utf-8")).toBe(form);
+  });
+});
+
+describe("FrameReader buffering (via main_uds)", () => {
+  test("reassembles a frame delivered SPLIT across multiple data chunks", async () => {
+    const sock = new FakeSocket();
+    currentSocket = sock;
+
+    const run = main_uds(DEFAULT_SOCKET);
+    muteLog();
+
+    // The welcome frame arrives byte-dribbled across several 'data' emissions
+    // (prefix split from body, body split mid-way) -- the reader must buffer.
+    const welcome = frameOf(UDS_WELCOME);
+    sock.emit("connect");
+    await Promise.resolve(); // let main_uds send (hello) and park on recv()
+    sock.emit("data", welcome.subarray(0, 2));
+    sock.emit("data", welcome.subarray(2, 4));
+    sock.emit("data", welcome.subarray(4, 9));
+    sock.emit("data", welcome.subarray(9));
+
+    // Feed the rest of the handshake one whole frame per chunk so it completes.
+    for (const reply of [WORLD_SELECTED, PROPOSED, ASSERTED, RESULT]) {
+      await Promise.resolve();
+      sock.emit("data", frameOf(reply));
+    }
+
+    await expect(run).resolves.toBeUndefined();
+    // Five frames sent (hello/use-world/propose/assert/query), all decodable.
+    expect(decodeFrames(sock.written())).toHaveLength(5);
+  });
+
+  test("yields ONE frame per recv when TWO frames coalesce in a single chunk", async () => {
+    const sock = new FakeSocket();
+    currentSocket = sock;
+
+    const run = main_uds(DEFAULT_SOCKET);
+    muteLog();
+
+    sock.emit("connect");
+    await Promise.resolve();
+    // welcome AND world-selected land in one chunk: the reader must hand back
+    // exactly one frame to the first recv() and keep the second buffered.
+    sock.emit("data", Buffer.concat([frameOf(UDS_WELCOME), frameOf(WORLD_SELECTED)]));
+    // proposed + asserted coalesced too.
+    await Promise.resolve();
+    sock.emit("data", Buffer.concat([frameOf(PROPOSED), frameOf(ASSERTED)]));
+    await Promise.resolve();
+    sock.emit("data", frameOf(RESULT));
+
+    await expect(run).resolves.toBeUndefined();
+    expect(decodeFrames(sock.written())).toHaveLength(5);
+  });
+
+  test("rejects (does not hang) on a premature EOF mid-frame via 'close'", async () => {
+    const sock = new FakeSocket();
+    currentSocket = sock;
+
+    const run = main_uds(DEFAULT_SOCKET);
+    muteLog();
+
+    sock.emit("connect");
+    await Promise.resolve(); // hello sent, recv() parked
+    // Only the length prefix arrives, promising a body that never comes, then
+    // the peer drops the connection. The parked recv() must reject, not hang.
+    sock.emit("data", frameOf(UDS_WELCOME).subarray(0, 4));
+    sock.emit("close");
+
+    await expect(run).rejects.toThrow("connection closed");
+  });
+
+  test("rejects on a premature EOF mid-frame via 'end'", async () => {
+    const sock = new FakeSocket();
+    currentSocket = sock;
+
+    const run = main_uds(DEFAULT_SOCKET);
+    muteLog();
+
+    sock.emit("connect");
+    await Promise.resolve();
+    sock.emit("data", frameOf(UDS_WELCOME).subarray(0, 5)); // partial frame
+    sock.emit("end");
+
+    await expect(run).rejects.toThrow("EOF");
+  });
+});
+
+// ===========================================================================
+// (B) main_uds handshake: drive the full sequence over the fake socket.
+// ===========================================================================
+
+/**
+ * Drive a full (or truncated) UDS handshake: emit 'connect', then for each
+ * canned reply wait a microtask (so the client has sent its frame and parked on
+ * recv()) and emit that reply as one framed 'data' chunk. Returns when the
+ * main_uds promise settles.
+ */
+async function driveUds(sock: FakeSocket, replies: string[]): Promise<void> {
+  const run = main_uds(DEFAULT_SOCKET);
+  muteLog();
+  sock.emit("connect");
+  for (const reply of replies) {
+    await Promise.resolve();
+    sock.emit("data", frameOf(reply));
+  }
+  await run;
+}
+
+describe("main_uds handshake", () => {
+  test("completes the full five-step sequence without throwing", async () => {
+    const sock = new FakeSocket();
+    currentSocket = sock;
+
+    await expect(driveUds(sock, UDS_FULL)).resolves.toBeUndefined();
+    expect(decodeFrames(sock.written())).toHaveLength(5);
+  });
+
+  test("opens with an anonymous (hello) frame", async () => {
+    const sock = new FakeSocket();
+    currentSocket = sock;
+
+    await driveUds(sock, UDS_FULL);
+
+    const sent = decodeFrames(sock.written());
+    expect(sent[0]).toBe(edn.encode(new edn.List([new edn.Symbol("hello")])));
+  });
+
+  test("never echoes a session id / #session into any frame after hello (connection-bound)", async () => {
+    const sock = new FakeSocket();
+    currentSocket = sock;
+
+    await driveUds(sock, UDS_FULL);
+
+    // The welcome carried #session "s-1"; over UDS the session is bound to the
+    // connection, so NO sent frame may carry a session id or #session tag.
+    for (const frame of decodeFrames(sock.written())) {
+      expect(frame).not.toContain("#session");
+      expect(frame).not.toContain("s-1");
+      expect(frame).not.toContain(":session");
+    }
+  });
+
+  test("threads the #proposal from the propose reply into the assert frame", async () => {
+    const sock = new FakeSocket();
+    currentSocket = sock;
+
+    await driveUds(sock, UDS_FULL);
+
+    // Sent frame index 3 is the assert; it must carry exactly the #proposal
+    // handle ("p-1") the proposed reply (UDS_FULL[2]) returned.
+    const assertFrame = decodeFrames(sock.written())[3];
+    const expected = edn.encode(
+      new edn.List([new edn.Symbol("assert"), edn.parse('#proposal "p-1"')]),
+    );
+    expect(assertFrame).toBe(expected);
+  });
+
+  test("closes (destroys) the socket on the way out", async () => {
+    const sock = new FakeSocket();
+    currentSocket = sock;
+
+    await driveUds(sock, UDS_FULL);
+
+    expect(sock.destroyed).toBe(true);
+  });
+
+  test("connects to the socket path it was given", async () => {
+    const sock = new FakeSocket();
+    currentSocket = sock;
+
+    const run = main_uds("/tmp/custom.sock");
+    muteLog();
+    sock.emit("connect");
+    for (const reply of UDS_FULL) {
+      await Promise.resolve();
+      sock.emit("data", frameOf(reply));
+    }
+    await run;
+
+    expect(lastPath).toBe("/tmp/custom.sock");
+  });
+
+  test("stops cleanly (no throw) on a non-:welcome first reply", async () => {
+    const sock = new FakeSocket();
+    currentSocket = sock;
+
+    await expect(
+      driveUds(sock, ['{:event :error :reason :malformed :message "bad"}']),
+    ).resolves.toBeUndefined();
+    // Only the hello frame was sent before the sequence bailed.
+    expect(decodeFrames(sock.written())).toHaveLength(1);
+    expect(sock.destroyed).toBe(true);
+  });
+});
+
+// ===========================================================================
+// (C) connect failure: 'error' before 'connect' rejects, naming the path.
+// ===========================================================================
+
+describe("main_uds connect failure", () => {
+  test("rejects with an Error naming the socket path when the socket errors before connect", async () => {
+    const sock = new FakeSocket();
+    currentSocket = sock;
+
+    const run = main_uds("/no/such.sock");
+    muteLog();
+    // An ENOENT-like failure arrives before 'connect' ever fires.
+    sock.emit("error", new Error("connect ENOENT /no/such.sock"));
+
+    await expect(run).rejects.toThrow("/no/such.sock");
+  });
+
+  test("the rejection mentions the server-not-running hint", async () => {
+    const sock = new FakeSocket();
+    currentSocket = sock;
+
+    const run = main_uds("/no/such.sock");
+    muteLog();
+    sock.emit("error", new Error("ENOENT"));
+
+    await expect(run).rejects.toThrow("is the server running?");
+  });
+});
+
+// ===========================================================================
+// (D) _dispatch routing: "uds" -> UDS connect; URL / no-arg -> HTTP main.
+// ===========================================================================
+
+describe("_dispatch routing", () => {
+  test('argv ["uds", "/x.sock"] attempts a UDS connection to that path', async () => {
+    const sock = new FakeSocket();
+    currentSocket = sock;
+
+    const run = _dispatch(["uds", "/x.sock"]);
+    muteLog();
+    sock.emit("connect");
+    for (const reply of UDS_FULL) {
+      await Promise.resolve();
+      sock.emit("data", frameOf(reply));
+    }
+    await run;
+
+    expect(connectCalls).toBe(1);
+    expect(lastPath).toBe("/x.sock");
+  });
+
+  test('argv ["uds"] alone defaults to DEFAULT_SOCKET', async () => {
+    const sock = new FakeSocket();
+    currentSocket = sock;
+
+    const run = _dispatch(["uds"]);
+    muteLog();
+    sock.emit("connect");
+    for (const reply of UDS_FULL) {
+      await Promise.resolve();
+      sock.emit("data", frameOf(reply));
+    }
+    await run;
+
+    expect(lastPath).toBe(DEFAULT_SOCKET);
+  });
+
+  test("a URL arg routes to HTTP main and opens NO UDS connection", async () => {
+    const captures: Capture[] = [];
+    scriptFetch(captures, FULL_SEQUENCE);
+
+    await _dispatch(["http://example.test:9999"]);
+
+    expect(connectCalls).toBe(0); // no UDS dial
+    // First HTTP call hit the URL arg's base.
+    expect(captures[0].url.startsWith("http://example.test:9999")).toBe(true);
+  });
+
+  test("no args route to HTTP main against DEFAULT_BASE and open NO UDS connection", async () => {
+    const captures: Capture[] = [];
+    scriptFetch(captures, FULL_SEQUENCE);
+
+    await _dispatch([]);
+
+    expect(connectCalls).toBe(0);
+    expect(captures[0].url.startsWith(DEFAULT_BASE)).toBe(true);
   });
 });

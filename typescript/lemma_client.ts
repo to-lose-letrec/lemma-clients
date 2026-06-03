@@ -54,6 +54,7 @@
  */
 
 import * as edn from "jsedn";
+import * as net from "node:net";
 
 // ---------------------------------------------------------------------------
 // Tagged-literal & collection constructors
@@ -244,6 +245,147 @@ export async function post_edn(
 }
 
 // ---------------------------------------------------------------------------
+// UDS transport:  EDN form  ->  length-prefixed frame  ->  parsed EDN response
+//
+// A second transport that speaks the same EDN codec over a Unix domain socket
+// instead of HTTP. It sits alongside post_edn rather than replacing it -- same
+// "encode, send, decode" shape, different plumbing. Two things differ from HTTP:
+//
+//   * Framing. There is no HTTP envelope, so each message is delimited
+//     explicitly: a 4-byte big-endian UNSIGNED length prefix followed by that
+//     many UTF-8 bytes of EDN. This matches Dianoia's transport/uds.clj
+//     write-frame / read-frame exactly (DataOutputStream.writeInt is a 4-byte
+//     big-endian int).
+//   * Session binding. Over HTTP the client threads the session id back into
+//     each request header. Over UDS the server binds the session to the
+//     *connection*: it captures the id from the welcome envelope and attaches
+//     it to the socket (see uds.clj handle-frame / build-ctx). So the client
+//     must NOT echo the session id into later frames -- it just keeps sending
+//     on the same socket, and the server already knows who it is.
+//
+// Node's `net` sockets are streaming, not message-oriented: `'data'` arrives as
+// arbitrary Buffer chunks that may split one frame across reads or coalesce
+// several frames into one. `FrameReader` below absorbs that, handing back one
+// length-prefixed frame at a time as a Promise. The only plumbing dependency is
+// node:net; the EDN codec is still jsedn.
+// ---------------------------------------------------------------------------
+
+/** Where a locally booted Dianoia UDS listener binds by default (uds.clj). */
+export const DEFAULT_SOCKET = "/tmp/dianoia.sock";
+
+/**
+ * A length-prefixed frame demultiplexer over a streaming Node socket.
+ *
+ * Node delivers `'data'` as raw Buffer chunks with no respect for our message
+ * boundaries: a single frame may straddle several chunks, and several frames
+ * may land in one chunk. So we buffer every byte that arrives and, on each
+ * `recv()` request, try to peel exactly one frame off the front -- a 4-byte
+ * big-endian length followed by that many body bytes -- leaving the remainder
+ * buffered for the next call.
+ *
+ * `recv()` returns a Promise that resolves with one frame's UTF-8 body. If a
+ * whole frame is already buffered it resolves synchronously on the microtask
+ * queue; otherwise it parks until enough bytes arrive. Exactly one `recv()` may
+ * be outstanding at a time, which matches the strictly request/response UDS
+ * protocol (one frame in, one frame out). EOF before a full frame -- the socket
+ * emitting `'end'`, `'close'`, or `'error'` -- rejects the pending `recv()` (and
+ * every later one) so a truncated reply surfaces as an error rather than hanging.
+ */
+class FrameReader {
+  private chunks: Buffer = Buffer.alloc(0);
+  private pending: {
+    resolve: (body: string) => void;
+    reject: (err: Error) => void;
+  } | null = null;
+  private failure: Error | null = null;
+
+  constructor(socket: net.Socket) {
+    socket.on("data", (chunk: Buffer) => {
+      this.chunks = Buffer.concat([this.chunks, chunk]);
+      this.deliver();
+    });
+    // Any of these means the peer is gone. A still-pending recv() can never be
+    // satisfied, so fail it (and remember the failure for later recv() calls).
+    socket.on("end", () => this.fail("connection closed by peer (EOF)"));
+    socket.on("close", () => this.fail("connection closed"));
+    socket.on("error", (err: Error) => this.fail(err.message));
+  }
+
+  /** Resolve with the next length-prefixed frame body, or reject on EOF/error. */
+  recv(): Promise<string> {
+    if (this.pending) {
+      return Promise.reject(
+        new Error("FrameReader.recv() called while a read is already pending"),
+      );
+    }
+    return new Promise<string>((resolve, reject) => {
+      this.pending = { resolve, reject };
+      // Bytes may already be buffered (a coalesced frame, or one that arrived
+      // before this call); try to satisfy immediately. Otherwise we've already
+      // seen EOF/error -- fail now rather than wait for a chunk that won't come.
+      if (!this.deliver() && this.failure) {
+        this.pending = null;
+        reject(this.failure);
+      }
+    });
+  }
+
+  /**
+   * If a waiter is parked and a full frame is buffered, hand it over and
+   * consume those bytes. Returns true iff a frame was delivered.
+   */
+  private deliver(): boolean {
+    if (!this.pending) return false;
+    if (this.chunks.length < 4) return false;
+    const length = this.chunks.readUInt32BE(0);
+    if (this.chunks.length < 4 + length) return false;
+
+    const body = this.chunks.subarray(4, 4 + length).toString("utf-8");
+    this.chunks = this.chunks.subarray(4 + length);
+    const waiter = this.pending;
+    this.pending = null;
+    waiter.resolve(body);
+    return true;
+  }
+
+  /** Record an EOF/error and reject any parked recv() with it. */
+  private fail(message: string): void {
+    if (!this.failure) this.failure = new Error(message);
+    if (this.pending) {
+      const waiter = this.pending;
+      this.pending = null;
+      waiter.reject(this.failure);
+    }
+  }
+}
+
+/**
+ * Frame `ednStr` and write it: a 4-byte big-endian length prefix, then the
+ * UTF-8 body. Mirrors uds.clj write-frame (DataOutputStream.writeInt is a
+ * 4-byte big-endian int). `socket.write` buffers internally, so a single call
+ * puts the whole frame on the wire in order.
+ */
+export function uds_send_frame(socket: net.Socket, ednStr: string): void {
+  const body = Buffer.from(ednStr, "utf-8");
+  const frame = Buffer.alloc(4 + body.length);
+  frame.writeUInt32BE(body.length, 0);
+  body.copy(frame, 4);
+  socket.write(frame);
+}
+
+/**
+ * Read one length-prefixed frame from `reader` and return its body as a string.
+ *
+ * The inverse of `uds_send_frame`: the `FrameReader` already handles the 4-byte
+ * length, the body read, and the UTF-8 decode -- including frames split across
+ * or coalesced within socket chunks -- so this is a thin, named await over it
+ * that mirrors python's uds_recv_frame.
+ */
+export function uds_recv_frame(reader: FrameReader): Promise<string> {
+  return reader.recv();
+}
+
+// ---------------------------------------------------------------------------
 // Runnable recipe:  the full Lemma round-trip
 //
 // A flat, linear retelling of examples/hello-http.clj: say hello, enter a
@@ -345,12 +487,153 @@ export async function main(base: string = DEFAULT_BASE): Promise<void> {
   );
 }
 
+/**
+ * Run the same hello/propose/assert/query round-trip over a Unix domain socket.
+ *
+ * Step for step this is the HTTP `main` -- hello, enter a world, propose a
+ * fact, assert it, query it back -- but spoken over a UDS frame stream. The one
+ * protocol difference is session handling: the server binds the session to the
+ * connection from the welcome envelope (uds.clj handle-frame), so we do NOT
+ * thread the session id into later frames. Every call after hello simply rides
+ * the same open socket.
+ *
+ * After each response we check `:event`; an `:error` / `:rejected` envelope is
+ * printed and the sequence stops cleanly rather than crashing. The socket is
+ * always closed on the way out, success or failure.
+ */
+export async function main_uds(socketPath: string = DEFAULT_SOCKET): Promise<void> {
+  // Connect and wait for the connection (or a connect-time error). An ENOENT /
+  // ECONNREFUSED before 'connect' means no listener at the path -- reject with
+  // an Error naming it so the failure is actionable rather than a bare errno.
+  const socket = net.createConnection({ path: socketPath });
+  const reader = new FrameReader(socket);
+  await new Promise<void>((resolve, reject) => {
+    socket.once("connect", resolve);
+    socket.once("error", (err: Error) =>
+      reject(
+        new Error(
+          `could not connect to the Lemma UDS server at ${socketPath} ` +
+            `(${err.message}); is the server running?`,
+        ),
+      ),
+    );
+  });
+
+  try {
+    // One round-trip: frame out, frame in, decode. The session lives on the
+    // connection -- no id is echoed back, unlike the HTTP transport.
+    const call = async (form: unknown): Promise<unknown> => {
+      uds_send_frame(socket, edn.encode(form));
+      return edn.parse(await uds_recv_frame(reader));
+    };
+
+    // 1. Anonymous hello. The welcome reply carries the session id, which the
+    //    server has already pinned to this connection for us; we read it for
+    //    display only and do NOT echo it into later frames.
+    const welcome = await call(new edn.List([new edn.Symbol("hello")]));
+    if (!isKeyword(eventOf(welcome), ":welcome")) {
+      console.log(
+        `hello: expected :welcome, got ${kwText(eventOf(welcome))}` +
+          ` -- ${describeFailure(welcome)}`,
+      );
+      return;
+    }
+    console.log(
+      `hello -> :welcome  version=${kwText(field(welcome, ":version"))}` +
+        `  session=${kwText(field(welcome, ":session"))}` +
+        `  world=${kwText(field(welcome, ":world"))}`,
+    );
+
+    // 2. Enter the world. (use-world #world "default")
+    let body = await call(
+      new edn.List([new edn.Symbol("use-world"), world("default")]),
+    );
+    if (isFailure(body)) {
+      console.log(`use-world refused: ${describeFailure(body)}`);
+      return;
+    }
+    console.log(
+      `use-world "default" -> ${kwText(eventOf(body))}` +
+        `  world=${kwText(field(body, ":world"))}`,
+    );
+
+    // 3. Propose a fact: morningstar is equivalent to venus. The reply hands
+    //    back a #proposal handle we feed straight into the assert.
+    const f = fact(new edn.Symbol("equivalent"), entity("morningstar"), entity("venus"));
+    body = await call(new edn.List([new edn.Symbol("propose"), f]));
+    if (isFailure(body)) {
+      console.log(`propose refused: ${describeFailure(body)}`);
+      return;
+    }
+    const proposal = field(body, ":proposal");
+    console.log(
+      `propose (equivalent morningstar venus) -> ${kwText(eventOf(body))}` +
+        `  proposal=${kwText(proposal)}`,
+    );
+
+    // 4. Assert the proposed fact into the world. The #proposal handle from the
+    //    propose reply round-trips back onto the wire untouched.
+    body = await call(new edn.List([new edn.Symbol("assert"), proposal]));
+    if (isFailure(body)) {
+      console.log(`assert refused: ${describeFailure(body)}`);
+      return;
+    }
+    console.log(`assert proposal -> ${kwText(eventOf(body))}`);
+
+    // 5. Query it back. As in the HTTP path, :find / :where are VECTORS and the
+    //    where-clause is a vector of vectors; only the verb head is a List.
+    const query = new edn.List([
+      new edn.Symbol("query"),
+      new edn.Map([
+        new edn.Keyword(":find"), new edn.Vector([new edn.Symbol("?o")]),
+        new edn.Keyword(":where"), new edn.Vector([
+          new edn.Vector([
+            new edn.Symbol("equivalent"),
+            entity("morningstar"),
+            new edn.Symbol("?o"),
+          ]),
+        ]),
+      ]),
+    ]);
+    body = await call(query);
+    if (isFailure(body)) {
+      console.log(`query refused: ${describeFailure(body)}`);
+      return;
+    }
+    console.log(
+      `query (equivalent morningstar ?o) -> rows=${kwText(field(body, ":rows"))}` +
+        `  done?=${kwText(field(body, ":done?"))}`,
+    );
+  } finally {
+    // Always release the socket, success or failure. Closing it also lets the
+    // server's reader thread observe EOF and drop the session.
+    socket.destroy();
+  }
+}
+
+/**
+ * Route CLI arguments (`process.argv.slice(2)`) to a transport.
+ *
+ * With no arguments we keep the original HTTP behaviour against the local
+ * default. A leading `"uds"` selects the Unix-domain-socket transport (with an
+ * optional socket path). Any other leading argument is an HTTP base URL.
+ */
+export function _dispatch(argv: string[]): Promise<void> {
+  if (argv[0] === "uds") {
+    return main_uds(argv[1] ?? DEFAULT_SOCKET);
+  }
+  if (argv.length > 0) {
+    return main(argv[0]);
+  }
+  return main(DEFAULT_BASE);
+}
+
 // Runnable guard: Bun sets `import.meta.main` for a directly-run entry file;
 // Node leaves it undefined, so this is a harmless no-op when imported (and the
 // optional-chaining keeps it from throwing under Node's typings). No network
 // happens at import time -- only here.
 if ((import.meta as { main?: boolean }).main) {
-  main(process.argv[2] || DEFAULT_BASE).catch((err) => {
+  _dispatch(process.argv.slice(2)).catch((err) => {
     console.error(err instanceof Error ? err.message : String(err));
     process.exit(1);
   });

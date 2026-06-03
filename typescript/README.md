@@ -2,9 +2,11 @@
 
 A single-file, Node-compatible TypeScript client that demonstrates the Lemma
 wire protocol against a local [Dianoia](https://github.com/to-lose-letrec/lemma)
-server over HTTP. It uses the `jsedn` library for the EDN codec; everything else
-is the platform's global `fetch`. This is the browser/Node-side counterpart to
-the [`python/`](../python) demo — the hello-world starter. Read
+server. It speaks **both** transports Dianoia exposes: HTTP (the default) and a
+Unix domain socket. It uses the `jsedn` library for the EDN codec; HTTP rides
+the platform's global `fetch` and UDS rides Node's `net` module. The same
+`edn.encode` / `edn.parse` codec serializes both transports. This is the
+browser/Node-side counterpart to the [`python/`](../python) demo. Read
 `lemma_client.ts` end to end: it is a recipe, not a library.
 
 ## Prerequisites
@@ -32,7 +34,8 @@ JAVA_HOME=/home/james/.local/share/jdk-21.0.11+10 \
 clj -M -m dianoia.main
 ```
 
-This binds an HTTP listener on `127.0.0.1:8080` and opens the world `default`.
+This binds an HTTP listener on `127.0.0.1:8080`, a Unix-domain-socket listener
+at `/tmp/dianoia.sock`, and opens the world `default`.
 
 The server *discovers* worlds; it does not create them. Before the first boot,
 create the world directory out-of-band:
@@ -46,7 +49,7 @@ EOF
 : > /tmp/dianoia-worlds/worlds/default/log.edn
 ```
 
-## Run
+## Run (HTTP)
 
 ```sh
 bun run lemma_client.ts
@@ -59,6 +62,24 @@ override it:
 ```sh
 bun run lemma_client.ts http://host:port
 ```
+
+## Run (UDS)
+
+```sh
+bun run lemma_client.ts uds
+```
+
+The `uds` argument selects the Unix-domain-socket transport and connects to
+`/tmp/dianoia.sock` (`DEFAULT_SOCKET`). Pass a path after `uds` to override the
+socket:
+
+```sh
+bun run lemma_client.ts uds /path/to/dianoia.sock
+```
+
+`_dispatch` reads `process.argv.slice(2)`: a leading `uds` runs `main_uds(...)`,
+any other argument is an HTTP base URL passed to `main(...)`, and no argument
+falls back to `main(DEFAULT_BASE)`. No network I/O occurs at import time.
 
 ## What it does
 
@@ -90,7 +111,10 @@ query (equivalent morningstar ?o) -> rows=[["venus"]]  done?=true
 The query binds `?o` to the matching entity's name, which Dianoia returns as a
 plain string — hence `rows=[["venus"]]`, not a tagged `#entity` literal.
 
-## How it maps to the wire
+`main_uds()` runs the identical verb sequence and prints the same per-step
+lines; only the transport differs.
+
+## How HTTP maps to the wire
 
 Request and response bodies are EDN text, encoded and parsed by `jsedn`
 (`edn.encode` / `edn.parse`). The verb forms are EDN **lists**
@@ -114,6 +138,33 @@ A non-2xx response still carries a valid Lemma EDN error envelope; `post_edn`
 parses and returns it rather than throwing, so the caller inspects `:event`. A
 connection-level failure is re-raised as an `Error` naming the base URL.
 
+## How UDS maps to the wire
+
+UDS carries the same EDN over a single persistent Node `net` socket, with
+explicit framing instead of an HTTP envelope: a **4-byte big-endian length**
+prefix followed by that many **UTF-8 bytes** of EDN. `uds_send_frame` writes the
+frame (`frame.writeUInt32BE(body.length, 0)` then the body); `uds_recv_frame`
+reads one frame back through a `FrameReader`, which reassembles the length, the
+body, and the UTF-8 decode across however the socket chunked the bytes.
+
+The session handling is the key contrast with HTTP. Over UDS the **session is
+bound to the connection**: the server captures the id from the `:welcome`
+envelope and pins it to the socket, so the client sends no `X-Lemma-Session`
+header and never echoes a session id back — it just keeps sending frames on the
+same socket. (Over HTTP the id is threaded explicitly through the
+`X-Lemma-Session` header and the named `/v1/sessions/{id}/messages` endpoint.)
+
+| Concern | Implementation |
+|---|---|
+| Body format | EDN text, encoded UTF-8 by `uds_send_frame` |
+| Framing | 4-byte big-endian length prefix, then the body bytes |
+| Connection | One persistent `net` socket for every frame |
+| Anonymous call | `(hello)` as the first frame |
+| Session id | Bound to the connection by the server; never echoed by the client |
+
+A connect-time failure (no listener at the path) is re-raised as an `Error`
+naming the socket path; the socket is always closed on the way out.
+
 ## Tests
 
 `lemma_client.test.ts` is a `bun:test` suite. Run it from this `typescript/`
@@ -129,16 +180,17 @@ server, and asserts the verb forms encode to grammar-valid wire text.
 
 ## Scope note
 
-This is the hello-world starter. The richer features — the Unix-domain-socket
-transport, cursor pagination, capabilities/limits negotiation, and watch/SSE
-streaming — are demonstrated in [`../python`](../python) and may be ported here
-later.
+Both the HTTP and Unix-domain-socket transports are now supported. The richer
+features — cursor pagination, capabilities/limits negotiation, and watch/SSE
+streaming — are still pending here; they are demonstrated in
+[`../python`](../python) and may be ported later.
 
 ## References
 
 - `lemma_client.ts` — the `jsedn` constructor helpers (`entity`, `world`,
-  `fact`), the envelope readers, the `post_edn` HTTP transport, and the runnable
-  `main()` round-trip.
+  `fact`), the envelope readers, both transports (`post_edn` for HTTP,
+  `uds_send_frame` / `uds_recv_frame` / `FrameReader` for UDS), and the runnable
+  `main()` / `main_uds()` round-trips dispatched by `_dispatch`.
 - [`jsedn`](https://www.npmjs.com/package/jsedn) — the EDN reader/writer the
   codec is built on.
 - [`../python/`](../python) — the reference implementation covering the full
