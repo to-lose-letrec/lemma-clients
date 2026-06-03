@@ -102,6 +102,156 @@ export function fact(
 }
 
 // ---------------------------------------------------------------------------
+// Capabilities & limits:  the :welcome surface  ->  ServerInfo
+//
+// Every session opens with a (hello) whose :welcome reply advertises what the
+// server can do (SPEC §10): a :capabilities set of namespaced flag keywords, a
+// :limits map of resource caps, and the :verbs / :predicates the world exposes.
+// A well-behaved client reads this once and tailors itself to it -- skipping
+// features the server doesn't advertise and staying under the byte caps it
+// enforces. ServerInfo is the parsed, queryable form of that surface; it is a
+// plain data record (not a new abstraction layer), so the round-trip code below
+// can ask "does this server paginate?" or "is my message small enough?" in one
+// readable call.
+//
+// jsedn note: a parsed `:capabilities` set is an `edn.Set`, a `:limits` map is
+// an `edn.Map`, and a `:verbs` / `:predicates` surface is an `edn.Map` of the
+// shape `{:core #{...} :extensions {pack #{...}}}`. We canonicalise keywords to
+// their wire text (via `edn.encode`) for membership tests, since `edn.Keyword`
+// has no reliable object identity across parses.
+// ---------------------------------------------------------------------------
+
+/**
+ * The parsed :welcome surface: what this server advertises (SPEC §10).
+ *
+ * `capabilities` is a Set of capability canonical-texts (e.g.
+ * `":lemma/cursor-pagination"`); `limits` maps a limit's canonical-text
+ * keyword to its value; `verbs` / `predicates` are flat Sets of name
+ * canonical-texts with the :core and :extensions surfaces merged. A record,
+ * not a class hierarchy -- it just answers "does this server support X?" and
+ * "what is the byte cap?".
+ */
+export interface ServerInfo {
+  /** :version value as the raw parsed `edn` value (or `null` if absent). */
+  version: unknown;
+  /** Advertised capability flags, keyed by canonical text (`:lemma/...`). */
+  capabilities: Set<string>;
+  /** :limits map, keyed by the limit keyword's canonical text. */
+  limits: Map<string, unknown>;
+  /** Every verb name this server understands (core ∪ all extension packs). */
+  verbs: Set<string>;
+  /** Every predicate name this server understands (core ∪ extension packs). */
+  predicates: Set<string>;
+  /** True iff `capability` (canonical text, e.g. ":lemma/watch") is advertised. */
+  supports(capability: string): boolean;
+  /**
+   * The :max-message-bytes limit, or `undefined` if the server didn't
+   * advertise one. `undefined` means "unadvertised" -- treated as unlimited by
+   * `within_message_limit`.
+   */
+  maxMessageBytes: number | undefined;
+}
+
+/**
+ * Merge a `{:core #{…} :extensions {pack #{…}}}` surface into one flat Set of
+ * name canonical-texts.
+ *
+ * The :verbs and :predicates entries of a welcome split names into a :core set
+ * plus per-pack :extensions sets (SPEC §10). A client mostly just wants "every
+ * name this server understands", so we union :core with all the extension sets.
+ * Missing keys default to empty -- a minimal welcome need not carry every
+ * section -- so this never throws on a sparse surface.
+ */
+function flattenSurface(surface: unknown): Set<string> {
+  const names = new Set<string>();
+  if (!(surface instanceof edn.Map)) return names;
+
+  const core = new edn.Keyword(":core");
+  if (surface.exists(core)) {
+    const coreSet = surface.at(core);
+    if (coreSet instanceof edn.Set) {
+      for (const name of coreSet.val) names.add(kwText(name));
+    }
+  }
+
+  const extensions = new edn.Keyword(":extensions");
+  if (surface.exists(extensions)) {
+    const packs = surface.at(extensions);
+    if (packs instanceof edn.Map) {
+      // each((value, key) => ...): every value is a pack's name Set.
+      packs.each((packSet: unknown) => {
+        if (packSet instanceof edn.Set) {
+          for (const name of packSet.val) names.add(kwText(name));
+        }
+      });
+    }
+  }
+  return names;
+}
+
+/**
+ * Parse a :welcome envelope into a `ServerInfo`.
+ *
+ * `body` is the parsed welcome map (an `edn.Map`). We pull :version,
+ * :capabilities (an `edn.Set` of Keywords, canonicalised to their wire text),
+ * :limits (an `edn.Map`, copied into a plain JS Map keyed by each limit's
+ * canonical text), and the flattened :verbs / :predicates surfaces. Every key
+ * is optional: a server that omits a section yields an empty default rather
+ * than an error, so this stays robust against minimal welcomes.
+ */
+export function read_welcome(body: unknown): ServerInfo {
+  const capabilities = new Set<string>();
+  if (isMap(body)) {
+    const capsKey = new edn.Keyword(":capabilities");
+    if (body.exists(capsKey)) {
+      const caps = body.at(capsKey);
+      if (caps instanceof edn.Set) {
+        for (const cap of caps.val) capabilities.add(kwText(cap));
+      }
+    }
+  }
+
+  const limits = new Map<string, unknown>();
+  if (isMap(body)) {
+    const limitsKey = new edn.Keyword(":limits");
+    if (body.exists(limitsKey)) {
+      const lim = body.at(limitsKey);
+      if (lim instanceof edn.Map) {
+        lim.each((value: unknown, key: unknown) => {
+          limits.set(kwText(key), value);
+        });
+      }
+    }
+  }
+
+  const maxBytes = limits.get(":max-message-bytes");
+  const maxMessageBytes = typeof maxBytes === "number" ? maxBytes : undefined;
+
+  return {
+    version: isMap(body) ? field(body, ":version", null) : null,
+    capabilities,
+    limits,
+    verbs: flattenSurface(field(body, ":verbs", null)),
+    predicates: flattenSurface(field(body, ":predicates", null)),
+    supports(capability: string): boolean {
+      return this.capabilities.has(capability);
+    },
+    maxMessageBytes,
+  };
+}
+
+/**
+ * True iff `ednText` fits under the server's :max-message-bytes cap.
+ *
+ * The limit is measured in UTF-8 bytes (SPEC §10). An unadvertised limit
+ * (`maxMessageBytes === undefined`) means unlimited, so any message passes.
+ */
+export function within_message_limit(info: ServerInfo, ednText: string): boolean {
+  if (info.maxMessageBytes === undefined) return true;
+  return Buffer.byteLength(ednText, "utf8") <= info.maxMessageBytes;
+}
+
+// ---------------------------------------------------------------------------
 // Envelope helpers:  reading keyword-keyed maps & comparing keywords
 //
 // Every Lemma reply is an EDN map keyed by keywords. `jsedn`'s `Map.at` THROWS
@@ -486,6 +636,12 @@ export async function main(base: string = DEFAULT_BASE): Promise<void> {
       `  session=${sid}  world=${kwText(field(welcome, ":world"))}`,
   );
 
+  // 1a. Read the advertised capabilities and limits once, up front, so the
+  //     rest of the round-trip can tailor itself to this server (SPEC §10).
+  const info = read_welcome(welcome);
+  const caps = [...info.capabilities].sort().join(", ");
+  console.log(`server: caps={${caps}} max-message-bytes=${info.maxMessageBytes}`);
+
   // 2. Every later call rides the same session: post to the named endpoint and
   //    echo the session id back in the request header.
   const named = (form: unknown) =>
@@ -551,61 +707,76 @@ export async function main(base: string = DEFAULT_BASE): Promise<void> {
       `  done?=${kwText(field(res.body, ":done?"))}`,
   );
 
-  // 7. Paginated query. Seed three subset-of facts in one propose, assert the
-  //    batch, then query them back with :limit 2 so the result spans two pages
-  //    (2 + 1) that query_all drains via (continue #cursor ...). subset-of is a
-  //    pure-EDB (stored-fact) predicate, so a query over it has stable
-  //    (tx-id, ref-id) ordering and can be paginated; a rule-headed predicate
-  //    like member-of cannot be the sole outer :where pattern (the server
-  //    rejects it :bad-args :unsupported-rule-call-ordering).
-  const f1 = fact(new edn.Symbol("subset-of"), entity("sub-a"), entity("group"));
-  const f2 = fact(new edn.Symbol("subset-of"), entity("sub-b"), entity("group"));
-  const f3 = fact(new edn.Symbol("subset-of"), entity("sub-c"), entity("group"));
-  res = await named(new edn.List([new edn.Symbol("propose"), f1, f2, f3]));
-  if (isFailure(res.body)) {
-    console.log(`propose (3x subset-of) refused: ${describeFailure(res.body)}`);
-    return;
-  }
-  const batch = field(res.body, ":proposal");
-  console.log(
-    `propose (3x subset-of ? group) -> ${kwText(eventOf(res.body))}` +
-      `  proposal=${kwText(batch)}`,
-  );
-  res = await named(new edn.List([new edn.Symbol("assert"), batch]));
-  if (isFailure(res.body)) {
-    console.log(`assert (3x subset-of) refused: ${describeFailure(res.body)}`);
-    return;
-  }
-  console.log(`assert proposal -> ${kwText(eventOf(res.body))}`);
+  // 7. The paginated section is gated on the server advertising cursor
+  //    pagination -- without it, draining pages via (continue #cursor ...) is
+  //    unsupported, so we skip the whole block rather than guess.
+  if (info.supports(":lemma/cursor-pagination")) {
+    // Seed three subset-of facts in one propose, assert the batch, then query
+    // them back with :limit 2 so the result spans two pages (2 + 1) that
+    // query_all drains via (continue #cursor ...). subset-of is a pure-EDB
+    // (stored-fact) predicate, so a query over it has stable (tx-id, ref-id)
+    // ordering and can be paginated; a rule-headed predicate like member-of
+    // cannot be the sole outer :where pattern (the server rejects it
+    // :bad-args :unsupported-rule-call-ordering).
+    const f1 = fact(new edn.Symbol("subset-of"), entity("sub-a"), entity("group"));
+    const f2 = fact(new edn.Symbol("subset-of"), entity("sub-b"), entity("group"));
+    const f3 = fact(new edn.Symbol("subset-of"), entity("sub-c"), entity("group"));
+    const proposeForm = new edn.List([new edn.Symbol("propose"), f1, f2, f3]);
+    // The batch propose is the largest representative message we send, so it is
+    // the one worth checking against :max-message-bytes. A real client checks
+    // every outbound message; this demo checks this one.
+    if (!within_message_limit(info, edn.encode(proposeForm))) {
+      console.log("limit-exceeded: message exceeds max-message-bytes; skipping");
+      return;
+    }
+    res = await named(proposeForm);
+    if (isFailure(res.body)) {
+      console.log(`propose (3x subset-of) refused: ${describeFailure(res.body)}`);
+      return;
+    }
+    const batch = field(res.body, ":proposal");
+    console.log(
+      `propose (3x subset-of ? group) -> ${kwText(eventOf(res.body))}` +
+        `  proposal=${kwText(batch)}`,
+    );
+    res = await named(new edn.List([new edn.Symbol("assert"), batch]));
+    if (isFailure(res.body)) {
+      console.log(`assert (3x subset-of) refused: ${describeFailure(res.body)}`);
+      return;
+    }
+    console.log(`assert proposal -> ${kwText(eventOf(res.body))}`);
 
-  // The paged query itself: :limit 2 over 3 matching rows yields two pages.
-  // query_all wants a `form -> Promise<body>` closure; post_edn returns a
-  // PostResult, so we adapt it by taking just the body.
-  const pagedQuery = new edn.List([
-    new edn.Symbol("query"),
-    new edn.Map([
-      new edn.Keyword(":find"), new edn.Vector([new edn.Symbol("?x")]),
-      new edn.Keyword(":where"), new edn.Vector([
-        new edn.Vector([
-          new edn.Symbol("subset-of"),
-          new edn.Symbol("?x"),
-          entity("group"),
+    // The paged query itself: :limit 2 over 3 matching rows yields two pages.
+    // query_all wants a `form -> Promise<body>` closure; post_edn returns a
+    // PostResult, so we adapt it by taking just the body.
+    const pagedQuery = new edn.List([
+      new edn.Symbol("query"),
+      new edn.Map([
+        new edn.Keyword(":find"), new edn.Vector([new edn.Symbol("?x")]),
+        new edn.Keyword(":where"), new edn.Vector([
+          new edn.Vector([
+            new edn.Symbol("subset-of"),
+            new edn.Symbol("?x"),
+            entity("group"),
+          ]),
         ]),
+        new edn.Keyword(":limit"), 2,
       ]),
-      new edn.Keyword(":limit"), 2,
-    ]),
-  ]);
-  const send = (form: unknown) =>
-    post_edn(`/v1/sessions/${sid}/messages`, form, sid, base).then((r) => r.body);
-  const paged = await query_all(send, pagedQuery);
-  if (paged.failure) {
-    console.log(`paged query refused: ${describeFailure(paged.failure)}`);
-    return;
+    ]);
+    const send = (form: unknown) =>
+      post_edn(`/v1/sessions/${sid}/messages`, form, sid, base).then((r) => r.body);
+    const paged = await query_all(send, pagedQuery);
+    if (paged.failure) {
+      console.log(`paged query refused: ${describeFailure(paged.failure)}`);
+      return;
+    }
+    console.log(
+      `paged query (subset-of ? group), limit 2 -> ${paged.rows.length} rows over ` +
+        `${paged.pages} page(s): ${edn.encode(new edn.Vector(paged.rows))}`,
+    );
+  } else {
+    console.log("server does not advertise cursor pagination; skipping paged query");
   }
-  console.log(
-    `paged query (subset-of ? group), limit 2 -> ${paged.rows.length} rows over ` +
-      `${paged.pages} page(s): ${edn.encode(new edn.Vector(paged.rows))}`,
-  );
 }
 
 /**
@@ -664,6 +835,12 @@ export async function main_uds(socketPath: string = DEFAULT_SOCKET): Promise<voi
         `  session=${kwText(field(welcome, ":session"))}` +
         `  world=${kwText(field(welcome, ":world"))}`,
     );
+
+    // 1a. Read the advertised capabilities and limits once, up front, so the
+    //     rest of the round-trip can tailor itself to this server (SPEC §10).
+    const info = read_welcome(welcome);
+    const caps = [...info.capabilities].sort().join(", ");
+    console.log(`server: caps={${caps}} max-message-bytes=${info.maxMessageBytes}`);
 
     // 2. Enter the world. (use-world #world "default")
     let body = await call(
@@ -726,58 +903,73 @@ export async function main_uds(socketPath: string = DEFAULT_SOCKET): Promise<voi
         `  done?=${kwText(field(body, ":done?"))}`,
     );
 
-    // 6. Paginated query. Seed three subset-of facts in one propose, assert the
-    //    batch, then query them back with :limit 2 so the result spans two pages
-    //    (2 + 1) that query_all drains via (continue #cursor ...). subset-of is a
-    //    pure-EDB predicate (stable tx-id/ref-id ordering), so it can be
-    //    paginated; a rule-headed predicate like member-of cannot be the sole
-    //    outer :where pattern (server :bad-args :unsupported-rule-call-ordering).
-    const f1 = fact(new edn.Symbol("subset-of"), entity("sub-a"), entity("group"));
-    const f2 = fact(new edn.Symbol("subset-of"), entity("sub-b"), entity("group"));
-    const f3 = fact(new edn.Symbol("subset-of"), entity("sub-c"), entity("group"));
-    body = await call(new edn.List([new edn.Symbol("propose"), f1, f2, f3]));
-    if (isFailure(body)) {
-      console.log(`propose (3x subset-of) refused: ${describeFailure(body)}`);
-      return;
-    }
-    const batch = field(body, ":proposal");
-    console.log(
-      `propose (3x subset-of ? group) -> ${kwText(eventOf(body))}` +
-        `  proposal=${kwText(batch)}`,
-    );
-    body = await call(new edn.List([new edn.Symbol("assert"), batch]));
-    if (isFailure(body)) {
-      console.log(`assert (3x subset-of) refused: ${describeFailure(body)}`);
-      return;
-    }
-    console.log(`assert proposal -> ${kwText(eventOf(body))}`);
+    // 6. The paginated section is gated on the server advertising cursor
+    //    pagination -- without it, draining pages via (continue #cursor ...) is
+    //    unsupported, so we skip the whole block rather than guess.
+    if (info.supports(":lemma/cursor-pagination")) {
+      // Seed three subset-of facts in one propose, assert the batch, then query
+      // them back with :limit 2 so the result spans two pages (2 + 1) that
+      // query_all drains via (continue #cursor ...). subset-of is a pure-EDB
+      // predicate (stable tx-id/ref-id ordering), so it can be paginated; a
+      // rule-headed predicate like member-of cannot be the sole outer :where
+      // pattern (server :bad-args :unsupported-rule-call-ordering).
+      const f1 = fact(new edn.Symbol("subset-of"), entity("sub-a"), entity("group"));
+      const f2 = fact(new edn.Symbol("subset-of"), entity("sub-b"), entity("group"));
+      const f3 = fact(new edn.Symbol("subset-of"), entity("sub-c"), entity("group"));
+      const proposeForm = new edn.List([new edn.Symbol("propose"), f1, f2, f3]);
+      // The batch propose is the largest representative message we send, so it
+      // is the one worth checking against :max-message-bytes. A real client
+      // checks every outbound message; this demo checks this one.
+      if (!within_message_limit(info, edn.encode(proposeForm))) {
+        console.log("limit-exceeded: message exceeds max-message-bytes; skipping");
+        return;
+      }
+      body = await call(proposeForm);
+      if (isFailure(body)) {
+        console.log(`propose (3x subset-of) refused: ${describeFailure(body)}`);
+        return;
+      }
+      const batch = field(body, ":proposal");
+      console.log(
+        `propose (3x subset-of ? group) -> ${kwText(eventOf(body))}` +
+          `  proposal=${kwText(batch)}`,
+      );
+      body = await call(new edn.List([new edn.Symbol("assert"), batch]));
+      if (isFailure(body)) {
+        console.log(`assert (3x subset-of) refused: ${describeFailure(body)}`);
+        return;
+      }
+      console.log(`assert proposal -> ${kwText(eventOf(body))}`);
 
-    // The paged query itself: :limit 2 over 3 matching rows yields two pages.
-    // The UDS `call` closure is already `form -> Promise<body>`, so query_all
-    // takes it directly.
-    const pagedQuery = new edn.List([
-      new edn.Symbol("query"),
-      new edn.Map([
-        new edn.Keyword(":find"), new edn.Vector([new edn.Symbol("?x")]),
-        new edn.Keyword(":where"), new edn.Vector([
-          new edn.Vector([
-            new edn.Symbol("subset-of"),
-            new edn.Symbol("?x"),
-            entity("group"),
+      // The paged query itself: :limit 2 over 3 matching rows yields two pages.
+      // The UDS `call` closure is already `form -> Promise<body>`, so query_all
+      // takes it directly.
+      const pagedQuery = new edn.List([
+        new edn.Symbol("query"),
+        new edn.Map([
+          new edn.Keyword(":find"), new edn.Vector([new edn.Symbol("?x")]),
+          new edn.Keyword(":where"), new edn.Vector([
+            new edn.Vector([
+              new edn.Symbol("subset-of"),
+              new edn.Symbol("?x"),
+              entity("group"),
+            ]),
           ]),
+          new edn.Keyword(":limit"), 2,
         ]),
-        new edn.Keyword(":limit"), 2,
-      ]),
-    ]);
-    const paged = await query_all(call, pagedQuery);
-    if (paged.failure) {
-      console.log(`paged query refused: ${describeFailure(paged.failure)}`);
-      return;
+      ]);
+      const paged = await query_all(call, pagedQuery);
+      if (paged.failure) {
+        console.log(`paged query refused: ${describeFailure(paged.failure)}`);
+        return;
+      }
+      console.log(
+        `paged query (subset-of ? group), limit 2 -> ${paged.rows.length} rows over ` +
+          `${paged.pages} page(s): ${edn.encode(new edn.Vector(paged.rows))}`,
+      );
+    } else {
+      console.log("server does not advertise cursor pagination; skipping paged query");
     }
-    console.log(
-      `paged query (subset-of ? group), limit 2 -> ${paged.rows.length} rows over ` +
-        `${paged.pages} page(s): ${edn.encode(new edn.Vector(paged.rows))}`,
-    );
   } finally {
     // Always release the socket, success or failure. Closing it also lets the
     // server's reader thread observe EOF and drop the session.

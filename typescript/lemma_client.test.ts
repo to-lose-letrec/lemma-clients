@@ -88,6 +88,8 @@ import {
   main_uds,
   _dispatch,
   query_all,
+  read_welcome,
+  within_message_limit,
   uds_send_frame,
   DEFAULT_BASE,
   DEFAULT_SOCKET,
@@ -145,7 +147,9 @@ function headerOf(init: RequestInit, name: string): string | null {
 
 // Canned EDN reply bodies for a full successful handshake.
 const WELCOME =
-  '{:event :welcome :version 1 :session #session "s-1" :world #world "default"}';
+  '{:event :welcome :version 1 :session #session "s-1" :world #world "default"' +
+  ' :capabilities #{:lemma/cursor-pagination :lemma/watch :lemma/v1}' +
+  ' :limits {:max-message-bytes 1048576}}';
 const WORLD_SELECTED = '{:event :world-selected :world #world "default"}';
 const PROPOSED = '{:event :proposed :proposal #proposal "p-1"}';
 const ASSERTED = '{:event :asserted}';
@@ -742,7 +746,9 @@ function decodeFrames(buf: Buffer): string[] {
 // welcome carries the session as a #session-tagged field (connection-bound),
 // NOT as a header.
 const UDS_WELCOME =
-  '{:event :welcome :version 1 :session #session "s-1" :world #world "default"}';
+  '{:event :welcome :version 1 :session #session "s-1" :world #world "default"' +
+  ' :capabilities #{:lemma/cursor-pagination :lemma/watch :lemma/v1}' +
+  ' :limits {:max-message-bytes 1048576}}';
 const UDS_FULL = [
   UDS_WELCOME, WORLD_SELECTED, PROPOSED, ASSERTED, RESULT, ...PAGED_TAIL,
 ];
@@ -1110,5 +1116,284 @@ describe("_dispatch routing", () => {
 
     expect(connectCalls).toBe(0);
     expect(captures[0].url.startsWith(DEFAULT_BASE)).toBe(true);
+  });
+});
+
+// ===========================================================================
+// (E) read_welcome / ServerInfo -- parse the :welcome surface (SPEC §10).
+//
+// read_welcome turns a parsed :welcome map into a queryable ServerInfo:
+// a Set of advertised capability flags, a :limits map, the flattened
+// :verbs / :predicates surfaces, supports(), and maxMessageBytes. We feed it
+// genuine `edn.parse` output (the same shapes the wire delivers) so the
+// jsedn-set / jsedn-map handling is exercised for real, not mocked.
+// ===========================================================================
+
+// A realistic welcome: a :capabilities Set, a :limits Map, and :verbs /
+// :predicates split into {:core #{...} :extensions {pack #{...}}} surfaces.
+const RICH_WELCOME =
+  '{:event :welcome :version 1 :world #world "default"' +
+  ' :capabilities #{:lemma/cursor-pagination :lemma/watch :lemma/v1}' +
+  ' :limits {:max-message-bytes 1048576 :max-rows 500}' +
+  ' :verbs {:core #{hello propose assert query}' +
+  '         :extensions {ext #{continue watch}}}' +
+  ' :predicates {:core #{equivalent subset-of}' +
+  '              :extensions {ext #{member-of}}}}';
+
+describe("read_welcome / ServerInfo", () => {
+  test("supports() returns true for an advertised capability", () => {
+    const info = read_welcome(edn.parse(RICH_WELCOME));
+
+    expect(info.supports(":lemma/cursor-pagination")).toBe(true);
+  });
+
+  test("supports() returns false for an unadvertised capability", () => {
+    const info = read_welcome(edn.parse(RICH_WELCOME));
+
+    expect(info.supports(":lemma/time-travel")).toBe(false);
+  });
+
+  test("capabilities Set carries every advertised flag by canonical text", () => {
+    const info = read_welcome(edn.parse(RICH_WELCOME));
+
+    expect([...info.capabilities].sort()).toEqual([
+      ":lemma/cursor-pagination",
+      ":lemma/v1",
+      ":lemma/watch",
+    ]);
+  });
+
+  test("maxMessageBytes reads the :max-message-bytes limit", () => {
+    const info = read_welcome(edn.parse(RICH_WELCOME));
+
+    expect(info.maxMessageBytes).toBe(1048576);
+  });
+
+  test("limits map carries every advertised limit keyed by canonical text", () => {
+    const info = read_welcome(edn.parse(RICH_WELCOME));
+
+    expect(info.limits.get(":max-message-bytes")).toBe(1048576);
+    expect(info.limits.get(":max-rows")).toBe(500);
+  });
+
+  test("verbs flatten :core members into the verb set", () => {
+    const info = read_welcome(edn.parse(RICH_WELCOME));
+
+    for (const verb of ["hello", "propose", "assert", "query"]) {
+      expect(info.verbs.has(verb)).toBe(true);
+    }
+  });
+
+  test("verbs flatten :extensions pack members into the verb set", () => {
+    const info = read_welcome(edn.parse(RICH_WELCOME));
+
+    // The ext pack's verbs are merged in alongside :core (SPEC §10).
+    expect(info.verbs.has("continue")).toBe(true);
+    expect(info.verbs.has("watch")).toBe(true);
+  });
+
+  test("predicates flatten core + extension members into the predicate set", () => {
+    const info = read_welcome(edn.parse(RICH_WELCOME));
+
+    for (const pred of ["equivalent", "subset-of", "member-of"]) {
+      expect(info.predicates.has(pred)).toBe(true);
+    }
+  });
+
+  test("a welcome with NO :limits yields undefined maxMessageBytes (no throw)", () => {
+    const noLimits =
+      '{:event :welcome :version 1' +
+      ' :capabilities #{:lemma/cursor-pagination}}';
+
+    const info = read_welcome(edn.parse(noLimits));
+
+    expect(info.maxMessageBytes).toBeUndefined();
+    expect(info.limits.size).toBe(0);
+  });
+
+  test("a minimal welcome (no caps/verbs/predicates) yields empty sets, not a throw", () => {
+    const minimal = '{:event :welcome :version 1}';
+
+    const info = read_welcome(edn.parse(minimal));
+
+    expect(info.capabilities.size).toBe(0);
+    expect(info.verbs.size).toBe(0);
+    expect(info.predicates.size).toBe(0);
+    expect(info.supports(":lemma/cursor-pagination")).toBe(false);
+  });
+
+  test("an :extensions-only verb surface is flattened into the verb set", () => {
+    // No :core key at all -- only an extensions pack. flattenSurface must still
+    // merge the pack's members rather than skipping the whole surface.
+    const extOnly =
+      '{:event :welcome :version 1' +
+      ' :verbs {:extensions {pack #{foo bar}}}}';
+
+    const info = read_welcome(edn.parse(extOnly));
+
+    expect(info.verbs.has("foo")).toBe(true);
+    expect(info.verbs.has("bar")).toBe(true);
+  });
+});
+
+// ===========================================================================
+// (F) within_message_limit -- UTF-8 byte cap enforcement (SPEC §10).
+// ===========================================================================
+
+describe("within_message_limit", () => {
+  test("a small message under a 1 MB limit passes", () => {
+    const info = read_welcome(edn.parse(RICH_WELCOME)); // 1 MB cap
+
+    expect(within_message_limit(info, "(hello)")).toBe(true);
+  });
+
+  test("a message exactly at the byte cap passes (boundary, <=)", () => {
+    // A welcome whose cap equals the message's exact UTF-8 byte length.
+    const msg = "(hello)"; // 7 ASCII bytes
+    const info = read_welcome(
+      edn.parse('{:event :welcome :limits {:max-message-bytes 7}}'),
+    );
+
+    expect(Buffer.byteLength(msg, "utf8")).toBe(7);
+    expect(within_message_limit(info, msg)).toBe(true);
+  });
+
+  test("an oversize message under a tiny limit fails", () => {
+    const info = read_welcome(
+      edn.parse('{:event :welcome :limits {:max-message-bytes 4}}'),
+    );
+
+    expect(within_message_limit(info, "(hello)")).toBe(false);
+  });
+
+  test("counts UTF-8 bytes, not characters, against the cap", () => {
+    // "✓" is three UTF-8 bytes; one such char already exceeds a 2-byte cap.
+    const info = read_welcome(
+      edn.parse('{:event :welcome :limits {:max-message-bytes 2}}'),
+    );
+
+    expect(within_message_limit(info, "✓")).toBe(false);
+  });
+
+  test("an unadvertised limit (no :limits) treats any message as within limit", () => {
+    const info = read_welcome(edn.parse('{:event :welcome :version 1}'));
+
+    expect(info.maxMessageBytes).toBeUndefined();
+    expect(within_message_limit(info, "x".repeat(10_000_000))).toBe(true);
+  });
+});
+
+// ===========================================================================
+// (G) Capability gating -- the paged tail runs IFF :lemma/cursor-pagination is
+// advertised. We drive main()/main_uds with a welcome whose :capabilities OMITS
+// cursor-pagination and assert the whole paginated block is skipped: the skip
+// note is printed, no (continue ...) / batch propose is sent, and the call /
+// frame count is the bare five of the handshake -- strictly fewer than the nine
+// of the full run. The capability-present path is the (now-fixed) default
+// WELCOME / UDS_WELCOME fixtures already driven by the handshake tests above.
+// ===========================================================================
+
+// A welcome advertising :watch but NOT :lemma/cursor-pagination. The single
+// (query ...) still runs; the paginated tail must be gated off.
+const WELCOME_NO_PAGINATION =
+  '{:event :welcome :version 1 :session #session "s-1" :world #world "default"' +
+  ' :capabilities #{:lemma/watch :lemma/v1}' +
+  ' :limits {:max-message-bytes 1048576}}';
+const UDS_WELCOME_NO_PAGINATION = WELCOME_NO_PAGINATION;
+
+// The bare handshake (no paginated tail): hello, use-world, propose, assert,
+// query. Five calls -- what a cursor-pagination-less server should elicit.
+const HANDSHAKE_ONLY = [WORLD_SELECTED, PROPOSED, ASSERTED, RESULT];
+
+describe("capability gating: cursor-pagination absent", () => {
+  test("HTTP main() SKIPS the paged query when cursor-pagination is unadvertised", async () => {
+    const lines: string[] = [];
+    console.log = ((...args: unknown[]) => {
+      lines.push(args.map(String).join(" "));
+    }) as typeof console.log;
+    const captures: Capture[] = [];
+    scriptFetch(captures, [WELCOME_NO_PAGINATION, ...HANDSHAKE_ONLY]);
+
+    await main();
+
+    // Exactly the five handshake calls -- the four paginated-tail calls are gated.
+    expect(captures).toHaveLength(5);
+    expect(captures.length).toBeLessThan(FULL_SEQUENCE_LEN);
+    const output = lines.join("\n");
+    expect(output).toContain("server does not advertise cursor pagination; skipping paged query");
+    // The skip is real: no batch propose, no (continue ...) ever went out.
+    for (const cap of captures) {
+      const sent = cap.init.body as string;
+      expect(sent).not.toContain("continue");
+      expect(sent).not.toContain("subset-of");
+    }
+  });
+
+  test("HTTP main() resolves without throwing on the gated path", async () => {
+    muteLog();
+    scriptFetch([], [WELCOME_NO_PAGINATION, ...HANDSHAKE_ONLY]);
+
+    await expect(main()).resolves.toBeUndefined();
+  });
+
+  test("UDS main_uds() SKIPS the paged query when cursor-pagination is unadvertised", async () => {
+    const sock = new FakeSocket();
+    currentSocket = sock;
+    const lines: string[] = [];
+    const run = main_uds(DEFAULT_SOCKET);
+    console.log = ((...args: unknown[]) => {
+      lines.push(args.map(String).join(" "));
+    }) as typeof console.log;
+    sock.emit("connect");
+    for (const reply of [UDS_WELCOME_NO_PAGINATION, ...HANDSHAKE_ONLY]) {
+      await Promise.resolve();
+      sock.emit("data", frameOf(reply));
+    }
+    await run;
+
+    const sent = decodeFrames(sock.written());
+    // Five frames sent (hello + four handshake), strictly fewer than the nine
+    // of the full paginated run.
+    expect(sent).toHaveLength(5);
+    expect(sent.length).toBeLessThan(UDS_FULL_LEN);
+    const output = lines.join("\n");
+    expect(output).toContain("server does not advertise cursor pagination; skipping paged query");
+    for (const frame of sent) {
+      expect(frame).not.toContain("continue");
+      expect(frame).not.toContain("subset-of");
+    }
+  });
+
+  test("UDS main_uds() still closes the socket on the gated path", async () => {
+    const sock = new FakeSocket();
+    currentSocket = sock;
+    const run = main_uds(DEFAULT_SOCKET);
+    muteLog();
+    sock.emit("connect");
+    for (const reply of [UDS_WELCOME_NO_PAGINATION, ...HANDSHAKE_ONLY]) {
+      await Promise.resolve();
+      sock.emit("data", frameOf(reply));
+    }
+    await run;
+
+    expect(sock.destroyed).toBe(true);
+  });
+
+  test("HTTP capability-present path (default WELCOME) runs the FULL paginated tail", async () => {
+    // The complement to the gated path: with the fixed default fixtures (which
+    // now advertise :lemma/cursor-pagination) the full nine-call run executes.
+    const lines: string[] = [];
+    console.log = ((...args: unknown[]) => {
+      lines.push(args.map(String).join(" "));
+    }) as typeof console.log;
+    const captures: Capture[] = [];
+    scriptFetch(captures, FULL_SEQUENCE);
+
+    await main();
+
+    expect(captures).toHaveLength(FULL_SEQUENCE_LEN);
+    const output = lines.join("\n");
+    expect(output).toContain("paged query (subset-of ? group), limit 2 -> 3 rows over 2 page(s)");
+    expect(output).not.toContain("skipping paged query");
   });
 });

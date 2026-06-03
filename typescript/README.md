@@ -89,7 +89,9 @@ printed via `describeFailure` and the sequence stops cleanly.
 
 1. `(hello)` — anonymous `POST /v1/messages`. The `:welcome` reply carries the
    new session id in the `X-Lemma-Session` response header, surfaced by
-   `post_edn`.
+   `post_edn`. `read_welcome` parses the reply into a `ServerInfo`, and a
+   `server: caps=… max-message-bytes=…` summary line is printed (see
+   [Capabilities and limits](#capabilities-and-limits)).
 2. `(use-world #world "default")` — enter the world on the session.
 3. `(propose #fact{...})` — propose `equivalent morningstar venus`. The reply
    returns a `#proposal` handle.
@@ -99,10 +101,16 @@ printed via `describeFailure` and the sequence stops cleanly.
    query it back and print `:rows` and `:done?`.
 6. `(propose #fact{...} #fact{...} #fact{...})` — batch-propose three
    `subset-of` facts in one call, then `(assert <proposal>)` the batch, so the
-   next query has more matching rows than a single page holds.
+   next query has more matching rows than a single page holds. Gated on
+   `info.supports(":lemma/cursor-pagination")`; before sending, the batch is
+   checked against `:max-message-bytes` with `within_message_limit`.
 7. `(query {... :limit 2})` — run a paginated query through `query_all`, which
    drains every page via `(continue #cursor ...)` and prints the total row
    count and page count. See [Pagination](#pagination).
+
+Steps 6–7 run only when the server advertises `:lemma/cursor-pagination`;
+otherwise the client prints `server does not advertise cursor pagination;
+skipping paged query`.
 
 Expected output (the session and proposal ids increment per run; the paged
 row/page counts reflect accumulated world state, since `subset-of` facts persist
@@ -110,6 +118,7 @@ across runs):
 
 ```text
 hello -> :welcome  version=1  session=s-1  world=#world "default"
+server: caps={:lemma/cursor-pagination, :lemma/watch} max-message-bytes=1048576
 use-world "default" -> :world-selected  world=#world "default"
 propose (equivalent morningstar venus) -> :proposed  proposal=#proposal "p-1"
 assert proposal -> :asserted
@@ -124,6 +133,42 @@ plain string — hence `rows=[["venus"]]`, not a tagged `#entity` literal.
 
 `main_uds()` runs the identical verb sequence and prints the same per-step
 lines; only the transport differs.
+
+## Capabilities and limits
+
+The `:welcome` envelope advertises what the server can do: a `:capabilities`
+set of namespaced flag keywords (e.g. `:lemma/cursor-pagination`,
+`:lemma/watch`), a `:limits` map of resource caps (e.g. `:max-message-bytes`),
+and `:verbs` / `:predicates` each shaped as `{:core #{...} :extensions {pack
+#{...}}}`.
+
+`read_welcome(body)` parses that surface into a `ServerInfo`:
+
+| Field / method | Meaning |
+|---|---|
+| `capabilities` | `Set<string>` of capability canonical-texts (`:lemma/...`) |
+| `limits` | `Map<string, unknown>` keyed by each limit's canonical text |
+| `verbs`, `predicates` | flat `Set<string>` with `:core` and all `:extensions` merged |
+| `supports(capability)` | `true` iff the capability canonical-text is advertised |
+| `maxMessageBytes` | the `:max-message-bytes` limit, or `undefined` if unadvertised |
+
+Keyword identity is compared by canonical text (via `edn.encode`), since
+`edn.Keyword` has no reliable object identity across parses. Every section is
+optional; an omitted one yields an empty default rather than an error. The
+client reads the welcome once and tailors itself to it:
+
+- It prints the `server: caps=… max-message-bytes=…` summary line after the
+  hello line.
+- It gates the paginated-query demo on
+  `info.supports(":lemma/cursor-pagination")`, skipping the block with
+  `server does not advertise cursor pagination; skipping paged query` when the
+  server does not advertise it.
+- Before sending the batch-propose it checks the message against
+  `:max-message-bytes` with `within_message_limit(info, edn.encode(form))`,
+  which compares the UTF-8 byte length to the cap (`undefined` means
+  unlimited). This respects the limit locally rather than relying on a
+  rejection. The demo checks only the representative batch-propose; a real
+  client checks every outbound message.
 
 ## Pagination
 
@@ -220,17 +265,19 @@ server, and asserts the verb forms encode to grammar-valid wire text.
 ## Scope note
 
 Both the HTTP and Unix-domain-socket transports are now supported, as is cursor
-pagination (see [Pagination](#pagination)). The remaining features —
-capabilities/limits negotiation and watch/SSE streaming — are still pending
-here; they are demonstrated in [`../python`](../python) and may be ported later.
+pagination (see [Pagination](#pagination)) and capabilities/limits awareness
+(see [Capabilities and limits](#capabilities-and-limits)). The one remaining
+feature — watch/SSE streaming — is still pending here; it is demonstrated in
+[`../python`](../python) and may be ported later.
 
 ## References
 
 - `lemma_client.ts` — the `jsedn` constructor helpers (`entity`, `world`,
-  `fact`), the envelope readers, both transports (`post_edn` for HTTP,
-  `uds_send_frame` / `uds_recv_frame` / `FrameReader` for UDS), the pagination
-  helper (`query_all`, `PagedResult`), and the runnable `main()` / `main_uds()`
-  round-trips dispatched by `_dispatch`.
+  `fact`), the `:welcome` parsing (`read_welcome`, `ServerInfo`,
+  `within_message_limit`), the envelope readers, both transports (`post_edn`
+  for HTTP, `uds_send_frame` / `uds_recv_frame` / `FrameReader` for UDS), the
+  pagination helper (`query_all`, `PagedResult`), and the runnable `main()` /
+  `main_uds()` round-trips dispatched by `_dispatch`.
 - [`jsedn`](https://www.npmjs.com/package/jsedn) — the EDN reader/writer the
   codec is built on.
 - [`../python/`](../python) — the reference implementation covering the full
