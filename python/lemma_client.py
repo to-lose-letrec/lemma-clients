@@ -324,6 +324,7 @@ def within_message_limit(info, edn_text):
 # ---------------------------------------------------------------------------
 
 import urllib.error
+import urllib.parse
 import urllib.request
 
 # Where a locally booted Dianoia listener lives by default (see the protocol
@@ -473,6 +474,249 @@ def uds_recv_frame(sock):
     return _recv_exactly(sock, length).decode("utf-8")
 
 
+def _uds_await_watch_event(sock, max_frames=8):
+    """Read framed replies until a ``:watch-event`` arrives; return it (or None).
+
+    Over UDS there is no separate event channel: watch pushes interleave with
+    ordinary command responses on the *same* frame stream (uds.clj fans both
+    onto the one connection). So after triggering a change we read frames in a
+    loop, skipping command replies (the ``:asserted`` echo, etc.) until we see
+    the ``:watch-event`` envelope. The loop is bounded by ``max_frames`` and the
+    socket's timeout so a missing push can never hang -- it returns ``None``,
+    which the caller reports as "no event observed".
+    """
+    for _ in range(max_frames):
+        try:
+            body = loads(uds_recv_frame(sock))
+        except (ConnectionError, socket.timeout):
+            return None
+        if (isinstance(body, _MAPPING_TYPES)
+                and body.get(Keyword("event")) == Keyword("watch-event")):
+            return body
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Watch over HTTP:  the SSE event stream  ->  parsed :watch-event envelopes
+#
+# A (watch-pattern ...) call registers a standing query; matching changes are
+# then *pushed* to the session rather than polled. Over HTTP those pushes
+# arrive on a separate Server-Sent-Events stream, GET /v1/sessions/{id}/events
+# (SPEC §9). SSE is a one-way text stream: each event is one or more
+# ``data:`` lines terminated by a blank line; ``:``-prefixed lines are
+# keep-alive comments to be ignored.
+#
+# Why a raw socket instead of urllib? Dianoia (http-kit) serves the stream with
+# ``Transfer-Encoding: chunked`` and writes an immediate size-0 chunk to flush
+# the response headers before any event exists. A standard chunked reader
+# (urllib / http.client) treats that size-0 chunk as end-of-body and reports
+# EOF, closing the stream before the first event ever arrives. So we speak HTTP
+# by hand over a raw socket -- the same plumbing the UDS transport already uses
+# -- and treat a size-0 chunk as a keep-alive flush (skip it, keep reading)
+# rather than as the end of the stream. Every read is bounded by ``timeout`` so
+# a quiet stream can never hang the demo.
+#
+# ORDERING IS LOAD-BEARING. Dianoia registers the per-session SSE sink LAZILY,
+# at the moment the GET /events connection's headers are written -- and the
+# watch dispatcher delivers a :watch-event only to sinks present at emit time,
+# with NO backlog replay. So the stream must be OPENED (sink registered) BEFORE
+# the change that triggers the event, or the push races ahead of the sink and
+# is lost. We therefore split the work in two:
+#
+#   * open_sse_stream -- connect, send the GET, read PAST the status line and
+#     headers (writing the request + draining headers is what makes Dianoia
+#     register the sink), and hand back an open handle. Call this BEFORE the
+#     trigger.
+#   * read_sse_events -- drain parsed events from an already-open handle, AFTER
+#     the trigger. Bounded by the handle's socket timeout.
+#
+# This is read-only and single-threaded by design. Stdlib only (socket +
+# urllib.parse); the EDN codec is edn_format.
+# ---------------------------------------------------------------------------
+
+
+class _SSEStream:
+    """An open SSE connection: the socket plus the byte buffer carried across
+    the header read into the body decode.
+
+    ``open_sse_stream`` builds one (connection live, headers consumed, server
+    sink registered); ``read_sse_events`` drains events from it; ``close``
+    releases the socket so the server drops the stream. ``buf`` holds any body
+    bytes already read past the header terminator so the chunked decoder does
+    not lose them.
+    """
+
+    def __init__(self, sock, buf):
+        self.sock = sock
+        self.buf = buf
+
+    def close(self):
+        """Release the socket, letting the server tear down the stream."""
+        self.sock.close()
+
+
+def open_sse_stream(base, session_id, timeout=10.0):
+    """Open the SSE event stream for ``session_id`` and return an :class:`_SSEStream`.
+
+    Connects a raw socket to the host/port parsed from ``base`` (e.g.
+    ``"http://127.0.0.1:8080"``), issues ``GET /v1/sessions/{id}/events`` with
+    an ``Accept: text/event-stream`` header, and reads PAST the status line and
+    response headers -- stopping at the blank line that begins the body. It does
+    NOT read any event bodies; that is :func:`read_sse_events`'s job.
+
+    The split matters because writing the GET and draining its headers is what
+    makes Dianoia register this session's SSE sink, and the watch dispatcher
+    only delivers to sinks that exist when an event is emitted (no replay). So a
+    caller must open the stream BEFORE triggering the change it wants to observe,
+    then read AFTER -- otherwise the push races ahead of the sink and is lost.
+
+    Parameters
+    ----------
+    base : str
+        Scheme + host + port, as passed to :func:`post_edn`.
+    session_id : str
+        The session whose event stream to open (its watches' pushes land here).
+    timeout : float
+        Per-read socket timeout in seconds, stored on the socket so subsequent
+        :func:`read_sse_events` calls inherit it.
+
+    Returns
+    -------
+    _SSEStream
+        An open handle. The caller must :meth:`_SSEStream.close` it when done
+        (or pass it to :func:`read_sse_events`, which closes on its own errors
+        only -- normal teardown stays with the caller).
+
+    Notes
+    -----
+    If the server closes the connection before the header terminator arrives,
+    the returned handle is still valid but its buffer is empty; the subsequent
+    read will see EOF and yield no events.
+    """
+    parts = urllib.parse.urlsplit(base)
+    host = parts.hostname
+    port = parts.port or 80
+
+    sock = socket.create_connection((host, port), timeout=timeout)
+    sock.settimeout(timeout)
+
+    request = (
+        f"GET /v1/sessions/{session_id}/events HTTP/1.1\r\n"
+        f"Host: {host}:{port}\r\n"
+        f"Accept: text/event-stream\r\n"
+        f"X-Lemma-Session: {session_id}\r\n"
+        f"Connection: keep-alive\r\n\r\n"
+    )
+    sock.sendall(request.encode("utf-8"))
+
+    # Consume the status line and headers; the body starts after the blank
+    # line. Anything already read past it is retained on the handle so the
+    # chunked decoder in read_sse_events does not lose those bytes. Draining
+    # the headers here is the act that registers the server-side sink.
+    buf = b""
+    try:
+        while b"\r\n\r\n" not in buf:
+            chunk = sock.recv(4096)
+            if not chunk:
+                # Server closed before headers completed: hand back an empty
+                # buffer; the read will see EOF and report no events.
+                return _SSEStream(sock, b"")
+            buf += chunk
+    except (socket.timeout, ConnectionError):
+        # Quiet or broken connection during the header read: still hand back a
+        # handle so the caller's try/finally can close it uniformly.
+        return _SSEStream(sock, b"")
+    _, _, body = buf.partition(b"\r\n\r\n")
+    return _SSEStream(sock, body)
+
+
+def read_sse_events(stream, max_events=1):
+    """Drain up to ``max_events`` parsed envelopes from an open :class:`_SSEStream`.
+
+    ``stream`` is the handle returned by :func:`open_sse_stream` (its socket is
+    live and its headers already consumed). This transfer-decodes the chunked
+    body and parses Server-Sent Events out of it: each event's ``data:`` lines
+    are concatenated and run through ``edn_format.loads``, so the return value
+    is a list of parsed envelopes (typically ``:watch-event`` maps).
+
+    Parameters
+    ----------
+    stream : _SSEStream
+        An open stream handle from :func:`open_sse_stream`.
+    max_events : int
+        Stop and return after this many SSE events have been parsed.
+
+    Returns
+    -------
+    list
+        The parsed envelopes. A ``socket.timeout`` (the per-read timeout set on
+        the socket by :func:`open_sse_stream`) or end of stream ends the read
+        and returns whatever arrived so far, so a quiet stream degrades to an
+        empty list rather than hanging.
+
+    Notes
+    -----
+    A size-0 chunk is http-kit's header-flush keep-alive, NOT end-of-stream, so
+    we skip it and keep reading. Genuine connection close (``recv`` returns
+    ``b""``) ends the read. The caller owns the socket and closes it; this only
+    reads. Errors propagate after the gathered events are returned.
+    """
+    sock = stream.sock
+
+    def read_line():
+        """Pull one CRLF-delimited line off the wire (for chunk-size lines)."""
+        while b"\r\n" not in stream.buf:
+            more = sock.recv(4096)
+            if not more:
+                raise EOFError
+            stream.buf += more
+        line, _, stream.buf = stream.buf.partition(b"\r\n")
+        return line
+
+    def read_n(n):
+        """Pull exactly ``n`` bytes off the wire (for chunk bodies)."""
+        while len(stream.buf) < n:
+            more = sock.recv(4096)
+            if not more:
+                raise EOFError
+            stream.buf += more
+        out, stream.buf = stream.buf[:n], stream.buf[n:]
+        return out
+
+    events = []
+    text = ""  # decoded body bytes awaiting SSE framing
+    try:
+        while len(events) < max_events:
+            size_line = read_line().strip()
+            if size_line == b"":
+                continue  # stray blank line between chunks -- ignore
+            size = int(size_line, 16)
+            if size == 0:
+                continue  # header-flush keep-alive, not end-of-stream
+            text += read_n(size).decode("utf-8")
+            read_n(2)  # the CRLF that trails every chunk body
+
+            # An SSE event is the run of lines up to the next blank line.
+            # Concatenate its ``data:`` payloads (dropping ``:`` comments)
+            # and parse the result as one EDN envelope.
+            while "\n\n" in text:
+                block, _, text = text.partition("\n\n")
+                data = [
+                    line[len("data:"):].lstrip()
+                    for line in block.splitlines()
+                    if line.startswith("data:")
+                ]
+                if data:
+                    events.append(loads("\n".join(data)))
+                    if len(events) >= max_events:
+                        break
+    except (EOFError, socket.timeout):
+        # End of stream or a quiet period: return what we gathered. The
+        # caller treats an empty list as "no event observed in time".
+        pass
+    return events
+
+
 # ---------------------------------------------------------------------------
 # Runnable recipe:  the full Lemma round-trip
 #
@@ -483,6 +727,7 @@ def uds_recv_frame(sock):
 # importing the module performs no I/O.
 # ---------------------------------------------------------------------------
 
+import os
 import sys
 
 # The fields every reply may carry. Pulled out so the step-by-step code below
@@ -672,6 +917,66 @@ def main(base=DEFAULT_BASE):
     else:
         print("server does not advertise cursor pagination; skipping paged query")
 
+    # 9. Watch: register a standing pattern and observe a matching change pushed
+    #    back on the SSE event stream. Gated on the server advertising
+    #    :lemma/watch -- without it the (watch-pattern ...) verb is unsupported.
+    if info.supports(Keyword("lemma/watch")):
+        # (watch-pattern :pattern [[subset-of ?x #entity "group"]]) -- the args
+        # are FLAT keyword args (the :pattern keyword then the where-vector), not
+        # a wrapping map. The reply hands back a #watch handle to unwatch with.
+        pattern = [[Symbol("subset-of"), Symbol("?x"), entity("group")]]
+        body, _ = named((Symbol("watch-pattern"), Keyword("pattern"), pattern))
+        if _is_failure(body):
+            print(f"watch-pattern refused: {_describe_failure(body)}")
+            return
+        watch = body.get(Keyword("watch"))
+        print(f"watch (subset-of ? group) -> {dumps(body.get(_EVENT))}"
+              f"  watch={dumps(watch)}")
+
+        # Ordering is load-bearing: Dianoia registers this session's SSE sink
+        # lazily, when the GET /events headers are written, and delivers a
+        # :watch-event only to sinks present at emit time (no backlog replay).
+        # So OPEN the stream first (registering the sink), THEN trigger the
+        # change, THEN drain -- otherwise the push can fire within milliseconds
+        # of the assert, before our sink exists, and be silently lost.
+        stream = open_sse_stream(base, sid, timeout=10.0)
+        try:
+            # The server pushes only DELTAS, so the change must be new: a fact
+            # re-asserted verbatim is a no-op and fires nothing. We key the probe
+            # entity to this process so each run asserts a genuinely fresh fact.
+            probe = entity(f"watch-probe-{os.getpid()}")
+            body, _ = named((Symbol("propose"),
+                             fact(Symbol("subset-of"), probe, entity("group"))))
+            if _is_failure(body):
+                print(f"watch-probe propose refused: {_describe_failure(body)}")
+                return
+            body, _ = named((Symbol("assert"), body.get(Keyword("proposal"))))
+            if _is_failure(body):
+                print(f"watch-probe assert refused: {_describe_failure(body)}")
+                return
+
+            events = read_sse_events(stream, max_events=1)
+            if events:
+                evt = events[0]
+                print(f"watch (subset-of ? group) -> {dumps(evt.get(_EVENT))}"
+                      f" type={dumps(evt.get(Keyword('type')))}"
+                      f" data={dumps(evt.get(Keyword('data')))}")
+            else:
+                print("watch: no event observed before timeout")
+        finally:
+            # Release the SSE socket so the server drops the stream, whether or
+            # not an event arrived.
+            stream.close()
+
+        # Tear the watch down. (unwatch #watch "w-N") -> :ok.
+        body, _ = named((Symbol("unwatch"), watch))
+        if _is_failure(body):
+            print(f"unwatch refused: {_describe_failure(body)}")
+            return
+        print(f"unwatch {dumps(watch)} -> {dumps(body.get(_EVENT))}")
+    else:
+        print("server does not advertise watch; skipping watch demo")
+
 
 def main_uds(socket_path=DEFAULT_SOCKET):
     """Run the same propose/assert/query round-trip over a Unix domain socket.
@@ -808,6 +1113,55 @@ def main_uds(socket_path=DEFAULT_SOCKET):
                   f"{pages} page(s): {dumps(rows)}")
         else:
             print("server does not advertise cursor pagination; skipping paged query")
+
+        # 8. Watch over UDS. Same standing-pattern idea as the HTTP path, but the
+        #    push has nowhere separate to go: it interleaves with command replies
+        #    on this one socket. Gated on the server advertising :lemma/watch.
+        if info.supports(Keyword("lemma/watch")):
+            # Bound every subsequent read so a missing push cannot hang the demo.
+            sock.settimeout(10.0)
+            # (watch-pattern :pattern [[subset-of ?x #entity "group"]]) -- flat
+            # keyword args, as on HTTP. The reply carries the #watch handle.
+            pattern = [[Symbol("subset-of"), Symbol("?x"), entity("group")]]
+            body = call((Symbol("watch-pattern"), Keyword("pattern"), pattern))
+            if _is_failure(body):
+                print(f"watch-pattern refused: {_describe_failure(body)}")
+                return
+            watch = body.get(Keyword("watch"))
+            print(f"watch (subset-of ? group) -> {dumps(body.get(_EVENT))}"
+                  f"  watch={dumps(watch)}")
+
+            # Trigger a fresh delta (a verbatim re-assert is a no-op and fires
+            # nothing), keyed to this process so each run is genuinely new. The
+            # :asserted reply and the :watch-event push both land on this socket;
+            # we read the assert reply here, then demux the push below.
+            probe = entity(f"watch-probe-{os.getpid()}")
+            body = call((Symbol("propose"),
+                         fact(Symbol("subset-of"), probe, entity("group"))))
+            if _is_failure(body):
+                print(f"watch-probe propose refused: {_describe_failure(body)}")
+                return
+            body = call((Symbol("assert"), body.get(Keyword("proposal"))))
+            if _is_failure(body):
+                print(f"watch-probe assert refused: {_describe_failure(body)}")
+                return
+
+            evt = _uds_await_watch_event(sock)
+            if evt is not None:
+                print(f"watch (subset-of ? group) -> {dumps(evt.get(_EVENT))}"
+                      f" type={dumps(evt.get(Keyword('type')))}"
+                      f" data={dumps(evt.get(Keyword('data')))}")
+            else:
+                print("watch: no event observed before timeout")
+
+            # Tear the watch down. (unwatch #watch "w-N") -> :ok.
+            body = call((Symbol("unwatch"), watch))
+            if _is_failure(body):
+                print(f"unwatch refused: {_describe_failure(body)}")
+                return
+            print(f"unwatch {dumps(watch)} -> {dumps(body.get(_EVENT))}")
+        else:
+            print("server does not advertise watch; skipping watch demo")
     finally:
         # Always release the socket, success or failure. Closing it also lets
         # the server's reader thread observe EOF and drop the session.

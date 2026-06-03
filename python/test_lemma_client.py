@@ -339,8 +339,19 @@ _PAGE1 = (
 )
 _PAGE2 = '{:event :result :rows [[#entity "carol"]] :done? true :cursor #cursor "c-1"}'
 
-# The full nine-step main() sequence: hello, use-world, propose, assert, query,
-# propose(3x), assert, paged-query(page1), continue(page2).
+# The watch tail main() now runs after the paged query when the server
+# advertises :lemma/watch: register the standing pattern (the reply carries a
+# #watch handle), propose+assert a fresh delta to trigger a push, then unwatch.
+# The :watch-event itself does NOT come back through post_edn -- it arrives on
+# the separate SSE event stream (read_sse_events), stubbed by _FakeSseTransport.
+_WATCH_ESTABLISHED = '{:event :watch-established :watch #watch "w-1"}'
+_WATCH_PROBE_PROPOSED = '{:event :proposed :proposal #proposal "p-3"}'
+_UNWATCHED = '{:event :ok}'
+
+# The full main() sequence over HTTP: hello, use-world, propose, assert, query,
+# propose(3x), assert, paged-query(page1), continue(page2), watch-pattern,
+# watch-probe propose, watch-probe assert, unwatch -- thirteen post_edn calls.
+# (The :watch-event push rides the SSE seam, not post_edn.)
 _FULL_SEQUENCE = [
     _WELCOME,
     _WORLD_SELECTED,
@@ -351,6 +362,10 @@ _FULL_SEQUENCE = [
     _ASSERTED,
     _PAGE1,
     _PAGE2,
+    _WATCH_ESTABLISHED,
+    _WATCH_PROBE_PROPOSED,
+    _ASSERTED,
+    _UNWATCHED,
 ]
 
 _ERROR = '{:event :error :reason :malformed :message "bad verb form"}'
@@ -387,13 +402,130 @@ class FakePostEdn:
         return body, session_id
 
 
+# --- SSE seam: a canned chunked HTTP response for read_sse_events ----------
+#
+# read_sse_events opens a RAW socket via socket.create_connection, writes a
+# GET, then transfer-decodes a chunked body and parses SSE out of it. We feed a
+# byte-accurate chunked response so the decoder's real logic runs:
+#   * status line + headers + blank line, then
+#   * a size-0 chunk (http-kit's header-flush keep-alive -- must be SKIPPED,
+#     not treated as EOF), then
+#   * a data chunk carrying a ``:``-comment keep-alive line (must be SKIPPED)
+#     plus the ``data:`` lines of one :watch-event envelope, terminated by the
+#     SSE blank line.
+# The fake socket replays those bytes through recv(); once exhausted recv
+# returns b"" (EOF), which ends the read without hanging.
+
+
+def _chunk(payload_bytes):
+    """Wrap ``payload_bytes`` as one HTTP chunked-transfer frame.
+
+    ``hexlen\\r\\n<bytes>\\r\\n`` -- the exact framing http-kit emits and the
+    framing read_sse_events transfer-decodes.
+    """
+    return f"{len(payload_bytes):x}\r\n".encode("ascii") + payload_bytes + b"\r\n"
+
+
+# One :watch-event envelope's SSE block: a ``:``-comment keep-alive line (to be
+# skipped) followed by the ``data:`` payload, ending in the SSE blank line.
+_WATCH_EVENT_EDN = (
+    '{:event :watch-event :type :assert '
+    ':data #fact {:predicate subset-of :subject #entity "wp" :object #entity "group"}}'
+)
+_SSE_BLOCK = (
+    ": keep-alive comment -- must be ignored\n"
+    f"data: {_WATCH_EVENT_EDN}\n"
+    "\n"
+).encode("utf-8")
+
+
+def _canned_sse_response(blocks=(_SSE_BLOCK,)):
+    """Assemble a full chunked SSE HTTP/1.1 response as on-wire bytes.
+
+    Headers, then a size-0 keep-alive flush chunk (proving it is NOT treated as
+    EOF), then one transfer-chunk per SSE ``block``. No terminating size-0
+    chunk: the stream simply goes quiet, and the fake socket signals EOF by
+    returning b"" once these bytes are drained.
+    """
+    head = (
+        b"HTTP/1.1 200 OK\r\n"
+        b"Content-Type: text/event-stream\r\n"
+        b"Transfer-Encoding: chunked\r\n"
+        b"\r\n"
+    )
+    body = _chunk(b"")  # size-0 header-flush keep-alive
+    for block in blocks:
+        body += _chunk(block)
+    return head + body
+
+
+class _FakeSseSocket:
+    """A raw-socket stand-in for read_sse_events: replays a byte script.
+
+    Records the GET request bytes sent, replays the canned response through
+    recv() in <=n-byte slices (so the header/chunk loops run for real), returns
+    b"" once drained (EOF), and records close(). settimeout is a no-op.
+    """
+
+    def __init__(self, response_bytes):
+        self._buf = response_bytes
+        self.sent = b""
+        self.timeout = None
+        self.closed = False
+
+    def settimeout(self, t):
+        self.timeout = t
+
+    def sendall(self, data):
+        self.sent += data
+
+    def recv(self, n):
+        chunk, self._buf = self._buf[:n], self._buf[n:]
+        return chunk  # b"" once exhausted -> EOF, no hang
+
+    def close(self):
+        self.closed = True
+
+
 class HandshakeBase(unittest.TestCase):
     def setUp(self):
         self._orig_post_edn = lc.post_edn
+        self._orig_create_connection = socket.create_connection
+        self.sse_sockets = []
+        self.create_connection_calls = []
         self.addCleanup(self._restore)
+        # By default, stub the SSE seam with one canned :watch-event so the
+        # watch tail of the default (watch-capable) fixtures completes. Tests
+        # that must prove the seam is NOT opened call disable_sse().
+        self._install_sse(_canned_sse_response())
 
     def _restore(self):
         lc.post_edn = self._orig_post_edn
+        socket.create_connection = self._orig_create_connection
+
+    def _install_sse(self, response_bytes):
+        sockets = self.sse_sockets
+        calls = self.create_connection_calls
+
+        def fake_create_connection(address, timeout=None):
+            calls.append((address, timeout))
+            fake = _FakeSseSocket(response_bytes)
+            sockets.append(fake)
+            return fake
+
+        socket.create_connection = fake_create_connection
+
+    def disable_sse(self):
+        """Make any SSE-seam open fail the test loudly (it must not be reached)."""
+        calls = self.create_connection_calls
+
+        def forbidden(address, timeout=None):
+            calls.append((address, timeout))
+            raise AssertionError(
+                "read_sse_events opened the SSE seam when it should have been gated out"
+            )
+
+        socket.create_connection = forbidden
 
     def install(self, fake):
         lc.post_edn = fake
@@ -410,9 +542,10 @@ class HandshakeSuccessTests(HandshakeBase):
     def test_full_sequence_reaches_result_without_raising(self):
         fake = self.install(FakePostEdn(_FULL_SEQUENCE))
         output = self.run_main_capturing()
-        # All nine protocol steps were issued (the tail is the paginated query
-        # plus its continue).
-        self.assertEqual(len(fake.calls), 9)
+        # All thirteen protocol steps were issued: the five base steps, the
+        # paginated query + continue, then the watch tail (watch-pattern,
+        # probe propose+assert, unwatch).
+        self.assertEqual(len(fake.calls), 13)
         # The conversation reached the query/result line.
         self.assertIn("rows=", output)
         self.assertIn('"venus"', output)
@@ -654,6 +787,7 @@ class _FakeUdsSocket:
         self.connect_calls = 0
         self.sends = []
         self.closed = False
+        self.timeout = None
         self._recv_buffer = b""
 
     # -- script the replies the server would send back -----------------------
@@ -662,6 +796,12 @@ class _FakeUdsSocket:
         self._recv_buffer = b"".join(_frame(r) for r in edn_replies)
 
     # -- socket surface used by main_uds -------------------------------------
+
+    def settimeout(self, t):
+        # The UDS watch path bounds its reads with sock.settimeout so a missing
+        # push cannot hang; record it, no real timer needed for the in-memory
+        # byte stream.
+        self.timeout = t
 
     def connect(self, path):
         self.connect_calls += 1
@@ -705,6 +845,24 @@ _UDS_PAGE2 = (
     '{:event :result :rows [[#entity "carol"]] :done? true :cursor #cursor "c-1"}'
 )
 
+# The UDS watch tail. Over UDS the :watch-event has no separate channel: it
+# interleaves with command replies on the one socket, so _uds_await_watch_event
+# must skip command echoes until it finds the event. The recv script below puts
+# the watch-established/proposed/asserted command replies, then a STRAY command
+# echo (proving the demux skips non-events), then the :watch-event frame, then
+# the unwatch :ok -- so the loop has to discard at least one frame before it
+# lands on the event.
+_UDS_WATCH_ESTABLISHED = '{:event :watch-established :watch #watch "w-1"}'
+_UDS_WATCH_PROBE_PROPOSED = '{:event :proposed :proposal #proposal "p-3"}'
+_UDS_WATCH_EVENT = (
+    '{:event :watch-event :type :assert '
+    ':data #fact {:predicate subset-of :subject #entity "wp" :object #entity "group"}}'
+)
+# A command-reply-shaped frame that is NOT a :watch-event; the demux must skip
+# it before reaching the event frame.
+_UDS_STRAY_ECHO = '{:event :asserted}'
+_UDS_UNWATCHED = '{:event :ok}'
+
 _UDS_FULL_SEQUENCE = [
     _UDS_WELCOME,
     _UDS_WORLD_SELECTED,
@@ -715,6 +873,14 @@ _UDS_FULL_SEQUENCE = [
     _UDS_ASSERTED,
     _UDS_PAGE1,
     _UDS_PAGE2,
+    # watch tail recv order: command replies, then an interleaved stray echo and
+    # the :watch-event push, then the unwatch reply.
+    _UDS_WATCH_ESTABLISHED,
+    _UDS_WATCH_PROBE_PROPOSED,
+    _UDS_ASSERTED,
+    _UDS_STRAY_ECHO,
+    _UDS_WATCH_EVENT,
+    _UDS_UNWATCHED,
 ]
 
 
@@ -808,12 +974,14 @@ class UdsHandshakeSuccessTests(UdsHandshakeBase):
         sent = self.sent_frames_as_edn(self.created[0])
         self.assertEqual(sent[0], "(hello)")
 
-    def test_sends_nine_frames_one_per_protocol_step(self):
+    def test_sends_thirteen_frames_one_per_protocol_step(self):
         self.install_socket(_UDS_FULL_SEQUENCE)
 
         self.run_main_uds_capturing()
 
-        self.assertEqual(len(self.sent_frames_as_edn(self.created[0])), 9)
+        # Five base + paged query/continue + watch tail (watch-pattern, probe
+        # propose+assert, unwatch) = thirteen sent frames.
+        self.assertEqual(len(self.sent_frames_as_edn(self.created[0])), 13)
 
     def test_no_frame_after_hello_echoes_the_session_handle(self):
         # CRITICAL: over UDS the session is bound to the connection by the
@@ -1240,19 +1408,20 @@ class WithinMessageLimitTests(unittest.TestCase):
 # ===========================================================================
 
 
-# A welcome WITHOUT cursor-pagination: it advertises other caps but omits the
-# one that gates the paged tail.
+# A welcome WITHOUT cursor-pagination or watch: both gated tails are skipped, so
+# only the five base steps run. (Watch is omitted too so these stay pure
+# pagination-gating tests; the watch gate has its own suite below.)
 _WELCOME_NO_PAGINATION = (
     '{:event :welcome :version 1 '
     ':session #session "s-77" :world #world "default" '
-    ':capabilities #{:lemma/v1 :lemma/watch} '
+    ':capabilities #{:lemma/v1} '
     ':limits {:max-message-bytes 1048576} '
     ':verbs {:core #{hello use-world propose assert query} :extensions {}}}'
 )
 _UDS_WELCOME_NO_PAGINATION = (
     '{:event :welcome :version 1 '
     ':session #session "s-uds-1" :world #world "default" '
-    ':capabilities #{:lemma/v1 :lemma/watch} '
+    ':capabilities #{:lemma/v1} '
     ':limits {:max-message-bytes 1048576} '
     ':verbs {:core #{hello use-world propose assert query} :extensions {}}}'
 )
@@ -1302,14 +1471,14 @@ class HttpCapabilityGatingTests(HandshakeBase):
             self.assertNotEqual(dumps(form).split(" ", 1)[0], "(continue")
             self.assertFalse(dumps(form).startswith("(continue"))
 
-    def test_present_pagination_capability_runs_the_full_nine_step_path(self):
+    def test_present_pagination_capability_runs_the_full_thirteen_step_path(self):
         # The default fixture advertises :lemma/cursor-pagination, so the full
-        # paginated path runs end to end.
+        # paginated path runs end to end, followed by the watch tail.
         fake = self.install(FakePostEdn(_FULL_SEQUENCE))
 
         self.run_main_capturing()
 
-        self.assertEqual(len(fake.calls), 9)
+        self.assertEqual(len(fake.calls), 13)
 
 
 class UdsCapabilityGatingTests(UdsHandshakeBase):
@@ -1338,12 +1507,503 @@ class UdsCapabilityGatingTests(UdsHandshakeBase):
         for frame in sent:
             self.assertFalse(frame.startswith("(continue"))
 
-    def test_present_pagination_capability_runs_the_full_nine_step_path(self):
+    def test_present_pagination_capability_runs_the_full_thirteen_step_path(self):
         self.install_socket(_UDS_FULL_SEQUENCE)
 
         self.run_main_uds_capturing()
 
-        self.assertEqual(len(self.sent_frames_as_edn(self.created[0])), 9)
+        self.assertEqual(len(self.sent_frames_as_edn(self.created[0])), 13)
+
+
+# ===========================================================================
+# (K) SSE reader, SPLIT in two (ordering is load-bearing -- SPEC §9):
+#
+#   * open_sse_stream(base, session_id, timeout) connects a RAW socket
+#     (socket.create_connection), writes the GET, and reads PAST the status
+#     line + headers (the blank-line terminator) -- which is what registers
+#     Dianoia's per-session SSE sink. It returns an open _SSEStream handle and
+#     does NOT read any event bodies. Callers open this BEFORE triggering the
+#     change, since the dispatcher delivers only to sinks present at emit time.
+#   * read_sse_events(stream, max_events) drains parsed envelopes from an
+#     already-open handle, transfer-decoding chunked + SSE framing -- because
+#     http-kit flushes a size-0 chunk up front that a stock chunked reader
+#     would mistake for EOF.
+#
+# These tests drive the real header-read AND the real decoder against a
+# byte-accurate canned response (built by _canned_sse_response / _chunk above),
+# so the header consumption, the size-0-keep-alive handling, the :-comment
+# skipping, the max_events bound, and the terminate-on-EOF behaviour all run for
+# real. socket.create_connection is the only seam patched; restored via
+# addCleanup. The single _FakeSseSocket serves BOTH phases off one byte script
+# -- open_sse_stream consumes the header bytes, read_sse_events drains the body
+# bytes that follow -- exactly as a live socket would. No real network, no hang.
+# ===========================================================================
+
+
+class SseStreamTestBase(unittest.TestCase):
+    """Shared SSE seam plumbing: patch socket.create_connection, record sockets."""
+
+    def setUp(self):
+        self._orig_create_connection = socket.create_connection
+        self.created = []
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        socket.create_connection = self._orig_create_connection
+
+    def install_sse(self, response_bytes):
+        created = self.created
+
+        def factory(address, timeout=None):
+            fake = _FakeSseSocket(response_bytes)
+            fake.address = address
+            fake.connect_timeout = timeout
+            created.append(fake)
+            return fake
+
+        socket.create_connection = factory
+
+    def open_stream(self, base="http://127.0.0.1:8080", session_id="s-1", **kw):
+        """Open a stream and arrange for its socket to be closed at teardown."""
+        stream = lc.open_sse_stream(base, session_id, **kw)
+        self.addCleanup(stream.close)
+        return stream
+
+
+class OpenSseStreamTests(SseStreamTestBase):
+    """open_sse_stream: connect, send a well-formed GET, consume headers only."""
+
+    def test_opens_connection_to_host_and_port_parsed_from_base(self):
+        self.install_sse(_canned_sse_response())
+
+        self.open_stream(base="http://127.0.0.1:8080", session_id="s-9")
+
+        self.assertEqual(self.created[0].address, ("127.0.0.1", 8080))
+
+    def test_issues_get_on_the_session_events_endpoint_with_session_header(self):
+        self.install_sse(_canned_sse_response())
+
+        self.open_stream(base="http://127.0.0.1:8080", session_id="s-9")
+
+        sent = self.created[0].sent.decode("utf-8")
+        self.assertIn("GET /v1/sessions/s-9/events HTTP/1.1", sent)
+        self.assertIn("Accept: text/event-stream", sent)
+        # The sink-registration GET must carry the session header so Dianoia
+        # binds the lazily-registered SSE sink to the right session.
+        self.assertIn("X-Lemma-Session: s-9", sent)
+
+    def test_consumes_headers_without_reading_event_bodies(self):
+        # open_sse_stream reads PAST the blank-line header terminator (the act
+        # that registers the sink) but must NOT consume event bodies. With the
+        # canned response, the size-0 keep-alive + the data chunk follow the
+        # headers, so the handle's buffer must still hold un-decoded body bytes
+        # and contain no parsed event text -- read_sse_events will do the body
+        # drain. We prove the split by showing the data chunk is still pending.
+        self.install_sse(_canned_sse_response())
+
+        stream = self.open_stream()
+
+        # Headers are gone (the partition dropped them); the chunked body bytes
+        # that begin with the size-0 keep-alive chunk are retained on the handle.
+        self.assertNotIn(b"HTTP/1.1", stream.buf)
+        self.assertNotIn(b"text/event-stream", stream.buf)
+        # The event payload has NOT been parsed away -- its bytes are still on
+        # the socket/buffer awaiting read_sse_events.
+        remaining = stream.buf + self.created[0]._buf
+        self.assertIn(b":watch-event", remaining)
+
+    def test_returns_open_handle_whose_socket_is_the_connected_one(self):
+        self.install_sse(_canned_sse_response())
+
+        stream = self.open_stream()
+
+        self.assertIs(stream.sock, self.created[0])
+
+    def test_immediate_connection_close_during_headers_yields_empty_buffer(self):
+        # The socket closes (recv -> b"") before the header terminator arrives:
+        # open_sse_stream still returns a usable handle, with an empty buffer.
+        self.install_sse(b"HTTP/1.1 200 OK\r\n")  # no blank-line terminator
+
+        stream = self.open_stream()
+
+        self.assertEqual(stream.buf, b"")
+
+    def test_close_closes_the_underlying_socket(self):
+        # The caller owns the socket; close() must release it so the server
+        # tears the stream down.
+        self.install_sse(_canned_sse_response())
+        stream = lc.open_sse_stream("http://127.0.0.1:8080", "s-1")
+
+        stream.close()
+
+        self.assertTrue(self.created[0].closed)
+
+
+class ReadSseEventsTests(SseStreamTestBase):
+    """read_sse_events: drain parsed envelopes from an already-open handle."""
+
+    # --- happy path: one event parsed off the chunked stream ----------------
+
+    def test_yields_the_parsed_watch_event_off_the_chunked_stream(self):
+        self.install_sse(_canned_sse_response())
+        stream = self.open_stream()
+
+        events = lc.read_sse_events(stream, max_events=1)
+
+        self.assertEqual(len(events), 1)
+        evt = events[0]
+        self.assertEqual(evt[Keyword("event")], Keyword("watch-event"))
+        self.assertEqual(evt[Keyword("type")], Keyword("assert"))
+        # The :data carried a #fact, which round-trips into the client's _Fact.
+        self.assertEqual(evt[Keyword("data")], loads(_WATCH_EVENT_EDN)[Keyword("data")])
+
+    def test_size_zero_keep_alive_chunk_is_not_treated_as_end_of_stream(self):
+        # The canned response leads with a size-0 chunk BEFORE the data chunk.
+        # If read_sse_events mistook it for EOF it would return [] before ever
+        # seeing the event; getting the event back proves the size-0 chunk was
+        # skipped (kept reading) rather than ending the stream.
+        self.install_sse(_canned_sse_response())
+        stream = self.open_stream()
+
+        events = lc.read_sse_events(stream, max_events=1)
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0][Keyword("event")], Keyword("watch-event"))
+
+    def test_colon_comment_keep_alive_line_is_skipped(self):
+        # The SSE block contains a leading ``: comment`` line; only the data:
+        # line should feed the parse. If the comment leaked into the EDN, loads
+        # would fail or the envelope would be malformed. A clean :watch-event
+        # parse proves the comment was dropped.
+        self.install_sse(_canned_sse_response())
+        stream = self.open_stream()
+
+        events = lc.read_sse_events(stream, max_events=1)
+
+        self.assertEqual(events[0][Keyword("event")], Keyword("watch-event"))
+
+    # --- max_events bound ---------------------------------------------------
+
+    def test_honors_max_events_and_returns_after_that_many(self):
+        # Feed two events but ask for only one: the loop must stop at one even
+        # though more data remains on the wire.
+        two = _canned_sse_response(blocks=(_SSE_BLOCK, _SSE_BLOCK))
+        self.install_sse(two)
+        stream = self.open_stream()
+
+        events = lc.read_sse_events(stream, max_events=1)
+
+        self.assertEqual(len(events), 1)
+
+    def test_drains_multiple_events_when_max_events_allows(self):
+        two = _canned_sse_response(blocks=(_SSE_BLOCK, _SSE_BLOCK))
+        self.install_sse(two)
+        stream = self.open_stream()
+
+        events = lc.read_sse_events(stream, max_events=2)
+
+        self.assertEqual(len(events), 2)
+        self.assertTrue(
+            all(e[Keyword("event")] == Keyword("watch-event") for e in events)
+        )
+
+    # --- termination / no-hang ----------------------------------------------
+
+    def test_stream_end_before_any_event_returns_empty_without_hanging(self):
+        # Headers + a lone size-0 keep-alive chunk, then EOF: no event ever
+        # arrives. open_sse_stream consumes the headers; the subsequent read
+        # must terminate and return [] rather than blocking.
+        head = (
+            b"HTTP/1.1 200 OK\r\n"
+            b"Content-Type: text/event-stream\r\n"
+            b"Transfer-Encoding: chunked\r\n\r\n"
+        )
+        self.install_sse(head + _chunk(b""))
+        stream = self.open_stream()
+
+        events = lc.read_sse_events(stream, max_events=1)
+
+        self.assertEqual(events, [])
+
+    def test_immediate_connection_close_during_headers_returns_empty(self):
+        # The socket closes (recv -> b"") before the header terminator arrives:
+        # open_sse_stream hands back an empty-buffer handle and read_sse_events
+        # returns [] rather than raising or hanging.
+        self.install_sse(b"HTTP/1.1 200 OK\r\n")  # no blank-line terminator
+        stream = self.open_stream()
+
+        events = lc.read_sse_events(stream, max_events=1)
+
+        self.assertEqual(events, [])
+
+    def test_does_not_close_the_socket_the_caller_owns_it(self):
+        # Under the split the reader only reads; teardown stays with the caller
+        # (main() closes the stream in its finally). So read_sse_events must
+        # leave the socket open.
+        self.install_sse(_canned_sse_response())
+        stream = self.open_stream()
+
+        lc.read_sse_events(stream, max_events=1)
+
+        self.assertFalse(self.created[0].closed)
+
+
+# ===========================================================================
+# (L) Watch capability gating: the watch tail is gated on :lemma/watch.
+#
+# (B) drive main()/main_uds() with a welcome whose :capabilities OMITS
+#     :lemma/watch. The watch demo must be skipped: the skip note printed, no
+#     (watch-pattern ...) frame sent, and -- over HTTP -- the SSE seam never
+#     opened. The capability-PRESENT path is exercised by the full-sequence
+#     suites above (which now include the watch tail end to end).
+# ===========================================================================
+
+
+# A welcome advertising pagination but NOT watch: the paged tail runs, the
+# watch tail is gated out. Built so the full nine-step paginated path completes,
+# then the watch block is skipped.
+_WELCOME_NO_WATCH = (
+    '{:event :welcome :version 1 '
+    ':session #session "s-77" :world #world "default" '
+    ':capabilities #{:lemma/v1 :lemma/cursor-pagination} '
+    ':limits {:max-message-bytes 1048576} '
+    ':verbs {:core #{hello use-world propose assert query} :extensions {}}}'
+)
+_UDS_WELCOME_NO_WATCH = (
+    '{:event :welcome :version 1 '
+    ':session #session "s-uds-1" :world #world "default" '
+    ':capabilities #{:lemma/v1 :lemma/cursor-pagination} '
+    ':limits {:max-message-bytes 1048576} '
+    ':verbs {:core #{hello use-world propose assert query} :extensions {}}}'
+)
+
+# Pagination present, watch absent: the nine paginated steps run, then the watch
+# tail is skipped -- nine post_edn calls / nine UDS frames, no watch-pattern.
+_NO_WATCH_SEQUENCE = [
+    _WELCOME_NO_WATCH,
+    _WORLD_SELECTED,
+    _PROPOSED,
+    _ASSERTED,
+    _RESULT,
+    _PROPOSED_3X,
+    _ASSERTED,
+    _PAGE1,
+    _PAGE2,
+]
+_UDS_NO_WATCH_SEQUENCE = [
+    _UDS_WELCOME_NO_WATCH,
+    _UDS_WORLD_SELECTED,
+    _UDS_PROPOSED,
+    _UDS_ASSERTED,
+    _UDS_RESULT,
+    _UDS_PROPOSED_3X,
+    _UDS_ASSERTED,
+    _UDS_PAGE1,
+    _UDS_PAGE2,
+]
+
+
+class HttpWatchGatingTests(HandshakeBase):
+    def test_missing_watch_capability_skips_the_watch_demo(self):
+        # Pagination runs (nine calls), watch tail gated out -- so exactly nine
+        # post_edn calls, none of them a (watch-pattern ...).
+        fake = self.install(FakePostEdn(_NO_WATCH_SEQUENCE))
+
+        self.run_main_capturing()
+
+        self.assertEqual(len(fake.calls), 9)
+
+    def test_missing_watch_capability_prints_the_skip_note(self):
+        self.install(FakePostEdn(_NO_WATCH_SEQUENCE))
+
+        output = self.run_main_capturing()
+
+        self.assertIn("does not advertise watch", output)
+
+    def test_missing_watch_capability_sends_no_watch_pattern_frame(self):
+        fake = self.install(FakePostEdn(_NO_WATCH_SEQUENCE))
+
+        self.run_main_capturing()
+
+        for _path, form, _session, _base in fake.calls:
+            self.assertFalse(dumps(form).startswith("(watch-pattern"))
+
+    def test_missing_watch_capability_never_opens_the_sse_seam(self):
+        # CRITICAL: the SSE stream must not be touched when watch is unadvertised.
+        # disable_sse makes any socket.create_connection raise, so if the gated
+        # code reached read_sse_events the test would fail loudly.
+        self.disable_sse()
+        self.install(FakePostEdn(_NO_WATCH_SEQUENCE))
+
+        self.run_main_capturing()
+
+        self.assertEqual(self.create_connection_calls, [])
+
+    def test_present_watch_capability_opens_the_sse_seam_once(self):
+        # The default fixture advertises :lemma/watch, so the watch tail runs
+        # and read_sse_events opens the (stubbed) SSE seam exactly once.
+        self.install(FakePostEdn(_FULL_SEQUENCE))
+
+        self.run_main_capturing()
+
+        self.assertEqual(len(self.create_connection_calls), 1)
+
+    def test_present_watch_capability_prints_the_observed_event(self):
+        self.install(FakePostEdn(_FULL_SEQUENCE))
+
+        output = self.run_main_capturing()
+
+        # The :watch-event drained off the SSE stream is reported, and the
+        # watch is torn down.
+        self.assertIn(":watch-event", output)
+        self.assertIn("unwatch", output)
+
+    def test_present_watch_capability_sends_unwatch_with_the_watch_handle(self):
+        fake = self.install(FakePostEdn(_FULL_SEQUENCE))
+
+        self.run_main_capturing()
+
+        # The final post_edn call is the unwatch carrying the #watch handle from
+        # the watch-established reply.
+        last_form = fake.calls[-1][1]
+        self.assertIsInstance(last_form, tuple)
+        self.assertEqual(last_form[0], Symbol("unwatch"))
+        self.assertEqual(last_form[1], loads('#watch "w-1"'))
+
+
+class UdsWatchGatingTests(UdsHandshakeBase):
+    def test_missing_watch_capability_skips_the_watch_demo(self):
+        self.install_socket(_UDS_NO_WATCH_SEQUENCE)
+
+        self.run_main_uds_capturing()
+
+        sent = self.sent_frames_as_edn(self.created[0])
+        self.assertEqual(len(sent), 9)
+
+    def test_missing_watch_capability_prints_the_skip_note(self):
+        self.install_socket(_UDS_NO_WATCH_SEQUENCE)
+
+        output = self.run_main_uds_capturing()
+
+        self.assertIn("does not advertise watch", output)
+
+    def test_missing_watch_capability_sends_no_watch_pattern_frame(self):
+        self.install_socket(_UDS_NO_WATCH_SEQUENCE)
+
+        self.run_main_uds_capturing()
+
+        for frame in self.sent_frames_as_edn(self.created[0]):
+            self.assertFalse(frame.startswith("(watch-pattern"))
+
+
+# ===========================================================================
+# (M) UDS watch demux: _uds_await_watch_event picks the :watch-event out of
+#     interleaved command-reply frames, and the watch path tears down with an
+#     (unwatch ...). Driven both at the unit level (the helper alone, against a
+#     scripted recv socket) and end-to-end through main_uds (the interleaved
+#     full sequence above), so the demux and the unwatch are both verified.
+# ===========================================================================
+
+
+class UdsAwaitWatchEventTests(unittest.TestCase):
+    """Unit-level: _uds_await_watch_event reads framed replies until the event."""
+
+    def _socket_of(self, edn_frames):
+        return _ScriptedRecvSocket([_frame(f) for f in edn_frames])
+
+    def test_returns_watch_event_skipping_leading_command_replies(self):
+        sock = self._socket_of([
+            _UDS_STRAY_ECHO,            # a command echo -- must be skipped
+            '{:event :asserted}',       # another non-event -- skipped
+            _UDS_WATCH_EVENT,           # the event we want
+        ])
+
+        evt = lc._uds_await_watch_event(sock, max_frames=8)
+
+        self.assertIsNotNone(evt)
+        self.assertEqual(evt[Keyword("event")], Keyword("watch-event"))
+        self.assertEqual(evt[Keyword("type")], Keyword("assert"))
+
+    def test_returns_first_event_when_it_is_the_very_first_frame(self):
+        sock = self._socket_of([_UDS_WATCH_EVENT])
+
+        evt = lc._uds_await_watch_event(sock)
+
+        self.assertEqual(evt[Keyword("event")], Keyword("watch-event"))
+
+    def test_returns_none_when_no_event_within_max_frames(self):
+        # Only command echoes, never an event: the bounded loop gives up and
+        # returns None (the caller reports "no event observed") rather than
+        # hanging.
+        sock = self._socket_of(['{:event :asserted}'] * 3)
+
+        evt = lc._uds_await_watch_event(sock, max_frames=3)
+
+        self.assertIsNone(evt)
+
+    def test_returns_none_on_premature_stream_close(self):
+        # The frame stream closes (EOF) before any event: _recv_exactly raises
+        # ConnectionError, which the helper swallows and reports as None.
+        sock = _ScriptedRecvSocket([])  # immediately b"" -> EOF
+
+        evt = lc._uds_await_watch_event(sock)
+
+        self.assertIsNone(evt)
+
+    def test_bounded_by_max_frames_even_with_more_non_event_frames(self):
+        # Six non-event frames available but max_frames=2: the loop reads at
+        # most two and returns None without draining the rest.
+        sock = self._socket_of(['{:event :asserted}'] * 6)
+
+        evt = lc._uds_await_watch_event(sock, max_frames=2)
+
+        self.assertIsNone(evt)
+        # Exactly two frames (each: a 4-byte prefix read + a body read) were
+        # consumed -- the loop did not run away past its bound.
+        self.assertLessEqual(len(sock._chunks), 4)
+
+
+class UdsWatchPathEndToEndTests(UdsHandshakeBase):
+    """End-to-end: main_uds demuxes the interleaved event and unwatches."""
+
+    def test_watch_event_is_demuxed_and_reported(self):
+        self.install_socket(_UDS_FULL_SEQUENCE)
+
+        output = self.run_main_uds_capturing()
+
+        # The interleaved :watch-event (which followed a stray command echo on
+        # the wire) was picked out and reported.
+        self.assertIn(":watch-event", output)
+        self.assertNotIn("no event observed", output)
+
+    def test_watch_path_sends_unwatch_with_the_watch_handle(self):
+        self.install_socket(_UDS_FULL_SEQUENCE)
+
+        self.run_main_uds_capturing()
+
+        sent = self.sent_frames_as_edn(self.created[0])
+        # The last frame is the unwatch carrying the #watch handle the
+        # watch-established reply returned.
+        last_form = loads(sent[-1])
+        self.assertEqual(last_form[0], Symbol("unwatch"))
+        self.assertEqual(last_form[1], loads('#watch "w-1"'))
+
+    def test_watch_path_sends_a_watch_pattern_frame(self):
+        self.install_socket(_UDS_FULL_SEQUENCE)
+
+        self.run_main_uds_capturing()
+
+        sent = self.sent_frames_as_edn(self.created[0])
+        self.assertTrue(any(f.startswith("(watch-pattern") for f in sent))
+
+    def test_watch_path_sets_a_read_timeout_so_a_missing_push_cannot_hang(self):
+        # main_uds calls sock.settimeout(10.0) before the watch reads so a
+        # missing push degrades to "no event observed" instead of blocking.
+        self.install_socket(_UDS_FULL_SEQUENCE)
+
+        self.run_main_uds_capturing()
+
+        self.assertEqual(self.created[0].timeout, 10.0)
 
 
 if __name__ == "__main__":

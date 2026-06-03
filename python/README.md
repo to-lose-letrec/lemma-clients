@@ -102,10 +102,17 @@ line per step:
 7. `(query {... :limit 2})` — run a paginated query through `query_all`, which
    drains every page via `(continue #cursor ...)` and prints the total row
    count and page count.
+8. `(watch-pattern :pattern [[subset-of ?x #entity "group"]])` — register a
+   standing pattern, assert one fresh matching fact, observe the resulting
+   `:watch-event` push, then `(unwatch #watch "...")`. Gated on
+   `info.supports(Keyword("lemma/watch"))`. See
+   [Watch / streaming](#watch--streaming).
 
 Steps 6–7 run only when the server advertises `:lemma/cursor-pagination`;
 otherwise the client prints `server does not advertise cursor pagination;
-skipping paged query` and stops there.
+skipping paged query`. Step 8 runs only when the server advertises
+`:lemma/watch`; otherwise the client prints `server does not advertise watch;
+skipping watch demo`.
 
 After every response the code inspects `:event`; an `:error` or `:rejected`
 envelope is printed via `_describe_failure` and the sequence stops cleanly.
@@ -122,6 +129,9 @@ query (equivalent morningstar ?o) -> rows=[["venus"]]  done?=true
 propose (3x subset-of ? group) -> :proposed  proposal=#proposal "p-2"
 assert proposal -> :asserted
 paged query (subset-of ? group), limit 2 -> 3 rows over 2 page(s): [["sub-a"] ["sub-b"] ["sub-c"]]
+watch (subset-of ? group) -> :watch-established  watch=#watch "w-1"
+watch (subset-of ? group) -> :watch-event type=:added data=[["watch-probe-12345"]]
+unwatch #watch "w-1" -> :ok
 ```
 
 The query binds `?o` to the matching entity's name, which Dianoia returns as a
@@ -191,6 +201,60 @@ Pagination needs a **stably ordered** result, which requires at least one
 pure-EDB (stored-fact) predicate at the outer `:where` level. The demo paginates
 over `subset-of` for that reason; a rule-headed predicate such as `member-of` as
 the sole pattern is rejected `:bad-args :unsupported-rule-call-ordering`.
+
+## Watch / streaming
+
+A `(watch-pattern :pattern [[subset-of ?x #entity "group"]])` call registers a
+standing query on the session. The args are **flat keyword args** — the
+`:pattern` keyword followed by the where-vector — not a wrapping map. The reply
+is `{:event :watch-established :watch #watch "..."}`, returning a `#watch`
+handle.
+
+Watches are **deltas-only**: after the subscription, each matching *change* is
+pushed as `{:event :watch-event :type :added|:retracted :data [...]}`. The
+current contents are never replayed, and re-asserting a fact verbatim is a no-op
+that fires nothing. The demo therefore opens the subscription first, then
+triggers a genuinely new delta by asserting a fact keyed to the process
+(`watch-probe-<pid>`), so each run produces a fresh `:added` event. Reads are
+bounded by a timeout so a missing push degrades to `watch: no event observed
+before timeout` rather than hanging. `(unwatch #watch "...")` ends the
+subscription and replies `:ok`.
+
+The two transports differ in **where the push arrives**:
+
+| Transport | Push delivery | Consumer |
+|---|---|---|
+| UDS | Interleaved on the same socket as command replies | `_uds_await_watch_event` |
+| HTTP | A separate SSE stream, `GET /v1/sessions/{id}/events` | `read_sse_events` |
+
+**UDS.** There is no separate event channel; the server fans watch pushes and
+ordinary command replies onto the one connection. After triggering the change,
+`_uds_await_watch_event(sock)` reads frames in a bounded loop, skipping command
+replies (the `:asserted` echo, etc.) until it sees the `:watch-event` envelope,
+then returns it. The loop is bounded by `max_frames` and the socket timeout, so
+a missing push returns `None` instead of blocking.
+
+**HTTP.** Pushes arrive out-of-band on a Server-Sent-Events stream:
+`GET /v1/sessions/{id}/events`, one or more `data:` lines per event terminated
+by a blank line, with `:`-prefixed keep-alive comment lines. `read_sse_events`
+consumes it over a **raw socket** rather than `urllib` / `http.client`, for two
+reasons:
+
+- Dianoia (http-kit) serves the stream `Transfer-Encoding: chunked` and writes
+  an immediate **size-0 chunk** to flush the response headers before any event
+  exists. A stdlib chunked reader treats that size-0 chunk as end-of-body and
+  reports immediate EOF, closing the stream before the first event arrives. The
+  raw reader treats a size-0 chunk as a keep-alive flush — skip it and keep
+  reading — and only ends on a genuine connection close.
+- Speaking the chunked transfer by hand lets the reader transfer-decode the
+  frames and parse the `data:` lines itself. Each event's `data:` payloads are
+  concatenated and run through `edn_format.loads`. Every read is bounded by
+  `timeout`, so a quiet stream returns the events gathered so far rather than
+  hanging.
+
+Both paths are read-only and single-threaded: the watch is established and the
+change triggered first, then the consumer drains the push the server has queued
+for the session.
 
 ## How HTTP maps to the wire
 
@@ -287,8 +351,9 @@ the handshake is verified without a live server.
 - `lemma_client.py` — the `edn_format` tag registrations and constructor
   helpers, the `:welcome` parsing (`read_welcome`, `ServerInfo`,
   `within_message_limit`), both transports (`post_edn` for HTTP,
-  `uds_send_frame` / `uds_recv_frame` for UDS), and the runnable `main()` /
-  `main_uds()` round-trips.
+  `uds_send_frame` / `uds_recv_frame` for UDS), the watch consumers
+  (`read_sse_events` for the HTTP SSE stream, `_uds_await_watch_event` for the
+  interleaved UDS stream), and the runnable `main()` / `main_uds()` round-trips.
 - [`edn_format`](https://pypi.org/project/edn_format/) — the EDN reader/writer
   the codec is built on.
 - `../README.md` — project framing: these are from-scratch single-file
