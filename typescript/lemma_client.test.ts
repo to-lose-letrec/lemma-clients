@@ -87,6 +87,7 @@ import {
   main,
   main_uds,
   _dispatch,
+  query_all,
   uds_send_frame,
   DEFAULT_BASE,
   DEFAULT_SOCKET,
@@ -149,6 +150,17 @@ const WORLD_SELECTED = '{:event :world-selected :world #world "default"}';
 const PROPOSED = '{:event :proposed :proposal #proposal "p-1"}';
 const ASSERTED = '{:event :asserted}';
 const RESULT = '{:event :result :rows [["venus"]] :done? true}';
+
+// The paginated tail the round-trip now runs after the single query: a second
+// propose (the 3x subset-of batch), its assert, then a :limit 2 query whose
+// first page is NOT done and carries a #cursor, followed by a (continue #cursor)
+// page that IS done. Two rows on page one, one on page two -> 3 rows / 2 pages.
+const PROPOSED_BATCH = '{:event :proposed :proposal #proposal "p-2"}';
+const PAGE_ONE =
+  '{:event :result :rows [["sub-a"] ["sub-b"]] :done? false :cursor #cursor "c-1"}';
+const PAGE_TWO = '{:event :result :rows [["sub-c"]] :done? true}';
+// The four extra replies the paginated tail consumes, in order.
+const PAGED_TAIL = [PROPOSED_BATCH, ASSERTED, PAGE_ONE, PAGE_TWO];
 
 // ===========================================================================
 // (A) post_edn -- request shape, happy path, error-envelope recovery.
@@ -307,15 +319,42 @@ function scriptFetch(captures: Capture[], bodies: string[]): void {
   }) as unknown as typeof fetch;
 }
 
-const FULL_SEQUENCE = [WELCOME, WORLD_SELECTED, PROPOSED, ASSERTED, RESULT];
+const FULL_SEQUENCE = [
+  WELCOME, WORLD_SELECTED, PROPOSED, ASSERTED, RESULT, ...PAGED_TAIL,
+];
+// The full round-trip now makes nine calls: the original five plus the four
+// paginated-tail calls (batch propose, assert, page one, continue page two).
+const FULL_SEQUENCE_LEN = FULL_SEQUENCE.length;
 
 describe("main() handshake", () => {
-  test("completes the full five-step sequence without throwing", async () => {
+  test("completes the full round-trip (handshake + paged query) without throwing", async () => {
     const captures: Capture[] = [];
     scriptFetch(captures, FULL_SEQUENCE);
 
     await expect(main()).resolves.toBeUndefined();
-    expect(captures).toHaveLength(5);
+    expect(captures).toHaveLength(FULL_SEQUENCE_LEN);
+  });
+
+  test("drains the paginated query across pages and prints rows-over-pages", async () => {
+    const lines: string[] = [];
+    console.log = ((...args: unknown[]) => {
+      lines.push(args.map(String).join(" "));
+    }) as typeof console.log;
+    const captures: Capture[] = [];
+    scriptFetch(captures, FULL_SEQUENCE);
+
+    await main();
+
+    // The :limit 2 query (call index 7) is followed by exactly one
+    // (continue #cursor "c-1") (index 8) before :done? -> two pages, three rows.
+    const continueBody = captures[8].init.body as string;
+    expect(continueBody).toBe(
+      edn.encode(new edn.List([
+        new edn.Symbol("continue"), edn.parse('#cursor "c-1"'),
+      ])),
+    );
+    const output = lines.join("\n");
+    expect(output).toContain("paged query (subset-of ? group), limit 2 -> 3 rows over 2 page(s)");
   });
 
   test("opens with an anonymous (hello) on the /v1/messages endpoint", async () => {
@@ -455,6 +494,215 @@ describe("EDN tagged-literal encoding", () => {
 });
 
 // ===========================================================================
+// (C2) query_all -- cursor pagination driven by a SCRIPTED in-memory `send`.
+//
+// query_all(send, queryForm) is transport-agnostic: `send` is a
+// `form -> Promise<body>` closure. These tests exercise the pagination loop in
+// isolation -- no fetch, no socket -- by handing it a closure over a queue of
+// canned reply bodies built with `edn.parse` (so the #cursor it feeds back is
+// the SAME edn.Tagged the server "sent"). The closure records every form it was
+// called with so we can assert what query_all put back on the wire.
+//
+// The handshake-level main()/main_uds tests already assert the happy two-page
+// drain at integration level; these add the dedicated unit coverage for the
+// single-page, mid-stream-failure, and initial-failure branches plus the exact
+// (continue #cursor) form, without re-driving the handshake fixtures.
+// ===========================================================================
+
+/**
+ * Build a scripted `send`: a `form -> Promise<body>` closure over a queue of
+ * canned EDN reply strings. Each string is `edn.parse`d on the way out so the
+ * `#cursor` carried on a page is a genuine `edn.Tagged` that query_all can feed
+ * straight back. Every form the closure receives is pushed onto `forms` so the
+ * test can inspect what query_all sent. No network of any kind.
+ */
+function scriptedSend(
+  bodies: string[],
+  forms: unknown[],
+): (form: unknown) => Promise<unknown> {
+  let i = 0;
+  return (form: unknown) => {
+    forms.push(form);
+    const raw = bodies[i];
+    i += 1;
+    if (raw === undefined) {
+      throw new Error(
+        `scripted send exhausted: query_all made more calls than scripted ` +
+          `(${i} calls, ${bodies.length} bodies)`,
+      );
+    }
+    return Promise.resolve(edn.parse(raw));
+  };
+}
+
+describe("query_all pagination", () => {
+  test("(A) concatenates rows across two pages in order", async () => {
+    const forms: unknown[] = [];
+    const send = scriptedSend(
+      [
+        '{:event :result :rows [[#entity "a"] [#entity "b"]] :done? false :cursor #cursor "c-1"}',
+        '{:event :result :rows [[#entity "c"]] :done? true}',
+      ],
+      forms,
+    );
+
+    const result = await query_all(send, new edn.List([new edn.Symbol("query")]));
+
+    expect(result.rows).toHaveLength(3);
+    expect(result.rows.map((r) => edn.encode(r))).toEqual([
+      '[#entity "a"]',
+      '[#entity "b"]',
+      '[#entity "c"]',
+    ]);
+  });
+
+  test("(A) reports two pages for a two-page drain", async () => {
+    const forms: unknown[] = [];
+    const send = scriptedSend(
+      [
+        '{:event :result :rows [[#entity "a"] [#entity "b"]] :done? false :cursor #cursor "c-1"}',
+        '{:event :result :rows [[#entity "c"]] :done? true}',
+      ],
+      forms,
+    );
+
+    const result = await query_all(send, new edn.List([new edn.Symbol("query")]));
+
+    expect(result.pages).toBe(2);
+  });
+
+  test("(A) reports no failure on a successful drain", async () => {
+    const forms: unknown[] = [];
+    const send = scriptedSend(
+      [
+        '{:event :result :rows [[#entity "a"] [#entity "b"]] :done? false :cursor #cursor "c-1"}',
+        '{:event :result :rows [[#entity "c"]] :done? true}',
+      ],
+      forms,
+    );
+
+    const result = await query_all(send, new edn.List([new edn.Symbol("query")]));
+
+    expect(result.failure).toBeFalsy();
+  });
+
+  test("(A) the second send is (continue #cursor) carrying page one's cursor", async () => {
+    const forms: unknown[] = [];
+    const send = scriptedSend(
+      [
+        '{:event :result :rows [[#entity "a"] [#entity "b"]] :done? false :cursor #cursor "c-1"}',
+        '{:event :result :rows [[#entity "c"]] :done? true}',
+      ],
+      forms,
+    );
+
+    await query_all(send, new edn.List([new edn.Symbol("query")]));
+
+    expect(forms).toHaveLength(2);
+    expect(edn.encode(forms[1])).toBe(
+      edn.encode(new edn.List([
+        new edn.Symbol("continue"), edn.parse('#cursor "c-1"'),
+      ])),
+    );
+  });
+
+  test("(B) a single done page returns one page and never sends a continue", async () => {
+    const forms: unknown[] = [];
+    const send = scriptedSend(
+      ['{:event :result :rows [[#entity "a"]] :done? true}'],
+      forms,
+    );
+
+    const result = await query_all(send, new edn.List([new edn.Symbol("query")]));
+
+    expect(result.pages).toBe(1);
+    expect(result.rows).toHaveLength(1);
+    expect(result.failure).toBeFalsy();
+    expect(forms).toHaveLength(1); // exactly one call: no (continue ...)
+  });
+
+  test("(B) does not throw on a done page that omits :cursor", async () => {
+    const forms: unknown[] = [];
+    const send = scriptedSend(
+      ['{:event :result :rows [[#entity "a"]] :done? true}'],
+      forms,
+    );
+
+    await expect(
+      query_all(send, new edn.List([new edn.Symbol("query")])),
+    ).resolves.toBeDefined();
+  });
+
+  test("(C) propagates a mid-stream continue failure with rows gathered so far", async () => {
+    const forms: unknown[] = [];
+    const send = scriptedSend(
+      [
+        '{:event :result :rows [[#entity "a"]] :done? false :cursor #cursor "c-1"}',
+        '{:event :error :reason :unknown-handle}',
+      ],
+      forms,
+    );
+
+    const result = await query_all(send, new edn.List([new edn.Symbol("query")]));
+
+    // rows-so-far survive; pages counts only the fully-fetched first page.
+    expect(result.rows.map((r) => edn.encode(r))).toEqual(['[#entity "a"]']);
+    expect(result.pages).toBe(1);
+    expect(result.failure).not.toBeNull();
+    expect(
+      edn.encode((result.failure as edn.Map).at(new edn.Keyword(":reason"))),
+    ).toBe(":unknown-handle");
+  });
+
+  test("(C) a mid-stream continue failure does not throw", async () => {
+    const forms: unknown[] = [];
+    const send = scriptedSend(
+      [
+        '{:event :result :rows [[#entity "a"]] :done? false :cursor #cursor "c-1"}',
+        '{:event :error :reason :unknown-handle}',
+      ],
+      forms,
+    );
+
+    await expect(
+      query_all(send, new edn.List([new edn.Symbol("query")])),
+    ).resolves.toBeDefined();
+  });
+
+  test("(C) an initial-reply failure returns no rows, zero pages, and the failure body", async () => {
+    const forms: unknown[] = [];
+    const send = scriptedSend(
+      ['{:event :error :reason :malformed :message "bad verb form"}'],
+      forms,
+    );
+
+    const result = await query_all(send, new edn.List([new edn.Symbol("query")]));
+
+    expect(result.rows).toEqual([]);
+    expect(result.pages).toBe(0);
+    expect(result.failure).not.toBeNull();
+    // Only the initial query was sent -- no continue attempted past a failure.
+    expect(forms).toHaveLength(1);
+  });
+
+  test("(C) a :rejected initial reply is also surfaced as a failure", async () => {
+    const forms: unknown[] = [];
+    const send = scriptedSend(
+      ['{:event :rejected :reason :inconsistent}'],
+      forms,
+    );
+
+    const result = await query_all(send, new edn.List([new edn.Symbol("query")]));
+
+    expect(result.pages).toBe(0);
+    expect(result.rows).toEqual([]);
+    expect(
+      edn.encode((result.failure as edn.Map).at(new edn.Keyword(":event"))),
+    ).toBe(":rejected");
+  });
+});
+
+// ===========================================================================
 // (D) UDS framing helpers and shared fakes.
 // ===========================================================================
 
@@ -495,7 +743,10 @@ function decodeFrames(buf: Buffer): string[] {
 // NOT as a header.
 const UDS_WELCOME =
   '{:event :welcome :version 1 :session #session "s-1" :world #world "default"}';
-const UDS_FULL = [UDS_WELCOME, WORLD_SELECTED, PROPOSED, ASSERTED, RESULT];
+const UDS_FULL = [
+  UDS_WELCOME, WORLD_SELECTED, PROPOSED, ASSERTED, RESULT, ...PAGED_TAIL,
+];
+const UDS_FULL_LEN = UDS_FULL.length;
 
 /** Silence console.log for a test body, restored by the shared afterEach. */
 function muteLog(): void {
@@ -577,15 +828,16 @@ describe("FrameReader buffering (via main_uds)", () => {
     sock.emit("data", welcome.subarray(4, 9));
     sock.emit("data", welcome.subarray(9));
 
-    // Feed the rest of the handshake one whole frame per chunk so it completes.
-    for (const reply of [WORLD_SELECTED, PROPOSED, ASSERTED, RESULT]) {
+    // Feed the rest of the round-trip one whole frame per chunk so it completes
+    // (the handshake's four replies plus the paginated tail's four).
+    for (const reply of [WORLD_SELECTED, PROPOSED, ASSERTED, RESULT, ...PAGED_TAIL]) {
       await Promise.resolve();
       sock.emit("data", frameOf(reply));
     }
 
     await expect(run).resolves.toBeUndefined();
-    // Five frames sent (hello/use-world/propose/assert/query), all decodable.
-    expect(decodeFrames(sock.written())).toHaveLength(5);
+    // All round-trip frames sent and decodable despite the dribbled welcome.
+    expect(decodeFrames(sock.written())).toHaveLength(UDS_FULL_LEN);
   });
 
   test("yields ONE frame per recv when TWO frames coalesce in a single chunk", async () => {
@@ -605,9 +857,14 @@ describe("FrameReader buffering (via main_uds)", () => {
     sock.emit("data", Buffer.concat([frameOf(PROPOSED), frameOf(ASSERTED)]));
     await Promise.resolve();
     sock.emit("data", frameOf(RESULT));
+    // Drive the paginated tail too so the round-trip runs to completion.
+    for (const reply of PAGED_TAIL) {
+      await Promise.resolve();
+      sock.emit("data", frameOf(reply));
+    }
 
     await expect(run).resolves.toBeUndefined();
-    expect(decodeFrames(sock.written())).toHaveLength(5);
+    expect(decodeFrames(sock.written())).toHaveLength(UDS_FULL_LEN);
   });
 
   test("rejects (does not hang) on a premature EOF mid-frame via 'close'", async () => {
@@ -665,12 +922,28 @@ async function driveUds(sock: FakeSocket, replies: string[]): Promise<void> {
 }
 
 describe("main_uds handshake", () => {
-  test("completes the full five-step sequence without throwing", async () => {
+  test("completes the full round-trip (handshake + paged query) without throwing", async () => {
     const sock = new FakeSocket();
     currentSocket = sock;
 
     await expect(driveUds(sock, UDS_FULL)).resolves.toBeUndefined();
-    expect(decodeFrames(sock.written())).toHaveLength(5);
+    expect(decodeFrames(sock.written())).toHaveLength(UDS_FULL_LEN);
+  });
+
+  test("drains the paginated query, threading the #cursor into a (continue ...) frame", async () => {
+    const sock = new FakeSocket();
+    currentSocket = sock;
+
+    await driveUds(sock, UDS_FULL);
+
+    // Sent frame index 8 is the (continue #cursor "c-1") that drains page two,
+    // carrying exactly the cursor handle page one returned.
+    const continueFrame = decodeFrames(sock.written())[8];
+    expect(continueFrame).toBe(
+      edn.encode(new edn.List([
+        new edn.Symbol("continue"), edn.parse('#cursor "c-1"'),
+      ])),
+    );
   });
 
   test("opens with an anonymous (hello) frame", async () => {

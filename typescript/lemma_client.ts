@@ -386,6 +386,71 @@ export function uds_recv_frame(reader: FrameReader): Promise<string> {
 }
 
 // ---------------------------------------------------------------------------
+// Cursor pagination:  drain a (query :limit N) across (continue #cursor) pages
+//
+// A (query ...) with a :limit returns a full first page whose :done? is false
+// and which carries a #cursor handle; each (continue #cursor) returns the next
+// page (more :rows, a fresh :cursor) until :done? is true (SPEC §8). query_all
+// walks that sequence to completion, mirroring python's query_all so the two
+// clients have parity. Both transports' send closures are `form -> body`, so
+// query_all is transport-agnostic: the caller supplies the closure.
+// ---------------------------------------------------------------------------
+
+/** The outcome of draining a paginated query: all rows, page count, failure. */
+export interface PagedResult {
+  /** Every row gathered across all pages (the raw `edn` values from `:rows`). */
+  rows: unknown[];
+  /** How many pages were fetched (the first query counts as page 1). */
+  pages: number;
+  /** The offending `:error` / `:rejected` body, or `null` on success. */
+  failure: unknown;
+}
+
+/**
+ * Run a `(query ...)` and drain every page via `(continue #cursor ...)`.
+ *
+ * `send` is a `form -> Promise<body>` closure (the per-transport adapter).
+ * Returns `{ rows, pages, failure }`: `failure` is `null` on success or the
+ * offending `:error` / `:rejected` body. A `:limit` query returns a full first
+ * page with `:done? false` and a `#cursor`; we `(continue #cursor)` until
+ * `:done?` is true.
+ *
+ * The `#cursor` carried on each page is an opaque `edn.Tagged` that round-trips
+ * back onto the wire untouched. Note an expired cursor (the server's idle TTL
+ * is ~300s, SPEC §8) comes back as `:error :unknown-handle`; this demo
+ * propagates that failure as-is, whereas a real client would re-issue the
+ * original query to start a fresh page.
+ */
+export async function query_all(
+  send: (form: unknown) => Promise<unknown>,
+  queryForm: unknown,
+): Promise<PagedResult> {
+  let body = await send(queryForm);
+  if (isFailure(body)) {
+    return { rows: [], pages: 0, failure: body };
+  }
+
+  // `:rows` is an `edn.Vector`; its elements live in `.val`. We accumulate the
+  // raw values so the caller can re-encode them exactly as the server sent.
+  const rows: unknown[] = [...(field(body, ":rows") as edn.Vector).val];
+  let pages = 1;
+  // `:done?` parses to a JS boolean. While it is false the server has more
+  // pages and (only then) includes a `:cursor` to fetch the next one.
+  while (field(body, ":done?") === false) {
+    // `:cursor` is present exactly when `:done?` is false -- the server omits
+    // it on an already-done result, so we read it only inside this loop.
+    const cursor = field(body, ":cursor");
+    body = await send(new edn.List([new edn.Symbol("continue"), cursor]));
+    if (isFailure(body)) {
+      return { rows, pages, failure: body };
+    }
+    rows.push(...(field(body, ":rows") as edn.Vector).val);
+    pages += 1;
+  }
+  return { rows, pages, failure: null };
+}
+
+// ---------------------------------------------------------------------------
 // Runnable recipe:  the full Lemma round-trip
 //
 // A flat, linear retelling of examples/hello-http.clj: say hello, enter a
@@ -484,6 +549,62 @@ export async function main(base: string = DEFAULT_BASE): Promise<void> {
   console.log(
     `query (equivalent morningstar ?o) -> rows=${kwText(field(res.body, ":rows"))}` +
       `  done?=${kwText(field(res.body, ":done?"))}`,
+  );
+
+  // 7. Paginated query. Seed three subset-of facts in one propose, assert the
+  //    batch, then query them back with :limit 2 so the result spans two pages
+  //    (2 + 1) that query_all drains via (continue #cursor ...). subset-of is a
+  //    pure-EDB (stored-fact) predicate, so a query over it has stable
+  //    (tx-id, ref-id) ordering and can be paginated; a rule-headed predicate
+  //    like member-of cannot be the sole outer :where pattern (the server
+  //    rejects it :bad-args :unsupported-rule-call-ordering).
+  const f1 = fact(new edn.Symbol("subset-of"), entity("sub-a"), entity("group"));
+  const f2 = fact(new edn.Symbol("subset-of"), entity("sub-b"), entity("group"));
+  const f3 = fact(new edn.Symbol("subset-of"), entity("sub-c"), entity("group"));
+  res = await named(new edn.List([new edn.Symbol("propose"), f1, f2, f3]));
+  if (isFailure(res.body)) {
+    console.log(`propose (3x subset-of) refused: ${describeFailure(res.body)}`);
+    return;
+  }
+  const batch = field(res.body, ":proposal");
+  console.log(
+    `propose (3x subset-of ? group) -> ${kwText(eventOf(res.body))}` +
+      `  proposal=${kwText(batch)}`,
+  );
+  res = await named(new edn.List([new edn.Symbol("assert"), batch]));
+  if (isFailure(res.body)) {
+    console.log(`assert (3x subset-of) refused: ${describeFailure(res.body)}`);
+    return;
+  }
+  console.log(`assert proposal -> ${kwText(eventOf(res.body))}`);
+
+  // The paged query itself: :limit 2 over 3 matching rows yields two pages.
+  // query_all wants a `form -> Promise<body>` closure; post_edn returns a
+  // PostResult, so we adapt it by taking just the body.
+  const pagedQuery = new edn.List([
+    new edn.Symbol("query"),
+    new edn.Map([
+      new edn.Keyword(":find"), new edn.Vector([new edn.Symbol("?x")]),
+      new edn.Keyword(":where"), new edn.Vector([
+        new edn.Vector([
+          new edn.Symbol("subset-of"),
+          new edn.Symbol("?x"),
+          entity("group"),
+        ]),
+      ]),
+      new edn.Keyword(":limit"), 2,
+    ]),
+  ]);
+  const send = (form: unknown) =>
+    post_edn(`/v1/sessions/${sid}/messages`, form, sid, base).then((r) => r.body);
+  const paged = await query_all(send, pagedQuery);
+  if (paged.failure) {
+    console.log(`paged query refused: ${describeFailure(paged.failure)}`);
+    return;
+  }
+  console.log(
+    `paged query (subset-of ? group), limit 2 -> ${paged.rows.length} rows over ` +
+      `${paged.pages} page(s): ${edn.encode(new edn.Vector(paged.rows))}`,
   );
 }
 
@@ -603,6 +724,59 @@ export async function main_uds(socketPath: string = DEFAULT_SOCKET): Promise<voi
     console.log(
       `query (equivalent morningstar ?o) -> rows=${kwText(field(body, ":rows"))}` +
         `  done?=${kwText(field(body, ":done?"))}`,
+    );
+
+    // 6. Paginated query. Seed three subset-of facts in one propose, assert the
+    //    batch, then query them back with :limit 2 so the result spans two pages
+    //    (2 + 1) that query_all drains via (continue #cursor ...). subset-of is a
+    //    pure-EDB predicate (stable tx-id/ref-id ordering), so it can be
+    //    paginated; a rule-headed predicate like member-of cannot be the sole
+    //    outer :where pattern (server :bad-args :unsupported-rule-call-ordering).
+    const f1 = fact(new edn.Symbol("subset-of"), entity("sub-a"), entity("group"));
+    const f2 = fact(new edn.Symbol("subset-of"), entity("sub-b"), entity("group"));
+    const f3 = fact(new edn.Symbol("subset-of"), entity("sub-c"), entity("group"));
+    body = await call(new edn.List([new edn.Symbol("propose"), f1, f2, f3]));
+    if (isFailure(body)) {
+      console.log(`propose (3x subset-of) refused: ${describeFailure(body)}`);
+      return;
+    }
+    const batch = field(body, ":proposal");
+    console.log(
+      `propose (3x subset-of ? group) -> ${kwText(eventOf(body))}` +
+        `  proposal=${kwText(batch)}`,
+    );
+    body = await call(new edn.List([new edn.Symbol("assert"), batch]));
+    if (isFailure(body)) {
+      console.log(`assert (3x subset-of) refused: ${describeFailure(body)}`);
+      return;
+    }
+    console.log(`assert proposal -> ${kwText(eventOf(body))}`);
+
+    // The paged query itself: :limit 2 over 3 matching rows yields two pages.
+    // The UDS `call` closure is already `form -> Promise<body>`, so query_all
+    // takes it directly.
+    const pagedQuery = new edn.List([
+      new edn.Symbol("query"),
+      new edn.Map([
+        new edn.Keyword(":find"), new edn.Vector([new edn.Symbol("?x")]),
+        new edn.Keyword(":where"), new edn.Vector([
+          new edn.Vector([
+            new edn.Symbol("subset-of"),
+            new edn.Symbol("?x"),
+            entity("group"),
+          ]),
+        ]),
+        new edn.Keyword(":limit"), 2,
+      ]),
+    ]);
+    const paged = await query_all(call, pagedQuery);
+    if (paged.failure) {
+      console.log(`paged query refused: ${describeFailure(paged.failure)}`);
+      return;
+    }
+    console.log(
+      `paged query (subset-of ? group), limit 2 -> ${paged.rows.length} rows over ` +
+        `${paged.pages} page(s): ${edn.encode(new edn.Vector(paged.rows))}`,
     );
   } finally {
     // Always release the socket, success or failure. Closing it also lets the

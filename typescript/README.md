@@ -97,8 +97,16 @@ printed via `describeFailure` and the sequence stops cleanly.
    `#proposal` handle round-trips back onto the wire untouched.
 5. `(query {:find [?o] :where [[equivalent #entity "morningstar" ?o]]})` —
    query it back and print `:rows` and `:done?`.
+6. `(propose #fact{...} #fact{...} #fact{...})` — batch-propose three
+   `subset-of` facts in one call, then `(assert <proposal>)` the batch, so the
+   next query has more matching rows than a single page holds.
+7. `(query {... :limit 2})` — run a paginated query through `query_all`, which
+   drains every page via `(continue #cursor ...)` and prints the total row
+   count and page count. See [Pagination](#pagination).
 
-Expected output (the session and proposal ids increment per run):
+Expected output (the session and proposal ids increment per run; the paged
+row/page counts reflect accumulated world state, since `subset-of` facts persist
+across runs):
 
 ```text
 hello -> :welcome  version=1  session=s-1  world=#world "default"
@@ -106,6 +114,9 @@ use-world "default" -> :world-selected  world=#world "default"
 propose (equivalent morningstar venus) -> :proposed  proposal=#proposal "p-1"
 assert proposal -> :asserted
 query (equivalent morningstar ?o) -> rows=[["venus"]]  done?=true
+propose (3x subset-of ? group) -> :proposed  proposal=#proposal "p-2"
+assert proposal -> :asserted
+paged query (subset-of ? group), limit 2 -> 3 rows over 2 page(s): [["sub-a"] ["sub-b"] ["sub-c"]]
 ```
 
 The query binds `?o` to the matching entity's name, which Dianoia returns as a
@@ -113,6 +124,34 @@ plain string — hence `rows=[["venus"]]`, not a tagged `#entity` literal.
 
 `main_uds()` runs the identical verb sequence and prints the same per-step
 lines; only the transport differs.
+
+## Pagination
+
+A `(query ...)` with `:limit N` returns a first page. If the page is full the
+reply carries `:done? false` and a `#cursor` handle; the client sends
+`(continue #cursor "...")` to fetch each next page until a reply has
+`:done? true`. A short result (fewer than `N` rows) or a query without `:limit`
+comes back with `:done? true` and no `#cursor`.
+
+`query_all(send, queryForm)` is the transport-agnostic helper that drains all
+pages. `send` is a `form -> Promise<body>` closure; the helper concatenates
+`:rows` across pages and returns `{ rows, pages, failure }`, where `failure` is
+`null` on success or the offending `:error` / `:rejected` envelope. Each
+transport supplies its own closure: HTTP's `main` adapts `post_edn` with
+`(form) => post_edn(..., sid, base).then((r) => r.body)`; UDS's `call` is
+already `form -> Promise<body>`, so `main_uds` passes it directly.
+
+The demo seeds three `subset-of` facts in one batch-propose, asserts them, then
+runs a `:limit 2` query so the result spans two pages in both transports.
+Pagination needs a **stably ordered** result, which requires a pure-EDB
+(stored-fact) predicate at the outer `:where` level. `subset-of` is pure EDB, so
+its `(tx-id, ref-id)` ordering is stable and the query can be paginated; a
+rule-headed predicate such as `member-of` as the sole `:where` pattern is
+rejected `:bad-args :unsupported-rule-call-ordering`.
+
+A `#cursor` is a server-side bookmark with a ~300-second idle TTL. An expired
+cursor returns `:error :unknown-handle`, which `query_all` propagates as its
+`failure`; a real client re-issues the original query to start a fresh page.
 
 ## How HTTP maps to the wire
 
@@ -180,17 +219,18 @@ server, and asserts the verb forms encode to grammar-valid wire text.
 
 ## Scope note
 
-Both the HTTP and Unix-domain-socket transports are now supported. The richer
-features — cursor pagination, capabilities/limits negotiation, and watch/SSE
-streaming — are still pending here; they are demonstrated in
-[`../python`](../python) and may be ported later.
+Both the HTTP and Unix-domain-socket transports are now supported, as is cursor
+pagination (see [Pagination](#pagination)). The remaining features —
+capabilities/limits negotiation and watch/SSE streaming — are still pending
+here; they are demonstrated in [`../python`](../python) and may be ported later.
 
 ## References
 
 - `lemma_client.ts` — the `jsedn` constructor helpers (`entity`, `world`,
   `fact`), the envelope readers, both transports (`post_edn` for HTTP,
-  `uds_send_frame` / `uds_recv_frame` / `FrameReader` for UDS), and the runnable
-  `main()` / `main_uds()` round-trips dispatched by `_dispatch`.
+  `uds_send_frame` / `uds_recv_frame` / `FrameReader` for UDS), the pagination
+  helper (`query_all`, `PagedResult`), and the runnable `main()` / `main_uds()`
+  round-trips dispatched by `_dispatch`.
 - [`jsedn`](https://www.npmjs.com/package/jsedn) — the EDN reader/writer the
   codec is built on.
 - [`../python/`](../python) — the reference implementation covering the full
