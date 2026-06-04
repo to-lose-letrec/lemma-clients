@@ -97,10 +97,16 @@ Loading the file performs no network I/O; only `-main` touches the network.
 7. `(query {... :limit 2})` — run a paginated query through `query-all`, which
    drains every page via `(continue #cursor ...)` and prints the total row count
    and page count. See [Pagination](#pagination).
+8. `(watch-pattern :pattern [[subset-of ?x #entity "group"]])` — register a
+   standing pattern, open the SSE stream, assert one fresh matching fact, observe
+   the resulting `:watch-event` push, then `(unwatch #watch "...")`. Gated on
+   `(supports? info :lemma/watch)`. See [Watch / streaming](#watch--streaming).
 
 Steps 6–7 run only when the server advertises `:lemma/cursor-pagination`;
 otherwise the client prints `server does not advertise cursor pagination;
-skipping paged query`.
+skipping paged query`. Step 8 runs only when the server advertises
+`:lemma/watch`; otherwise the client prints `server does not advertise watch;
+skipping watch demo`.
 
 After every reply the code checks `:event`; an `:error` or `:rejected` envelope
 is printed via `describe-failure` and the sequence stops cleanly. A
@@ -120,6 +126,9 @@ query (equivalent morningstar ?o) -> rows=[["venus"]]  done?=true
 propose (3x subset-of ? group) -> :proposed  proposal=#proposal "p-2"
 assert proposal -> :asserted
 paged query (subset-of ? group), limit 2 -> 3 rows over 2 page(s): [["sub-a"] ["sub-b"] ["sub-c"]]
+watch (subset-of ? group) -> :watch-established  watch=#watch "w-1"
+watch (subset-of ? group) -> :watch-event type=:added data=[["watch-probe-12345"]]
+unwatch #watch "w-1" -> :ok
 ```
 
 The query binds `?o` to the matching entity's name, which Dianoia returns as a
@@ -261,6 +270,74 @@ Pagination needs a **stably ordered** result, which requires a pure-EDB
 rule-headed predicate such as `member-of` as the sole `:where` pattern is
 rejected `:bad-args :unsupported-rule-call-ordering`.
 
+## Watch / streaming
+
+A `(watch-pattern :pattern [[subset-of ?x #entity "group"]])` call registers a
+standing query on the session. The args are **flat keyword args** — the
+`:pattern` keyword followed by the where-vector — not a wrapping map. The reply
+is `{:event :watch-established :watch #watch "..."}`, returning a `#watch`
+handle.
+
+Watches are **deltas-only**: after the subscription, each matching *change* is
+pushed as `{:event :watch-event :type :added|:retracted :data [...]}`. The
+current contents are never replayed, and re-asserting a fact verbatim is a no-op
+that fires nothing. The demo is gated on `(supports? info :lemma/watch)`. It
+opens the subscription first, then triggers a genuinely new delta by asserting a
+fact keyed to the process (`watch-probe-<pid>`, via
+`(.pid (java.lang.ProcessHandle/current))`), so each run produces a fresh
+`:added` event. Reads are bounded by a timeout so a missing push degrades to
+`watch: no event observed before timeout` rather than hanging.
+`(unwatch #watch "...")` ends the subscription and replies `:ok`.
+
+The two transports differ in **where the push arrives**:
+
+| Transport | Push delivery | Consumer |
+|---|---|---|
+| UDS | Interleaved on the same socket as command replies | `uds-await-watch-event` |
+| HTTP | A separate SSE stream, `GET /v1/sessions/{id}/events` | `open-sse-stream` / `read-sse-events` |
+
+**UDS.** There is no separate event channel; the server fans watch pushes and
+ordinary command replies onto the one connection. After triggering the change,
+`uds-await-watch-event` reads frames via a `recv-fn` closure in a bounded loop,
+demultiplexing the `:watch-event` envelope out of the command stream — skipping
+command replies (the `:asserted` echo, etc.) until it sees the push, then
+returning it. The loop is bounded by `max-frames`, so a missing push returns
+`nil` instead of blocking.
+
+**HTTP.** Pushes arrive out-of-band on a Server-Sent-Events stream:
+`GET /v1/sessions/{id}/events`, one or more `data:` lines per event terminated
+by a blank line, with `:`-prefixed keep-alive comment lines. The stream is
+consumed over a **raw `java.net.Socket`** rather than `java.net.http`, for two
+reasons:
+
+- Dianoia (http-kit) serves the stream `Transfer-Encoding: chunked` and writes
+  an immediate **size-0 chunk** to flush the response headers before any event
+  exists. `java.net.http`'s streaming body handler — like Python's `urllib` and
+  Bun's `fetch` — treats that size-0 chunk as end-of-body and reports immediate
+  EOF, closing the stream before the first event arrives. The raw reader treats
+  a size-0 chunk as an http-kit keep-alive flush — skip it and keep reading —
+  and only ends on a genuine connection close (`.read` returns `-1`).
+- Speaking the chunked transfer by hand lets the reader transfer-decode the
+  frames and parse the `data:` lines itself. Each event's `data:` payloads are
+  concatenated and run through `(edn/read-string {:default tagged-literal} ...)`,
+  so handles like `#watch` round-trip.
+
+The work is split in two because **ordering is load-bearing**: Dianoia registers
+this session's SSE sink *lazily*, when the `GET /events` headers are written, and
+delivers a `:watch-event` only to sinks present at emit time (no backlog replay).
+So `(open-sse-stream base session-id timeout)` connects, sends the GET, and reads
+past the status line and headers (the act that registers the sink), returning an
+open handle (`{:sock <Socket> :buf <StringBuilder>}`) — call it **before**
+triggering the change. Then `(read-sse-events stream max-events)`
+transfer-decodes the chunked body and drains parsed envelopes from the open
+handle **after** the trigger. Every read is bounded by the socket's `SO_TIMEOUT`
+(set via `.setSoTimeout`), so a quiet stream returns the events gathered so far
+rather than hanging; the caller `.close`s the `:sock` to drop the stream.
+
+Both paths are read-only and single-threaded: the watch is established and the
+change triggered first, then the consumer drains the push the server has queued
+for the session.
+
 ## Tests
 
 `lemma_client_test.clj` is a `clojure.test` suite. It rebinds the single I/O
@@ -278,12 +355,15 @@ use `-M:test` if the git dep cannot resolve offline.
 
 ## Scope
 
-This starter speaks both the HTTP and Unix-domain-socket transports,
-demonstrates capabilities/limits awareness (see
-[Capabilities and limits](#capabilities-and-limits)), and demonstrates cursor
-pagination (see [Pagination](#pagination)). The one remaining feature —
-watch/SSE streaming — is demonstrated in [`../python`](../python) and
-[`../typescript`](../typescript) and may be ported here later.
+This demo is now at **full parity with [`../python`](../python) and
+[`../typescript`](../typescript)**: both the HTTP and Unix-domain-socket
+transports, cursor pagination (see [Pagination](#pagination)),
+capabilities/limits awareness (see
+[Capabilities and limits](#capabilities-and-limits)), and watch/SSE streaming
+(see [Watch / streaming](#watch--streaming)) are all supported. The richer
+streaming surface — watch-gap / slow-consumer handling, multiple concurrent
+watches, reconnection — stays out of scope per the parent
+[`../README.md`](../README.md).
 
 ## References
 
@@ -292,8 +372,10 @@ watch/SSE streaming — is demonstrated in [`../python`](../python) and
   `max-message-bytes`, `within-message-limit?`), the HTTP transport
   (`http-send`, `post-edn`), the UDS transport (`uds-send-frame`,
   `uds-recv-frame`), the envelope predicates (`failure?`, `describe-failure`),
-  the pagination helper (`query-all`), and the runnable `run-http` / `run-uds`
-  round-trips dispatched by `-main`.
+  the pagination helper (`query-all`), the watch consumers (`open-sse-stream` /
+  `read-sse-events` for the HTTP SSE stream, `uds-await-watch-event` for the
+  interleaved UDS stream), and the runnable `run-http` / `run-uds` round-trips
+  dispatched by `-main`.
 - `deps.edn` — the zero-dependency classpath and the `:test` alias.
 - `../README.md` — project framing: these are from-scratch single-file recipes,
   not libraries.
