@@ -170,24 +170,42 @@
 (def proposed-edn "{:event :proposed :proposal #proposal \"p-1\"}")
 (def asserted-edn "{:event :asserted}")
 (def result-edn  "{:event :result :rows [[#entity \"venus\"]] :done? true}")
+;; The cursor-pagination tail (SPEC §8): after the single-result query, the
+;; round-trip seeds three subset-of facts in one batched propose, asserts the
+;; batch, then drains a :limit-2 query across TWO pages. Page 1 comes back
+;; :done? false with a #cursor; (continue #cursor) yields page 2 :done? true.
+(def proposed-batch-edn "{:event :proposed :proposal #proposal \"p-2\"}")
+(def page1-edn "{:event :result :rows [[#entity \"sub-a\"] [#entity \"sub-b\"]] :done? false :cursor #cursor \"c-1\"}")
+(def page2-edn "{:event :result :rows [[#entity \"sub-c\"]] :done? true}")
+
+;; The full 8-send HTTP round-trip plus the trailing (continue #cursor) = 9
+;; canned replies: hello, use-world, propose, assert, query (single page),
+;; propose(batch), assert, query (page 1 :done? false), continue (page 2 :done? true).
+(def main-handshake-edns
+  [welcome-edn world-edn proposed-edn asserted-edn result-edn
+   proposed-batch-edn asserted-edn page1-edn page2-edn])
+
+(defn main-handshake-responses
+  "The 9 canned HttpResponses for the full paged round-trip; the welcome carries
+  `session` so the named-endpoint URIs can be asserted."
+  [session]
+  (into [(fake-response welcome-edn session)]
+        (map fake-response (rest main-handshake-edns))))
 
 (deftest main-walks-full-roundtrip-to-result-without-throwing
-  (let [welcome (fake-response welcome-edn "sid-MAIN")
-        responses [welcome
-                   (fake-response world-edn)
-                   (fake-response proposed-edn)
-                   (fake-response asserted-edn)
-                   (fake-response result-edn)]
-        [reqs send] (capturing-send responses)
+  (let [[reqs send] (capturing-send (main-handshake-responses "sid-MAIN"))
         out (with-redefs [lc/http-send send]
               (with-out-str (lc/-main)))]
     (is (re-find #"hello -> :welcome" out) "prints the welcome line")
     (is (re-find #"query .* -> rows=" out)
         "reaches the final query/result line")
+    (is (re-find #"paged query .* 3 rows over 2 page\(s\)" out)
+        "drains the limit-2 query across two pages")
     (is (not (re-find #"refused" out)) "no step is reported as refused")
     ;; The welcome-header session must flow into every later endpoint URI.
     (let [uris (map #(str (.uri %)) @reqs)]
-      (is (= 5 (count uris)) "all five protocol steps were sent")
+      (is (= 9 (count uris))
+          "all eight round-trip steps plus the (continue #cursor) were sent")
       (is (= (str lc/default-base "/v1/messages") (first uris))
           "first call is the anonymous hello on /v1/messages")
       (is (every? #(re-find #"/v1/sessions/sid-MAIN/messages" %) (rest uris))
@@ -196,12 +214,7 @@
 (deftest main-threads-proposal-handle-from-propose-into-assert
   ;; Step 4 returns #proposal "p-1"; step 5 (assert) must carry that exact
   ;; tagged literal back as its verb argument.
-  (let [responses [(fake-response welcome-edn "sid-X")
-                   (fake-response world-edn)
-                   (fake-response proposed-edn)
-                   (fake-response asserted-edn)
-                   (fake-response result-edn)]
-        [reqs send] (capturing-send responses)]
+  (let [[reqs send] (capturing-send (main-handshake-responses "sid-X"))]
     (with-redefs [lc/http-send send]
       (with-out-str (lc/-main)))
     ;; The 4th request (index 3) is the assert. Its body should be
@@ -211,12 +224,7 @@
           "the #proposal from propose threads verbatim into the assert verb"))))
 
 (deftest main-sets-session-header-on-named-calls
-  (let [responses [(fake-response welcome-edn "sid-H")
-                   (fake-response world-edn)
-                   (fake-response proposed-edn)
-                   (fake-response asserted-edn)
-                   (fake-response result-edn)]
-        [reqs send] (capturing-send responses)]
+  (let [[reqs send] (capturing-send (main-handshake-responses "sid-H"))]
     (with-redefs [lc/http-send send]
       (with-out-str (lc/-main)))
     ;; The hello (req 0) carries no session header; the named calls all do.
@@ -224,7 +232,8 @@
                           (.firstValue "x-lemma-session") (.orElse nil)))]
       (is (nil? (hdr 0)) "hello is anonymous")
       (is (= "sid-H" (hdr 1)) "use-world rides the session")
-      (is (= "sid-H" (hdr 4)) "query rides the same session"))))
+      (is (= "sid-H" (hdr 4)) "query rides the same session")
+      (is (= "sid-H" (hdr 8)) "the (continue #cursor) page-2 call rides it too"))))
 
 (deftest main-stops-cleanly-on-error-envelope
   ;; A non-:welcome first reply must NOT throw; -main prints and stops.
@@ -235,6 +244,112 @@
     (is (re-find #"expected :welcome" out)
         "an error at hello is reported, not thrown")
     (is (= 1 (count @reqs)) "and the sequence stops after the failed hello")))
+
+;; ===========================================================================
+;; (B2) query-all — cursor pagination drained with an in-memory scripted `send`.
+;;
+;; query-all takes a `(fn [form] body)` closure and walks (continue #cursor …)
+;; until :done?. We drive it with a pure in-memory script — an atom of canned
+;; reply BODIES (parsed the same way post-edn parses the wire: {:default
+;; tagged-literal}, so #entity / #cursor survive as tagged literals) — recording
+;; every form sent. NO network, NO channel, fully deterministic.
+;; ===========================================================================
+
+(defn read-body
+  "Parse an EDN reply body string exactly as post-edn / run-uds do on the wire:
+  unknown tags (#entity, #cursor, …) fall through to tagged-literal."
+  [s]
+  (edn/read-string {:default tagged-literal} s))
+
+(defn scripted-send
+  "Return `[sent-atom send-fn]`. `send-fn` is a `(fn [form] body)` over an atom
+  of canned reply bodies: it records each form it is handed into `sent-atom`
+  (in order) and returns the next body from `bodies` (the last repeats if the
+  loop over-calls — though a correct drain never does). This is the exact shape
+  query-all expects, with zero I/O."
+  [bodies]
+  (let [sent      (atom [])
+        remaining (atom bodies)
+        send-fn   (fn [form]
+                    (swap! sent conj form)
+                    (let [[b & more] @remaining]
+                      (when (seq more) (reset! remaining more))
+                      b))]
+    [sent send-fn]))
+
+;; --- (A) multi-page: two pages drained to a flat, ordered row set ----------
+
+(deftest query-all-drains-two-pages-into-flat-ordered-rows
+  (let [bodies [(read-body "{:event :result :rows [[#entity \"a\"] [#entity \"b\"]] :done? false :cursor #cursor \"c-1\"}")
+                (read-body "{:event :result :rows [[#entity \"c\"]] :done? true}")]
+        [_ send] (scripted-send bodies)
+        {:keys [rows pages failure]} (lc/query-all send (list 'query {:limit 2}))]
+    (is (= [[(lc/ent "a")] [(lc/ent "b")] [(lc/ent "c")]] rows)
+        "all three rows are returned, page 1 then page 2, in order")
+    (is (= 2 pages) "two pages were drained")
+    (is (nil? failure) "a fully-drained query reports no failure")))
+
+(deftest query-all-second-form-is-continue-of-the-page1-cursor
+  (let [cursor (read-body "#cursor \"c-1\"")
+        bodies [(read-body "{:event :result :rows [[#entity \"a\"] [#entity \"b\"]] :done? false :cursor #cursor \"c-1\"}")
+                (read-body "{:event :result :rows [[#entity \"c\"]] :done? true}")]
+        [sent send] (scripted-send bodies)
+        query (list 'query {:limit 2})]
+    (lc/query-all send query)
+    (is (= query (first @sent)) "the first form sent is the original query")
+    (is (= (list 'continue cursor) (second @sent))
+        "the second form is (continue #cursor \"c-1\") — the page-1 cursor verbatim")
+    (is (= 2 (count @sent)) "exactly two forms are sent for a two-page drain")))
+
+;; --- (B) single page: :done? true on page 1, no #cursor present ------------
+
+(deftest query-all-single-page-done-true-needs-no-continue
+  (let [bodies [(read-body "{:event :result :rows [[#entity \"only\"]] :done? true}")]
+        [sent send] (scripted-send bodies)
+        {:keys [rows pages failure]} (lc/query-all send (list 'query {}))]
+    (is (= [[(lc/ent "only")]] rows) "the single page's one row is returned")
+    (is (= 1 pages) "exactly one page")
+    (is (nil? failure) "no failure")
+    (is (= 1 (count @sent))
+        "send is called once — no (continue …) when page 1 is already :done?")))
+
+(deftest query-all-single-page-tolerates-missing-cursor
+  ;; The server omits :cursor on an already-done result; query-all must not read
+  ;; it (it only touches the cursor inside the not-:done? branch). A :done? page
+  ;; with NO :cursor key must drain cleanly without throwing.
+  (let [bodies [(read-body "{:event :result :rows [[#entity \"x\"]] :done? true}")]
+        [_ send] (scripted-send bodies)
+        result (lc/query-all send (list 'query {}))]
+    (is (= 1 (:pages result))
+        "a done page without a #cursor key drains in one page, no NPE")))
+
+;; --- (C) failure propagation: mid-drain error and initial error ------------
+
+(deftest query-all-propagates-continue-failure-with-rows-so-far
+  ;; Page 1 is :done? false with a cursor; the (continue …) comes back an error
+  ;; (e.g. an expired cursor :unknown-handle). query-all must NOT throw: it
+  ;; returns the rows gathered so far plus the error body as :failure.
+  (let [err (read-body "{:event :error :reason :unknown-handle}")
+        bodies [(read-body "{:event :result :rows [[#entity \"a\"] [#entity \"b\"]] :done? false :cursor #cursor \"c-1\"}")
+                err]
+        [_ send] (scripted-send bodies)
+        {:keys [rows pages failure]} (lc/query-all send (list 'query {:limit 2}))]
+    (is (= [[(lc/ent "a")] [(lc/ent "b")]] rows)
+        "the rows gathered before the failure are still returned")
+    (is (= 1 pages) "only the first page was fully drained")
+    (is (= err failure)
+        "the refusal body is surfaced verbatim as :failure")))
+
+(deftest query-all-initial-failure-returns-empty-rows-zero-pages
+  ;; When the very first query reply is a refusal, there are no rows and no
+  ;; pages — :failure is that body and the loop never runs.
+  (let [err (read-body "{:event :error :reason :bad-args}")
+        [sent send] (scripted-send [err])
+        {:keys [rows pages failure]} (lc/query-all send (list 'query {:bad :form}))]
+    (is (= [] rows) "no rows when the opening query is refused")
+    (is (= 0 pages) "zero pages — the drain loop never entered")
+    (is (= err failure) "the opening refusal body is the :failure")
+    (is (= 1 (count @sent)) "and no (continue …) is attempted after it")))
 
 ;; ===========================================================================
 ;; (C) EDN sanity — tag rendering + round-trip
@@ -414,6 +529,11 @@
 (def uds-proposed-edn "{:event :proposed :proposal #proposal \"p-uds\"}")
 (def uds-asserted-edn "{:event :asserted}")
 (def uds-result-edn   "{:event :result :rows [[#entity \"venus\"]] :done? true}")
+;; Same cursor-pagination tail as the HTTP path: batched propose/assert, then a
+;; :limit-2 query drained over two pages via (continue #cursor "c-uds").
+(def uds-proposed-batch-edn "{:event :proposed :proposal #proposal \"p-uds-2\"}")
+(def uds-page1-edn "{:event :result :rows [[#entity \"sub-a\"] [#entity \"sub-b\"]] :done? false :cursor #cursor \"c-uds\"}")
+(def uds-page2-edn "{:event :result :rows [[#entity \"sub-c\"]] :done? true}")
 
 (defn with-uds-listener
   "Stand up a real UNIX ServerSocketChannel at a temp path and call `(f path)`.
@@ -464,15 +584,21 @@
                   (with-out-str (lc/run-uds path)))]
         {:out out :sent @sent}))))
 
+;; The full 8-frame UDS round-trip plus the trailing (continue #cursor) = 9
+;; canned replies, mirroring main-handshake-edns.
 (def uds-handshake-responses
-  [uds-welcome-edn uds-world-edn uds-proposed-edn uds-asserted-edn uds-result-edn])
+  [uds-welcome-edn uds-world-edn uds-proposed-edn uds-asserted-edn uds-result-edn
+   uds-proposed-batch-edn uds-asserted-edn uds-page1-edn uds-page2-edn])
 
 (deftest run-uds-walks-full-roundtrip-to-result-without-throwing
   (let [{:keys [out sent]} (run-uds-capturing uds-handshake-responses)]
     (is (re-find #"hello -> :welcome" out) "prints the welcome line")
     (is (re-find #"query .* -> rows=" out) "reaches the final query/result line")
+    (is (re-find #"paged query .* 3 rows over 2 page\(s\)" out)
+        "drains the limit-2 query across two pages")
     (is (not (re-find #"refused" out)) "no step is reported as refused")
-    (is (= 5 (count sent)) "all five protocol steps were framed out")))
+    (is (= 9 (count sent))
+        "all eight round-trip frames plus the (continue #cursor) were framed out")))
 
 (deftest run-uds-first-frame-is-the-anonymous-hello
   (let [{:keys [sent]} (run-uds-capturing uds-handshake-responses)]

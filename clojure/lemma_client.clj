@@ -159,6 +159,46 @@
        (#(if (seq %) % "(no detail provided)"))))
 
 ;; ---------------------------------------------------------------------------
+;; Cursor pagination:  drain a (query …) across (continue #cursor …) pages
+;;
+;; A query with :limit returns a full first page with :done? false plus a
+;; #cursor; (continue #cursor) carries the next :rows/:cursor/:done? until
+;; :done? is true (SPEC §8). `query-all` walks that chain to a flat row set.
+;; `send` is a `form -> body` closure (the per-transport adapter), so the same
+;; pagination loop serves both HTTP and UDS.
+;; ---------------------------------------------------------------------------
+
+(defn query-all
+  "Run `query-form` and drain every page via (continue #cursor …).
+
+  `send` is a `(fn [form] body)` closure — it sends one verb LIST and returns
+  the parsed reply body. Returns `{:rows <all-rows> :pages <n> :failure nil}`
+  on success, or `{:rows … :pages … :failure <body>}` if any page is refused
+  (the rows gathered so far are still returned).
+
+  A query with :limit yields a full first page with :done? false and a
+  `#cursor` tagged literal; the cursor is present ONLY while :done? is falsey
+  (the server omits it on an already-done result), so we read it only inside
+  the loop. An expired cursor (server idle TTL ~300s, SPEC §8) comes back as
+  :error :unknown-handle; this demo PROPAGATES that failure, whereas a real
+  client would re-issue the original query to start a fresh page."
+  [send query-form]
+  (let [body (send query-form)]
+    (if (failure? body)
+      {:rows [] :pages 0 :failure body}
+      (loop [rows  (vec (:rows body))
+             pages 1
+             body  body]
+        (if (:done? body)
+          {:rows rows :pages pages :failure nil}
+          (let [next-body (send (list 'continue (:cursor body)))]
+            (if (failure? next-body)
+              {:rows rows :pages pages :failure next-body}
+              (recur (into rows (:rows next-body))
+                     (inc pages)
+                     next-body))))))))
+
+;; ---------------------------------------------------------------------------
 ;; Runnable recipe:  the full Lemma round-trip
 ;;
 ;; A flat, linear retelling of the protocol's hello → use-world → propose →
@@ -234,9 +274,51 @@
                                                             :where [['equivalent (ent "morningstar") '?o]]}))]
                                 (if (failure? q)
                                   (println (str "query refused: " (describe-failure q)))
-                                  (println (str "query (equivalent morningstar ?o) -> rows="
-                                                (pr-str (:rows q))
-                                                "  done?=" (pr-str (:done? q)))))))))))))))))))
+                                  (do
+                                    (println (str "query (equivalent morningstar ?o) -> rows="
+                                                  (pr-str (:rows q))
+                                                  "  done?=" (pr-str (:done? q))))
+
+                                    ;; 7. Cursor pagination. Seed three
+                                    ;;    subset-of facts in one batched propose,
+                                    ;;    assert the batch, then drain a
+                                    ;;    :limit-2 query across pages. subset-of
+                                    ;;    is a pure-EDB (stored-fact) predicate
+                                    ;;    with stable (tx-id, ref-id) ordering, so
+                                    ;;    it paginates; a rule-headed predicate
+                                    ;;    like member-of cannot be the sole outer
+                                    ;;    :where pattern (the server refuses it
+                                    ;;    :bad-args :unsupported-rule-call-ordering).
+                                    (let [f1 (fct {:predicate 'subset-of :subject (ent "sub-a") :object (ent "group")})
+                                          f2 (fct {:predicate 'subset-of :subject (ent "sub-b") :object (ent "group")})
+                                          f3 (fct {:predicate 'subset-of :subject (ent "sub-c") :object (ent "group")})
+                                          {p3 :body} (named (list 'propose f1 f2 f3))]
+                                      (if (failure? p3)
+                                        (println (str "propose (3x subset-of) refused: " (describe-failure p3)))
+                                        (let [{a3 :body} (named (list 'assert (:proposal p3)))]
+                                          (if (failure? a3)
+                                            (println (str "assert (3x subset-of) refused: " (describe-failure a3)))
+                                            (do
+                                              (println (str "propose (3x subset-of ? group) -> "
+                                                            (pr-str (:event p3))
+                                                            "  proposal=" (pr-str (:proposal p3))))
+                                              (println (str "assert proposal -> " (pr-str (:event a3))))
+
+                                              ;; query-all wants a form -> body
+                                              ;; closure; named returns a map, so
+                                              ;; we adapt it by taking :body.
+                                              (let [send (fn [form] (:body (named form)))
+                                                    {:keys [rows pages failure]}
+                                                    (query-all send
+                                                               (list 'query
+                                                                     {:find  '[?x]
+                                                                      :where [['subset-of '?x (ent "group")]]
+                                                                      :limit 2}))]
+                                                (if failure
+                                                  (println (str "paged query refused: " (describe-failure failure)))
+                                                  (println (str "paged query (subset-of ? group), limit 2 -> "
+                                                                (count rows) " rows over " pages
+                                                                " page(s): " (pr-str rows))))))))))))))))))))))))))
     (catch clojure.lang.ExceptionInfo e
       (println (.getMessage e))
       (System/exit 1))))
@@ -392,9 +474,49 @@
                                                      :where [['equivalent (ent "morningstar") '?o]]}))]
                                   (if (failure? q)
                                     (println (str "query refused: " (describe-failure q)))
-                                    (println (str "query (equivalent morningstar ?o) -> rows="
-                                                  (pr-str (:rows q))
-                                                  "  done?=" (pr-str (:done? q)))))))))))))))))))
+                                    (do
+                                      (println (str "query (equivalent morningstar ?o) -> rows="
+                                                    (pr-str (:rows q))
+                                                    "  done?=" (pr-str (:done? q))))
+
+                                      ;; 6. Cursor pagination, exactly as the
+                                      ;;    HTTP path. Seed three subset-of facts
+                                      ;;    in one batched propose, assert the
+                                      ;;    batch, then drain a :limit-2 query
+                                      ;;    across pages. subset-of is a pure-EDB
+                                      ;;    predicate (stable tx-id/ref-id
+                                      ;;    ordering) so it paginates; member-of
+                                      ;;    is rule-headed and cannot be the sole
+                                      ;;    outer :where pattern (server refuses
+                                      ;;    :bad-args :unsupported-rule-call-ordering).
+                                      ;;    The UDS `call` closure is already
+                                      ;;    form -> body, so query-all takes it directly.
+                                      (let [f1 (fct {:predicate 'subset-of :subject (ent "sub-a") :object (ent "group")})
+                                            f2 (fct {:predicate 'subset-of :subject (ent "sub-b") :object (ent "group")})
+                                            f3 (fct {:predicate 'subset-of :subject (ent "sub-c") :object (ent "group")})
+                                            p3 (call (list 'propose f1 f2 f3))]
+                                        (if (failure? p3)
+                                          (println (str "propose (3x subset-of) refused: " (describe-failure p3)))
+                                          (let [a3 (call (list 'assert (:proposal p3)))]
+                                            (if (failure? a3)
+                                              (println (str "assert (3x subset-of) refused: " (describe-failure a3)))
+                                              (do
+                                                (println (str "propose (3x subset-of ? group) -> "
+                                                              (pr-str (:event p3))
+                                                              "  proposal=" (pr-str (:proposal p3))))
+                                                (println (str "assert proposal -> " (pr-str (:event a3))))
+
+                                                (let [{:keys [rows pages failure]}
+                                                      (query-all call
+                                                                 (list 'query
+                                                                       {:find  '[?x]
+                                                                        :where [['subset-of '?x (ent "group")]]
+                                                                        :limit 2}))]
+                                                  (if failure
+                                                    (println (str "paged query refused: " (describe-failure failure)))
+                                                    (println (str "paged query (subset-of ? group), limit 2 -> "
+                                                                  (count rows) " rows over " pages
+                                                                  " page(s): " (pr-str rows))))))))))))))))))))))))))
       (finally
         (.close ch)))))
 

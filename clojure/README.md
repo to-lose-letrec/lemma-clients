@@ -87,6 +87,12 @@ Loading the file performs no network I/O; only `-main` touches the network.
 4. `(assert <proposal>)` — assert the proposed fact into the world.
 5. `(query {:find [?o] :where [[equivalent #entity "morningstar" ?o]]})` — query
    it back and print `:rows` and `:done?`.
+6. `(propose #fact{...})` ×3, `(assert <proposal>)` — batch-propose three
+   `subset-of` facts (`sub-a`/`sub-b`/`sub-c` → `group`) in one `(propose f1 f2 f3)`
+   and assert the batch.
+7. `(query {... :limit 2})` — run a paginated query through `query-all`, which
+   drains every page via `(continue #cursor ...)` and prints the total row count
+   and page count. See [Pagination](#pagination).
 
 After every reply the code checks `:event`; an `:error` or `:rejected` envelope
 is printed via `describe-failure` and the sequence stops cleanly. A
@@ -102,10 +108,15 @@ use-world "default" -> :world-selected  world=#world "default"
 propose (equivalent morningstar venus) -> :proposed  proposal=#proposal "p-1"
 assert proposal -> :asserted
 query (equivalent morningstar ?o) -> rows=[["venus"]]  done?=true
+propose (3x subset-of ? group) -> :proposed  proposal=#proposal "p-2"
+assert proposal -> :asserted
+paged query (subset-of ? group), limit 2 -> 3 rows over 2 page(s): [["sub-a"] ["sub-b"] ["sub-c"]]
 ```
 
 The query binds `?o` to the matching entity's name, which Dianoia returns as a
-plain string — hence `rows=[["venus"]]`, not a tagged `#entity` literal.
+plain string — hence `rows=[["venus"]]`, not a tagged `#entity` literal. The
+paged row count reflects accumulated world state: each run asserts another batch,
+so a re-run against the same world reports more `subset-of` rows over more pages.
 
 `run-uds` runs the identical verb sequence and prints the same per-step lines;
 only the transport differs (see below).
@@ -171,6 +182,39 @@ their own `defn`s so tests can `with-redefs` them with a canned exchange and
 exercise `run-uds` without a live socket. Connecting to a missing socket throws
 an `ex-info` naming the path; the channel is always closed in a `finally`.
 
+## Pagination
+
+A `(query ...)` with `:limit N` returns a first page. If the page is full the
+reply carries `:done? false` and a `#cursor` handle; the client sends
+`(continue #cursor "...")` to fetch each next page until a reply has
+`:done? true`. A short result (fewer than `N` rows) or a query without `:limit`
+comes back with `:done? true` and no `#cursor`.
+
+`query-all` is the transport-agnostic helper that drains all pages:
+
+```clojure
+(query-all send query-form) ;=> {:rows <all-rows> :pages <n> :failure <body-or-nil>}
+```
+
+`send` is a `(fn [form] body)` closure that sends one verb LIST and returns the
+parsed reply body; `query-all` concatenates `:rows` across pages and returns a
+map of `:rows`, `:pages`, and `:failure` — `nil` on success, or the offending
+error/rejection envelope (the rows gathered so far are still returned). Each
+transport adapts its own call into the closure: HTTP's `named` returns a `:body`
+map, so `run-http` passes `(fn [form] (:body (named form)))`; the UDS `call` is
+already `form -> body`, so `run-uds` passes it directly.
+
+A `#cursor` is a server-side bookmark with a ~300-second idle TTL. An expired
+cursor returns `:error :unknown-handle`; a real client re-issues the original
+query to start a fresh page, but this demo propagates the failure through
+`query-all`'s `:failure`.
+
+Pagination needs a **stably ordered** result, which requires a pure-EDB
+(stored-fact) predicate with stable `(tx-id, ref-id)` ordering at the outer
+`:where` level. The demo paginates over `subset-of` for that reason; a
+rule-headed predicate such as `member-of` as the sole `:where` pattern is
+rejected `:bad-args :unsupported-rule-call-ordering`.
+
 ## Tests
 
 `lemma_client_test.clj` is a `clojure.test` suite. It rebinds the single I/O
@@ -188,18 +232,19 @@ use `-M:test` if the git dep cannot resolve offline.
 
 ## Scope
 
-This is a hello-world starter that speaks both the HTTP and Unix-domain-socket
-transports. Richer features — cursor pagination, capabilities/limits
-negotiation, and watch/SSE streaming — are demonstrated in
-[`../python`](../python) and [`../typescript`](../typescript) and may be ported
-here later.
+This starter speaks both the HTTP and Unix-domain-socket transports and
+demonstrates cursor pagination (see [Pagination](#pagination)). The remaining
+features — capabilities/limits negotiation and watch/SSE streaming — are
+demonstrated in [`../python`](../python) and [`../typescript`](../typescript)
+and may be ported here later.
 
 ## References
 
 - `lemma_client.clj` — the tag constructors (`ent`, `wrld`, `fct`), the HTTP
   transport (`http-send`, `post-edn`), the UDS transport (`uds-send-frame`,
   `uds-recv-frame`), the envelope predicates (`failure?`, `describe-failure`),
-  and the runnable `run-http` / `run-uds` round-trips dispatched by `-main`.
+  the pagination helper (`query-all`), and the runnable `run-http` / `run-uds`
+  round-trips dispatched by `-main`.
 - `deps.edn` — the zero-dependency classpath and the `:test` alias.
 - `../README.md` — project framing: these are from-scratch single-file recipes,
   not libraries.
