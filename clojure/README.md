@@ -1,18 +1,20 @@
 # Clojure Lemma Client
 
 A single-file Clojure client that demonstrates the Lemma wire protocol against a
-local [Dianoia](https://github.com/to-lose-letrec/lemma) server over HTTP.
+local [Dianoia](https://github.com/to-lose-letrec/lemma) server over **both**
+transports Dianoia exposes: HTTP (the default) and a Unix domain socket.
 Clojure is the protocol's **native** language: Lemma speaks EDN (Clojure's own
-data syntax), so there is **zero** to install. `clojure.edn` is the codec and
-`java.net.http` (JDK 11+) is the transport — both built in. `deps.edn` carries
-no client dependencies. This is the smallest of the demos. Read
-`lemma_client.clj` end to end; it is a recipe, not a library.
+data syntax), so there is **zero** to install. `clojure.edn` is the codec;
+`java.net.http` (JDK 11+) is the HTTP transport and a `java.nio` `SocketChannel`
+is the UDS transport — both built in. `deps.edn` carries no client dependencies.
+This is the smallest of the demos. Read `lemma_client.clj` end to end; it is a
+recipe, not a library.
 
 ## Prerequisites
 
 - The Clojure CLI (`clojure` / `clj`) and a JDK. The client needs JDK 11+ for
   `java.net.http`; the system Java is fine. Only Dianoia itself needs JDK 21.
-- A running Dianoia server reachable over HTTP.
+- A running Dianoia server reachable over HTTP or its Unix domain socket.
 
 ## Boot a local Dianoia
 
@@ -52,6 +54,24 @@ URL argument to override it:
 clojure -M -m lemma-client http://host:port
 ```
 
+## Run (UDS)
+
+```sh
+clojure -M -m lemma-client uds
+```
+
+A leading `uds` argument selects the Unix-domain-socket transport and connects
+to `/tmp/dianoia.sock` (`default-socket`). Pass a path after `uds` to override
+the socket:
+
+```sh
+clojure -M -m lemma-client uds /path/to/dianoia.sock
+```
+
+`-main` routes `argv` to a transport: a leading `uds` runs `run-uds` (against
+`default-socket`, or the path given after `uds`); a base URL runs `run-http`
+against it; no argument runs `run-http` against `default-base`.
+
 Loading the file performs no network I/O; only `-main` touches the network.
 
 ## What it does
@@ -87,6 +107,9 @@ query (equivalent morningstar ?o) -> rows=[["venus"]]  done?=true
 The query binds `?o` to the matching entity's name, which Dianoia returns as a
 plain string — hence `rows=[["venus"]]`, not a tagged `#entity` literal.
 
+`run-uds` runs the identical verb sequence and prints the same per-step lines;
+only the transport differs (see below).
+
 ## How it maps to the wire
 
 EDN bodies are produced and consumed with `clojure.edn` and `pr-str`, no
@@ -116,6 +139,38 @@ are vectors. Tagged literals are built with `clojure.core/tagged-literal` via
 the thin constructors `ent` (`#entity`), `wrld` (`#world`), and `fct`
 (`#fact`).
 
+## How UDS maps to the wire
+
+UDS carries the same EDN over a single persistent `java.nio` `SocketChannel`
+(opened with `StandardProtocolFamily/UNIX`), with explicit framing instead of an
+HTTP envelope: a **4-byte big-endian length** prefix followed by that many
+**UTF-8 bytes** of EDN. `uds-send-frame` writes the frame — a `ByteBuffer`
+`.putInt` of the body length, then the body bytes, each buffer looped on
+`.hasRemaining` to drain partial writes. `uds-recv-frame` reads exactly 4 bytes
+for the length, then exactly that many body bytes, then decodes UTF-8; a partial
+`.read` is looped and an early EOF surfaces as an `ex-info` rather than a short
+read.
+
+The session handling is the key contrast with HTTP. Over UDS the **session is
+bound to the connection**: the server captures the id from the `:welcome`
+envelope and pins it to the socket, so the client sends no `X-Lemma-Session`
+header and never echoes a session id back — it just keeps sending frames on the
+same open channel. (Over HTTP the id is threaded explicitly through the
+`x-lemma-session` header and the named `/v1/sessions/{id}/messages` endpoint.)
+
+| Concern | Implementation |
+|---|---|
+| Body format | EDN text via `pr-str` (out) and `(edn/read-string {:default tagged-literal} ...)` (in) |
+| Framing | 4-byte big-endian length prefix, then the body bytes |
+| Connection | One persistent `java.nio` `SocketChannel` (`StandardProtocolFamily/UNIX`) for every frame |
+| Anonymous call | `(hello)` as the first frame |
+| Session id | Bound to the connection by the server; never echoed by the client |
+
+`uds-send-frame` / `uds-recv-frame` are the channel I/O seam, pulled out as
+their own `defn`s so tests can `with-redefs` them with a canned exchange and
+exercise `run-uds` without a live socket. Connecting to a missing socket throws
+an `ex-info` naming the path; the channel is always closed in a `finally`.
+
 ## Tests
 
 `lemma_client_test.clj` is a `clojure.test` suite. It rebinds the single I/O
@@ -133,16 +188,18 @@ use `-M:test` if the git dep cannot resolve offline.
 
 ## Scope
 
-This is a hello-world starter. Richer features — the Unix-domain-socket
-transport, cursor pagination, capabilities/limits negotiation, and watch/SSE
-streaming — are demonstrated in [`../python`](../python) and
-[`../typescript`](../typescript) and may be ported here later.
+This is a hello-world starter that speaks both the HTTP and Unix-domain-socket
+transports. Richer features — cursor pagination, capabilities/limits
+negotiation, and watch/SSE streaming — are demonstrated in
+[`../python`](../python) and [`../typescript`](../typescript) and may be ported
+here later.
 
 ## References
 
 - `lemma_client.clj` — the tag constructors (`ent`, `wrld`, `fct`), the HTTP
-  transport (`http-send`, `post-edn`), the envelope predicates (`failure?`,
-  `describe-failure`), and the runnable `-main` round-trip.
+  transport (`http-send`, `post-edn`), the UDS transport (`uds-send-frame`,
+  `uds-recv-frame`), the envelope predicates (`failure?`, `describe-failure`),
+  and the runnable `run-http` / `run-uds` round-trips dispatched by `-main`.
 - `deps.edn` — the zero-dependency classpath and the `:test` alias.
 - `../README.md` — project framing: these are from-scratch single-file recipes,
   not libraries.

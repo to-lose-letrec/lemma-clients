@@ -47,15 +47,25 @@
 (ns lemma-client
   (:require [clojure.edn :as edn]
             [clojure.string :as str])
-  (:import (java.net URI)
+  (:import (java.net URI
+                     UnixDomainSocketAddress
+                     StandardProtocolFamily)
            (java.net.http HttpClient
                           HttpRequest
                           HttpResponse$BodyHandlers
-                          HttpRequest$BodyPublishers)))
+                          HttpRequest$BodyPublishers)
+           (java.nio ByteBuffer)
+           (java.nio.channels SocketChannel)
+           (java.nio.charset StandardCharsets)))
 
 ;; Where a locally booted Dianoia HTTP listener lives by default (SPEC examples).
 ;; Override by passing a base URL as the first CLI argument.
 (def default-base "http://127.0.0.1:8080")
+
+;; Where a locally booted Dianoia UDS listener binds by default (see Dianoia's
+;; transport/uds.clj `start!` :socket-path). Override by passing a path after
+;; the `uds` CLI argument.
+(def default-socket "/tmp/dianoia.sock")
 
 ;; One shared client for the whole session. Building it is pure (no connection
 ;; is opened until the first send), so it is safe at load time.
@@ -158,16 +168,16 @@
 ;; sequence stops cleanly rather than crashing.
 ;; ---------------------------------------------------------------------------
 
-(defn -main
-  "Walk the propose/assert/query round-trip against a Lemma server. The HTTP
-  base is the first CLI arg, defaulting to `default-base`."
-  [& args]
-  (let [base (or (first args) default-base)]
-   ;; A connection-level failure (server down/refused) is the one thing the
-   ;; round-trip cannot recover from: post-edn re-throws it as an ex-info
-   ;; naming the base. Catch it here so the demo prints that actionable line
-   ;; and exits nonzero, rather than dumping a raw Java stack trace.
-   (try
+(defn run-http
+  "Walk the propose/assert/query round-trip against a Lemma server over HTTP.
+  `base` is the server's base URL (e.g. `http://127.0.0.1:8080`).
+
+  A connection-level failure (server down/refused) is the one thing the
+  round-trip cannot recover from: post-edn re-throws it as an ex-info naming
+  the base. We catch it here so the demo prints that actionable line and exits
+  nonzero, rather than dumping a raw Java stack trace."
+  [base]
+  (try
     ;; 1. Anonymous hello. The welcome reply carries the new session id in the
     ;;    X-Lemma-Session response header, which post-edn surfaces for us.
     (let [{welcome :body sid :session} (post-edn "/v1/messages" (list 'hello) :base base)]
@@ -229,4 +239,184 @@
                                                 "  done?=" (pr-str (:done? q)))))))))))))))))))
     (catch clojure.lang.ExceptionInfo e
       (println (.getMessage e))
-      (System/exit 1)))))
+      (System/exit 1))))
+
+;; ---------------------------------------------------------------------------
+;; UDS transport:  EDN form  ->  length-prefixed frame  ->  parsed EDN response
+;;
+;; A second transport that speaks the same EDN codec over a Unix domain socket
+;; instead of HTTP. Same "encode, send, decode" shape as `post-edn`, different
+;; plumbing. Two things differ from the HTTP path:
+;;
+;;   * Framing. There is no HTTP envelope, so each message is delimited
+;;     explicitly: a 4-byte BIG-ENDIAN length prefix followed by exactly that
+;;     many UTF-8 bytes of EDN. This matches Dianoia's transport/uds.clj
+;;     `write-frame` / `read-frame` exactly — a `DataOutputStream.writeInt` is a
+;;     4-byte big-endian int, and `ByteBuffer.putInt` / `.getInt` default to
+;;     big-endian, so the two agree on the wire without a byte-order dance.
+;;   * Session binding. Over HTTP the client threads the session id back into
+;;     each request header. Over UDS the server binds the session to the
+;;     *connection* — it captures the id from the welcome envelope and pins it
+;;     to the socket (see uds.clj handle-frame / build-ctx). So the client must
+;;     NOT echo the session id into later frames; it just keeps sending on the
+;;     same open channel and the server already knows who it is.
+;;
+;; `uds-send-frame` / `uds-recv-frame` are the channel I/O seam — pulled out as
+;; their own `defn`s so tests can `with-redefs` them with a canned exchange and
+;; exercise `run-uds` without a live socket. The channel is blocking, which
+;; makes "read exactly N bytes" a straightforward loop on `.read`.
+;; ---------------------------------------------------------------------------
+
+(defn uds-send-frame
+  "Frame `s` and write it to channel `ch`: a 4-byte big-endian length prefix,
+  then the UTF-8 body bytes. A `SocketChannel` write may be partial, so we loop
+  on each buffer until it is fully drained (`.hasRemaining`). Mirrors uds.clj
+  `write-frame`."
+  [^SocketChannel ch ^String s]
+  (let [body (.getBytes s StandardCharsets/UTF_8)
+        len  (doto (ByteBuffer/allocate 4)
+               (.putInt (alength body))
+               (.flip))
+        buf  (ByteBuffer/wrap body)]
+    (while (.hasRemaining len)
+      (.write ch len))
+    (while (.hasRemaining buf)
+      (.write ch buf))))
+
+(defn uds-recv-frame
+  "Read one length-prefixed frame from channel `ch` and return its body as a
+  String. Reads exactly 4 bytes for the big-endian length N, then exactly N
+  body bytes, decoding UTF-8. `.read` may return fewer bytes than requested, so
+  each phase loops until its buffer is full; a `-1` (EOF) before a buffer fills
+  is a truncated frame, which we surface as an ex-info rather than a short read.
+  Mirrors uds.clj `read-frame`."
+  ^String [^SocketChannel ch]
+  (let [read-fully (fn [^ByteBuffer buf]
+                     (while (.hasRemaining buf)
+                       (when (neg? (.read ch buf))
+                         (throw (ex-info (str "connection closed with "
+                                              (.remaining buf)
+                                              " of " (.capacity buf)
+                                              " bytes still expected")
+                                         {:reason :eof}))))
+                     buf)
+        len-buf (.flip ^ByteBuffer (read-fully (ByteBuffer/allocate 4)))
+        n       (.getInt len-buf)
+        body    (byte-array n)]
+    (read-fully (ByteBuffer/wrap body))
+    (String. body StandardCharsets/UTF_8)))
+
+(defn run-uds
+  "Run the same propose/assert/query round-trip over a Unix domain socket.
+
+  Step for step this is `run-http` — hello, enter a world, propose a fact,
+  assert it, query it back — but spoken over a UDS frame stream. The one
+  protocol difference is session handling: the server binds the session to the
+  connection from the welcome envelope (uds.clj handle-frame), so we do NOT
+  thread the session id into later frames. Every call after hello simply rides
+  the same open channel.
+
+  Connecting to a missing socket (or one with no listener) throws an ex-info
+  naming the path, so the failure is actionable rather than a bare Java
+  exception. After each response we check `:event`; an `:error` / `:rejected`
+  envelope is printed and the sequence stops cleanly. The channel is always
+  closed in a `finally`."
+  [socket-path]
+  (let [ch (SocketChannel/open StandardProtocolFamily/UNIX)]
+    (try
+      (try
+        (.connect ch (UnixDomainSocketAddress/of ^String socket-path))
+        (catch java.io.IOException e
+          ;; No listener at the path: the socket file is missing, or nothing is
+          ;; accepting on it. Name the path so the failure points at what to fix.
+          (let [cause (or (not-empty (.getMessage e))
+                          (.. e getClass getSimpleName))]
+            (throw (ex-info (str "could not connect to the Lemma UDS server at "
+                                 socket-path " (" cause "); is the server running?")
+                            {:socket-path socket-path} e)))))
+
+      ;; One round-trip: frame out, frame in, decode. The session lives on the
+      ;; connection — no id is echoed back, unlike the HTTP transport.
+      (let [call (fn [form]
+                   (uds-send-frame ch (pr-str form))
+                   (edn/read-string {:default tagged-literal} (uds-recv-frame ch)))]
+
+        ;; 1. Anonymous hello. The welcome reply carries the session id, which
+        ;;    the server has already pinned to this connection for us.
+        (let [welcome (call (list 'hello))]
+          (if (not= :welcome (:event welcome))
+            (println (str "hello: expected :welcome, got " (pr-str (:event welcome))
+                          " -- " (describe-failure welcome)))
+            (do
+              (println (str "hello -> :welcome  version=" (pr-str (:version welcome))
+                            "  session=" (pr-str (:session welcome))
+                            "  world=" (pr-str (:world welcome))))
+
+              ;; 2. Enter the world. (use-world #world "default")
+              (let [world (call (list 'use-world (wrld "default")))]
+                (if (failure? world)
+                  (println (str "use-world refused: " (describe-failure world)))
+
+                  (do
+                    (println (str "use-world \"default\" -> " (pr-str (:event world))
+                                  "  world=" (pr-str (:world world))))
+
+                    ;; 3. Propose a fact: morningstar is equivalent to venus. The
+                    ;;    reply hands back a #proposal handle we feed to the assert.
+                    (let [f (fct {:predicate 'equivalent
+                                  :subject   (ent "morningstar")
+                                  :object    (ent "venus")})
+                          p (call (list 'propose f))]
+                      (if (failure? p)
+                        (println (str "propose refused: " (describe-failure p)))
+
+                        (do
+                          (println (str "propose (equivalent morningstar venus) -> "
+                                        (pr-str (:event p))
+                                        "  proposal=" (pr-str (:proposal p))))
+
+                          ;; 4. Assert the proposed fact into the world.
+                          (let [a (call (list 'assert (:proposal p)))]
+                            (if (failure? a)
+                              (println (str "assert refused: " (describe-failure a)))
+
+                              (do
+                                (println (str "assert proposal -> " (pr-str (:event a))))
+
+                                ;; 5. Query it back. As in the HTTP path, :find /
+                                ;;    :where are VECTORS and the where-clause is a
+                                ;;    vector of vectors; only the verb head is a
+                                ;;    list, and ?o stays a quoted symbol.
+                                (let [q (call (list 'query
+                                                    {:find  '[?o]
+                                                     :where [['equivalent (ent "morningstar") '?o]]}))]
+                                  (if (failure? q)
+                                    (println (str "query refused: " (describe-failure q)))
+                                    (println (str "query (equivalent morningstar ?o) -> rows="
+                                                  (pr-str (:rows q))
+                                                  "  done?=" (pr-str (:done? q)))))))))))))))))))
+      (finally
+        (.close ch)))))
+
+;; ---------------------------------------------------------------------------
+;; Dispatcher
+;;
+;; `-main` routes the CLI argv to a transport. `uds [path]` runs the UDS
+;; round-trip (defaulting to `default-socket`); a bare URL runs the HTTP
+;; round-trip against it; no args runs HTTP against `default-base`. A
+;; connection-level failure on the UDS path is re-thrown by `run-uds` as an
+;; ex-info naming the socket — we catch it here, print the actionable line, and
+;; exit nonzero (the HTTP path catches its own equivalent inside `run-http`).
+;; ---------------------------------------------------------------------------
+
+(defn -main
+  "Route the CLI argv to a transport: `uds [path]` -> UDS round-trip;
+  a base URL -> HTTP round-trip; no args -> HTTP against `default-base`."
+  [& args]
+  (if (= "uds" (first args))
+    (try
+      (run-uds (or (second args) default-socket))
+      (catch clojure.lang.ExceptionInfo e
+        (println (.getMessage e))
+        (System/exit 1)))
+    (run-http (or (first args) default-base))))
