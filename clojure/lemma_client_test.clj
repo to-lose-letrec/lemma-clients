@@ -165,7 +165,7 @@
 ;; (B) handshake — the full -main round-trip over canned responses
 ;; ===========================================================================
 
-(def welcome-edn "{:event :welcome :version \"1.0\" :world #world \"default\"}")
+(def welcome-edn "{:event :welcome :version \"1.0\" :world #world \"default\" :capabilities #{:lemma/v1 :lemma/cursor-pagination :lemma/watch} :limits {:max-message-bytes 1048576}}")
 (def world-edn   "{:event :world-selected :world #world \"default\"}")
 (def proposed-edn "{:event :proposed :proposal #proposal \"p-1\"}")
 (def asserted-edn "{:event :asserted}")
@@ -524,7 +524,7 @@
 ;; lifecycle (including the `finally` .close) runs for real.
 ;; ===========================================================================
 
-(def uds-welcome-edn  "{:event :welcome :version \"1.0\" :session #session \"sess-uds\" :world #world \"default\"}")
+(def uds-welcome-edn  "{:event :welcome :version \"1.0\" :session #session \"sess-uds\" :world #world \"default\" :capabilities #{:lemma/v1 :lemma/cursor-pagination :lemma/watch} :limits {:max-message-bytes 1048576}}")
 (def uds-world-edn    "{:event :world-selected :world #world \"default\"}")
 (def uds-proposed-edn "{:event :proposed :proposal #proposal \"p-uds\"}")
 (def uds-asserted-edn "{:event :asserted}")
@@ -686,3 +686,148 @@
       (lc/-main))
     (is (= [:http lc/default-base] @got)
         "no args runs the HTTP round-trip against default-base")))
+
+;; ===========================================================================
+;; (G) read-welcome — parse the :welcome surface into a queryable ServerInfo.
+;;
+;; The welcome (SPEC §10) advertises :capabilities (a set), :limits (a map),
+;; and the :verbs / :predicates surfaces (each {:core #{…} :extensions {pack
+;; #{…}}}). read-welcome flattens those surfaces and exposes the rest as plain
+;; data so supports? / max-message-bytes can interrogate it. Every section is
+;; optional: a minimal welcome must yield empty defaults, never an error.
+;; ===========================================================================
+
+(def realistic-welcome-edn
+  (str "{:event :welcome :version 1 :session #session \"s-1\" :world nil"
+       " :capabilities #{:lemma/v1 :lemma/cursor-pagination :lemma/watch}"
+       " :limits {:max-message-bytes 1048576}"
+       " :predicates {:core #{equivalent subset-of} :extensions {}}"
+       " :verbs {:core #{hello query continue} :extensions {}}}"))
+
+(deftest read-welcome-advertised-capability-is-supported
+  (let [info (lc/read-welcome (read-body realistic-welcome-edn))]
+    (is (true? (lc/supports? info :lemma/cursor-pagination))
+        "a capability the welcome lists is reported supported")))
+
+(deftest read-welcome-unadvertised-capability-is-not-supported
+  (let [info (lc/read-welcome (read-body realistic-welcome-edn))]
+    (is (false? (lc/supports? info :lemma/nope))
+        "a capability the welcome omits is reported unsupported")))
+
+(deftest read-welcome-exposes-max-message-bytes-limit
+  (let [info (lc/read-welcome (read-body realistic-welcome-edn))]
+    (is (= 1048576 (lc/max-message-bytes info))
+        "the :max-message-bytes limit is read straight off :limits")))
+
+(deftest read-welcome-flattens-verb-and-predicate-core-members
+  (let [info (lc/read-welcome (read-body realistic-welcome-edn))]
+    (is (every? (:verbs info) '[hello query continue])
+        "the core verbs appear in the flattened :verbs set")
+    (is (every? (:predicates info) '[equivalent subset-of])
+        "the core predicates appear in the flattened :predicates set")))
+
+(deftest read-welcome-without-limits-yields-nil-max-message-bytes
+  ;; A welcome that omits :limits entirely must not throw — max-message-bytes
+  ;; returns nil ("unadvertised"), which within-message-limit? treats as
+  ;; unlimited.
+  (let [info (lc/read-welcome
+              (read-body "{:event :welcome :version 1 :capabilities #{:lemma/v1}}"))]
+    (is (nil? (lc/max-message-bytes info))
+        "no :limits section => max-message-bytes is nil, no exception")))
+
+(deftest read-welcome-flattens-extension-pack-members-into-verbs
+  ;; An :extensions {pack #{foo}} surface must be unioned into the flat verb
+  ;; set alongside :core, so a client asking "every verb this server knows"
+  ;; sees the pack's verbs too.
+  (let [info (lc/read-welcome
+              (read-body (str "{:event :welcome"
+                              " :verbs {:core #{hello} :extensions {pack #{foo}}}}")))]
+    (is (contains? (:verbs info) 'foo)
+        "an extension-pack verb is flattened into :verbs")
+    (is (contains? (:verbs info) 'hello)
+        "and the :core verbs remain alongside the extension members")))
+
+;; ===========================================================================
+;; (H) within-message-limit? — the outbound byte-cap guard.
+;;
+;; Measured in UTF-8 bytes against the welcome's :max-message-bytes (SPEC §10).
+;; A small message passes a generous cap; an oversize one fails a tiny cap; an
+;; unadvertised limit (nil) means unlimited so everything passes.
+;; ===========================================================================
+
+(defn info-with-limit
+  "A ServerInfo whose :max-message-bytes is `n` (nil => no limit advertised)."
+  [n]
+  (lc/read-welcome {:limits (when n {:max-message-bytes n})}))
+
+(deftest within-message-limit-small-message-passes-generous-cap
+  (let [info (info-with-limit 1048576)]
+    (is (true? (lc/within-message-limit? info "(hello)"))
+        "a tiny message fits comfortably under a 1 MB cap")))
+
+(deftest within-message-limit-oversize-message-fails-tiny-cap
+  (let [info (info-with-limit 4)]
+    (is (false? (lc/within-message-limit? info "(hello)"))
+        "a 7-byte message exceeds a 4-byte cap and is rejected")))
+
+(deftest within-message-limit-nil-limit-means-unlimited
+  ;; A welcome with no :limits => max-message-bytes nil => every message passes,
+  ;; however large.
+  (let [info (info-with-limit nil)]
+    (is (nil? (lc/max-message-bytes info)) "no limit is advertised")
+    (is (true? (lc/within-message-limit? info (apply str (repeat 10000 "x"))))
+        "with no advertised cap even a large message passes")))
+
+;; ===========================================================================
+;; (I) capability gating — when the welcome OMITS :lemma/cursor-pagination, the
+;; paged-query block is skipped on BOTH transports. We drive the real round-trips
+;; (run-http via the http-send seam, run-uds via the frame seams) with a
+;; welcome whose :capabilities lacks cursor-pagination and assert: the skip note
+;; is printed, no (continue …) / batched propose is sent, and the run is SHORTER
+;; than the full paged run (5 sends vs. 9).
+;; ===========================================================================
+
+(def no-pagination-welcome-edn
+  "{:event :welcome :version \"1.0\" :world #world \"default\" :capabilities #{:lemma/v1 :lemma/watch} :limits {:max-message-bytes 1048576}}")
+
+(def uds-no-pagination-welcome-edn
+  "{:event :welcome :version \"1.0\" :session #session \"sess-uds\" :world #world \"default\" :capabilities #{:lemma/v1 :lemma/watch} :limits {:max-message-bytes 1048576}}")
+
+;; The un-paginated round-trip stops after the single-page query: hello,
+;; use-world, propose, assert, query => 5 sends, then the skip note.
+(def http-unpaged-responses
+  [no-pagination-welcome-edn world-edn proposed-edn asserted-edn result-edn])
+
+(def uds-unpaged-responses
+  [uds-no-pagination-welcome-edn uds-world-edn uds-proposed-edn uds-asserted-edn uds-result-edn])
+
+(deftest run-http-skips-paged-query-when-cursor-pagination-not-advertised
+  (let [[reqs send] (capturing-send
+                     (into [(fake-response no-pagination-welcome-edn "sid-NOPAGE")]
+                           (map fake-response (rest http-unpaged-responses))))
+        out (with-redefs [lc/http-send send]
+              (with-out-str (lc/-main)))]
+    (is (re-find #"does not advertise cursor pagination; skipping" out)
+        "the skip note is printed when the server omits the capability")
+    (is (not (re-find #"rows over .* page\(s\)" out))
+        "no paged-query result line is reached")
+    (is (= 5 (count @reqs))
+        "exactly the 5 pre-pagination sends fire — fewer than the full 9-send run")
+    (let [bodies (map #(publisher->string (.get (.bodyPublisher %))) @reqs)]
+      (is (not-any? #(re-find #"continue" %) bodies)
+          "no (continue #cursor …) frame is sent")
+      (is (not-any? #(re-find #"subset-of" %) bodies)
+          "and the batched subset-of propose is never sent"))))
+
+(deftest run-uds-skips-paged-query-when-cursor-pagination-not-advertised
+  (let [{:keys [out sent]} (run-uds-capturing uds-unpaged-responses)]
+    (is (re-find #"does not advertise cursor pagination; skipping" out)
+        "the skip note is printed when the server omits the capability")
+    (is (not (re-find #"rows over .* page\(s\)" out))
+        "no paged-query result line is reached")
+    (is (= 5 (count sent))
+        "exactly the 5 pre-pagination frames fire — fewer than the full 9-frame run")
+    (is (not-any? #(re-find #"continue" %) sent)
+        "no (continue #cursor …) frame is sent")
+    (is (not-any? #(re-find #"subset-of" %) sent)
+        "and the batched subset-of propose is never framed out")))

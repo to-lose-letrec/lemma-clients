@@ -80,7 +80,9 @@ Loading the file performs no network I/O; only `-main` touches the network.
 
 1. `(hello)` — anonymous `POST /v1/messages`. The `:welcome` reply carries the
    new session id in the `X-Lemma-Session` response header, which `post-edn`
-   surfaces.
+   surfaces. `read-welcome` parses the reply into a ServerInfo map, and a
+   `server: caps=… max-message-bytes=…` summary line is printed (see
+   [Capabilities and limits](#capabilities-and-limits)).
 2. `(use-world #world "default")` — enter the world on the session.
 3. `(propose #fact{...})` — propose `equivalent morningstar venus`. The reply
    returns a `#proposal` handle in `:proposal`.
@@ -89,10 +91,16 @@ Loading the file performs no network I/O; only `-main` touches the network.
    it back and print `:rows` and `:done?`.
 6. `(propose #fact{...})` ×3, `(assert <proposal>)` — batch-propose three
    `subset-of` facts (`sub-a`/`sub-b`/`sub-c` → `group`) in one `(propose f1 f2 f3)`
-   and assert the batch.
+   and assert the batch. Gated on `(supports? info :lemma/cursor-pagination)`;
+   before sending, the batch is checked against `:max-message-bytes` with
+   `within-message-limit?`.
 7. `(query {... :limit 2})` — run a paginated query through `query-all`, which
    drains every page via `(continue #cursor ...)` and prints the total row count
    and page count. See [Pagination](#pagination).
+
+Steps 6–7 run only when the server advertises `:lemma/cursor-pagination`;
+otherwise the client prints `server does not advertise cursor pagination;
+skipping paged query`.
 
 After every reply the code checks `:event`; an `:error` or `:rejected` envelope
 is printed via `describe-failure` and the sequence stops cleanly. A
@@ -104,6 +112,7 @@ Expected output (the session and proposal ids increment per run):
 
 ```text
 hello -> :welcome  version=1  session=s-1  world=nil
+server: caps={lemma/cursor-pagination, lemma/watch} max-message-bytes=1048576
 use-world "default" -> :world-selected  world=#world "default"
 propose (equivalent morningstar venus) -> :proposed  proposal=#proposal "p-1"
 assert proposal -> :asserted
@@ -182,6 +191,43 @@ their own `defn`s so tests can `with-redefs` them with a canned exchange and
 exercise `run-uds` without a live socket. Connecting to a missing socket throws
 an `ex-info` naming the path; the channel is always closed in a `finally`.
 
+## Capabilities and limits
+
+The `:welcome` envelope advertises what the server can do: a `:capabilities`
+set of namespaced flag keywords (e.g. `:lemma/cursor-pagination`,
+`:lemma/watch`), a `:limits` map of resource caps (e.g. `:max-message-bytes`),
+and `:verbs` / `:predicates` each shaped as `{:core #{...} :extensions {pack
+#{...}}}`.
+
+`read-welcome` parses that surface into a ServerInfo map. Because Lemma speaks
+EDN — Clojure's own data syntax — there is no codec to cross, so ServerInfo is
+just a plain map, not a new abstraction:
+
+| Key / fn | Meaning |
+|---|---|
+| `:capabilities` | a set of capability keywords (`:lemma/...`) |
+| `:limits` | a map of `:limit-keyword` → cap value |
+| `:verbs`, `:predicates` | flat sets of symbols with `:core` and all `:extensions` merged |
+| `(supports? info cap)` | `true` iff the `cap` keyword is advertised |
+| `(max-message-bytes info)` | the `:max-message-bytes` limit, or `nil` if unadvertised |
+
+Every section is optional; an omitted one yields an empty default (empty set /
+empty map) rather than an error. The client reads the welcome once and tailors
+itself to it:
+
+- It prints the `server: caps=… max-message-bytes=…` summary line after the
+  hello line.
+- It gates the paginated-query demo on `(supports? info
+  :lemma/cursor-pagination)`, skipping the block with `server does not advertise
+  cursor pagination; skipping paged query` when the server does not advertise
+  it.
+- Before sending the batch-propose it checks the message against
+  `:max-message-bytes` with `(within-message-limit? info (pr-str
+  propose-form))`, which compares the UTF-8 byte length to the cap (`nil` means
+  unlimited). This respects the limit locally rather than relying on a
+  rejection. The demo checks only the representative batch-propose; a real
+  client checks every outbound message.
+
 ## Pagination
 
 A `(query ...)` with `:limit N` returns a first page. If the page is full the
@@ -232,16 +278,19 @@ use `-M:test` if the git dep cannot resolve offline.
 
 ## Scope
 
-This starter speaks both the HTTP and Unix-domain-socket transports and
-demonstrates cursor pagination (see [Pagination](#pagination)). The remaining
-features — capabilities/limits negotiation and watch/SSE streaming — are
-demonstrated in [`../python`](../python) and [`../typescript`](../typescript)
-and may be ported here later.
+This starter speaks both the HTTP and Unix-domain-socket transports,
+demonstrates capabilities/limits awareness (see
+[Capabilities and limits](#capabilities-and-limits)), and demonstrates cursor
+pagination (see [Pagination](#pagination)). The one remaining feature —
+watch/SSE streaming — is demonstrated in [`../python`](../python) and
+[`../typescript`](../typescript) and may be ported here later.
 
 ## References
 
-- `lemma_client.clj` — the tag constructors (`ent`, `wrld`, `fct`), the HTTP
-  transport (`http-send`, `post-edn`), the UDS transport (`uds-send-frame`,
+- `lemma_client.clj` — the tag constructors (`ent`, `wrld`, `fct`), the welcome
+  parser and ServerInfo helpers (`read-welcome`, `supports?`,
+  `max-message-bytes`, `within-message-limit?`), the HTTP transport
+  (`http-send`, `post-edn`), the UDS transport (`uds-send-frame`,
   `uds-recv-frame`), the envelope predicates (`failure?`, `describe-failure`),
   the pagination helper (`query-all`), and the runnable `run-http` / `run-uds`
   round-trips dispatched by `-main`.
