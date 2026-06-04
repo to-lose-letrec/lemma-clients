@@ -1,0 +1,25 @@
+;; deps.edn — the Clojure Lemma client.
+;;
+;; ZERO client dependencies: the client speaks the protocol with only
+;; `clojure.edn` and `java.net.http`, both built into the JDK. `:paths ["."]`
+;; puts lemma_client.clj (and the test namespace alongside it) on the classpath.
+;;
+;; Run the demo:    clojure -M -m lemma-client [base-url]
+;; Run the tests:   clojure -M:test          (dependency-free; always works)
+;;            or:    clojure -X:test          (cognitect runner, if it resolves)
+;;
+;; The :test alias works two ways. The dependency-free path is `-M:test`: its
+;; :main-opts require the test namespace, run clojure.test, and `System/exit`
+;; nonzero when anything fails — no third-party dep, so it runs even fully
+;; offline. The `-X:test` path uses the cognitect test-runner (a git dep) to
+;; auto-discover every `*-test` namespace under :dirs; :exec-args points it at
+;; "." so it finds the test file that lives alongside the client. If the git
+;; dep cannot resolve offline, just use `-M:test`.
+{:paths ["."]
+ :aliases
+ {:test
+  {:extra-deps {io.github.cognitect-labs/test-runner
+                {:git/tag "v0.5.1" :git/sha "dfb30dd"}}
+   :exec-fn cognitect.test-runner.api/test
+   :exec-args {:dirs ["."]}
+   :main-opts ["-e" "(require 'lemma-client-test)(let [r (clojure.test/run-tests 'lemma-client-test)] (System/exit (if (zero? (+ (:fail r) (:error r))) 0 1)))"]}}}
