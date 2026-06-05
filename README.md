@@ -1,5 +1,7 @@
 # lemma-clients
 
+[![ci](https://github.com/to-lose-letrec/lemma-clients/actions/workflows/ci.yml/badge.svg)](https://github.com/to-lose-letrec/lemma-clients/actions/workflows/ci.yml)
+
 Reference clients for the [Lemma](https://github.com/to-lose-letrec/lemma) wire protocol. Each subdirectory is a small, single-file demonstration that implements the protocol from scratch in one language.
 
 ## Goal
