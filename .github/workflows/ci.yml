@@ -18,8 +18,8 @@ jobs:
       run:
         working-directory: python
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - run: pip install edn_format
@@ -31,7 +31,7 @@ jobs:
       run:
         working-directory: typescript
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: oven-sh/setup-bun@v2
       - run: bun install --frozen-lockfile
       - run: bun test
@@ -42,14 +42,14 @@ jobs:
       run:
         working-directory: clojure
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           # The UDS tests use java.nio UNIX SocketChannels (JDK 16+); 21
           # matches the JDK the demos were developed and live-verified on.
           java-version: "21"
-      - uses: DeLaGuardo/setup-clojure@13.2
+      - uses: DeLaGuardo/setup-clojure@13.4
         with:
           cli: latest
       # -M:test is the dependency-free runner: it requires the test
@@ -62,8 +62,8 @@ jobs:
       run:
         working-directory: go
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go/go.mod
       - run: go vet ./...
@@ -75,7 +75,7 @@ jobs:
       run:
         working-directory: rust
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
