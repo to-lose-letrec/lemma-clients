@@ -1008,6 +1008,387 @@ func TestQueryAll_FirstReplyFailure_ReturnsEmptyRowsZeroPages(t *testing.T) {
 	}
 }
 
+// ===========================================================================
+// (G) Capabilities & limits: read_welcome / ServerInfo parse the :welcome
+//     surface (SPEC §10).
+//
+// Parity reference: python/test_lemma_client.py's ReadWelcomeTests. Welcome
+// bodies are built through the REAL codec (edn.Unmarshal of canned welcome
+// strings, via the parse helper) so the decoded shapes — set -> map[..]bool,
+// map -> map[interface{}]interface{}, int -> int64 — are exactly what the live
+// transports hand readWelcome. readWelcome owns turning that surface into a
+// queryable ServerInfo: a Keyword capability set, a :limits map with the
+// max-message-bytes convenience, and FLATTENED :verbs / :predicates Symbol sets
+// (core unioned with every :extensions pack). Every section is optional — a
+// minimal {:event :welcome} must parse to all-empty defaults without panicking.
+// ===========================================================================
+
+// A realistic welcome advertising three capabilities, a byte cap, split
+// core/extensions verb + predicate surfaces, and an extension verb pack —
+// mirrors python's _REALISTIC_WELCOME plus a populated :extensions pack so the
+// flatten-the-pack contract is exercised here too.
+const realisticWelcome = `{:event :welcome :version 1 :session #session "s-1" :world nil ` +
+	`:capabilities #{:lemma/v1 :lemma/cursor-pagination :lemma/watch} ` +
+	`:limits {:max-message-bytes 1048576} ` +
+	`:predicates {:core #{equivalent subset-of} :extensions {}} ` +
+	`:verbs {:core #{hello query continue} :extensions {somepack #{foo}}}}`
+
+// supports() reports true for an advertised capability.
+func TestReadWelcome_Supports_TrueForAdvertisedCapability(t *testing.T) {
+	info := readWelcome(parse(t, []byte(realisticWelcome)))
+	if !info.supports(edn.Keyword("lemma/cursor-pagination")) {
+		t.Errorf("supports(lemma/cursor-pagination) = false, want true")
+	}
+}
+
+// supports() reports false for a capability the welcome never advertised.
+func TestReadWelcome_Supports_FalseForUnadvertisedCapability(t *testing.T) {
+	info := readWelcome(parse(t, []byte(realisticWelcome)))
+	if info.supports(edn.Keyword("lemma/nope")) {
+		t.Errorf("supports(lemma/nope) = true, want false")
+	}
+}
+
+// maxMessageBytes() reads the advertised :max-message-bytes limit as an int64.
+func TestReadWelcome_MaxMessageBytes_ReadsAdvertisedLimit(t *testing.T) {
+	info := readWelcome(parse(t, []byte(realisticWelcome)))
+	got, advertised := info.maxMessageBytes()
+	if !advertised {
+		t.Fatalf("maxMessageBytes advertised = false, want true")
+	}
+	if got != 1048576 {
+		t.Errorf("maxMessageBytes = %d, want 1048576", got)
+	}
+}
+
+// The flattened :verbs surface contains the core verb symbols.
+func TestReadWelcome_Verbs_ContainCoreSymbols(t *testing.T) {
+	info := readWelcome(parse(t, []byte(realisticWelcome)))
+	for _, want := range []edn.Symbol{"hello", "query", "continue"} {
+		if !info.Verbs[want] {
+			t.Errorf("verbs surface missing %q", want)
+		}
+	}
+}
+
+// The flattened :predicates surface contains the core predicate symbols.
+func TestReadWelcome_Predicates_ContainCoreSymbols(t *testing.T) {
+	info := readWelcome(parse(t, []byte(realisticWelcome)))
+	for _, want := range []edn.Symbol{"equivalent", "subset-of"} {
+		if !info.Predicates[want] {
+			t.Errorf("predicates surface missing %q", want)
+		}
+	}
+}
+
+// An :extensions pack's verb names are flattened into the verb set alongside
+// the :core ones — the realistic welcome carries a `somepack #{foo}` pack.
+func TestReadWelcome_Verbs_FlattenExtensionsPackNames(t *testing.T) {
+	info := readWelcome(parse(t, []byte(realisticWelcome)))
+	if !info.Verbs[edn.Symbol("foo")] {
+		t.Errorf("extension pack verb foo not flattened into the verb set")
+	}
+	if !info.Verbs[edn.Symbol("hello")] {
+		t.Errorf("core verb hello missing after extensions flatten")
+	}
+}
+
+// A MINIMAL welcome ({:event :welcome} only) must parse without panic, report
+// an unadvertised byte cap, and answer supports() false — every section
+// defaults to empty rather than nil, so no map lookup panics.
+func TestReadWelcome_MinimalWelcome_ParsesToEmptyDefaults(t *testing.T) {
+	info := readWelcome(parse(t, []byte(`{:event :welcome}`)))
+	if _, advertised := info.maxMessageBytes(); advertised {
+		t.Errorf("minimal welcome reports an advertised byte cap, want unadvertised")
+	}
+	if info.supports(edn.Keyword("lemma/v1")) {
+		t.Errorf("minimal welcome supports(lemma/v1) = true, want false")
+	}
+	// The flattened surfaces are non-nil empty sets — a lookup must not panic.
+	if len(info.Verbs) != 0 {
+		t.Errorf("minimal welcome verbs = %#v, want empty", info.Verbs)
+	}
+	if len(info.Predicates) != 0 {
+		t.Errorf("minimal welcome predicates = %#v, want empty", info.Predicates)
+	}
+}
+
+// ===========================================================================
+// (H) withinMessageLimit: is an EDN message under the server's byte cap?
+//
+// Parity reference: python/test_lemma_client.py's WithinMessageLimitTests. The
+// cap is :max-message-bytes, measured in UTF-8 BYTES (SPEC §10) — len(string)
+// for a Go string, NOT rune count. An unadvertised cap means unlimited, so any
+// message passes. The multibyte case is the load-bearing one: it proves the
+// check measures bytes, not runes.
+// ===========================================================================
+
+// serverInfoWithLimit builds a ServerInfo advertising a max-message-bytes cap.
+func serverInfoWithLimit(cap int64) ServerInfo {
+	return ServerInfo{
+		Capabilities: map[edn.Keyword]bool{},
+		Limits:       map[edn.Keyword]interface{}{edn.Keyword("max-message-bytes"): cap},
+		Verbs:        map[edn.Symbol]bool{},
+		Predicates:   map[edn.Symbol]bool{},
+	}
+}
+
+// A small payload sits comfortably under a 1MB cap, so it passes.
+func TestWithinMessageLimit_SmallPayloadUnderOneMegabyte_Passes(t *testing.T) {
+	info := serverInfoWithLimit(1048576)
+	if !withinMessageLimit(info, "(hello)") {
+		t.Errorf("withinMessageLimit(small, 1MB) = false, want true")
+	}
+}
+
+// An oversized payload against a tiny cap fails: nine bytes against four.
+func TestWithinMessageLimit_OversizedPayloadAgainstTinyLimit_Fails(t *testing.T) {
+	info := serverInfoWithLimit(4)
+	if withinMessageLimit(info, "(hello!!)") { // 9 bytes against a 4-byte cap
+		t.Errorf("withinMessageLimit(9 bytes, 4-byte cap) = true, want false")
+	}
+}
+
+// With no advertised limit, an arbitrarily large payload still passes — an
+// unadvertised cap means unlimited.
+func TestWithinMessageLimit_NoAdvertisedLimit_AlwaysPasses(t *testing.T) {
+	info := ServerInfo{
+		Capabilities: map[edn.Keyword]bool{},
+		Limits:       map[edn.Keyword]interface{}{},
+		Verbs:        map[edn.Symbol]bool{},
+		Predicates:   map[edn.Symbol]bool{},
+	}
+	if _, advertised := info.maxMessageBytes(); advertised {
+		t.Fatalf("no-limit ServerInfo reports an advertised cap")
+	}
+	if !withinMessageLimit(info, strings.Repeat("x", 10_000_000)) {
+		t.Errorf("withinMessageLimit(huge, no cap) = false, want true")
+	}
+}
+
+// The byte-vs-rune case: "αβγδε" is 5 runes but 10 UTF-8 bytes. Against a cap of
+// 6 — above its rune count, below its byte count — a byte-measured check must
+// REJECT it. A rune-measuring (buggy) implementation would wrongly pass it.
+func TestWithinMessageLimit_MultibytePayload_MeasuredInBytesNotRunes(t *testing.T) {
+	const multibyte = "αβγδε" // 5 runes, 10 UTF-8 bytes
+	if rc := len([]rune(multibyte)); rc != 5 {
+		t.Fatalf("fixture rune count = %d, want 5", rc)
+	}
+	if bc := len(multibyte); bc != 10 {
+		t.Fatalf("fixture byte count = %d, want 10", bc)
+	}
+	info := serverInfoWithLimit(6) // 5 < 6 < 10
+	if withinMessageLimit(info, multibyte) {
+		t.Errorf("withinMessageLimit measured runes not bytes: 10-byte payload passed a 6-byte cap")
+	}
+}
+
+// ===========================================================================
+// (I) HTTP capability gating: the paginated tail of mainRun is gated on the
+//     server advertising :lemma/cursor-pagination (SPEC §10).
+//
+// Parity reference: python/test_lemma_client.py's HttpCapabilityGatingTests.
+// We drive the REAL mainRun against an httptest.Server scripted with canned EDN
+// replies in order, recording each inbound request body. A welcome WITHOUT
+// lemma/cursor-pagination: the walk prints the skip note, issues only the five
+// base calls, and never sends a (continue …) or the paged (limit) query. A
+// welcome WITH it: the full paged path runs through the seed propose/assert and
+// the two-page query/continue drain.
+// ===========================================================================
+
+// httpCall records one inbound request for a scripted HTTP server.
+type httpCall struct {
+	path string
+	body string
+}
+
+// scriptedHTTPServer stands up an httptest.Server that replies to each inbound
+// request with the next canned EDN body in order (404-style empty body once the
+// script is exhausted, which stops mainRun cleanly), recording every request's
+// path and body in *calls. The first reply's X-Lemma-Session header seeds the
+// session id mainRun threads into later calls. Closed via t.Cleanup.
+func scriptedHTTPServer(t *testing.T, sessionHeader string, replies []string) (*httptest.Server, *[]httpCall) {
+	t.Helper()
+	calls := &[]httpCall{}
+	i := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		*calls = append(*calls, httpCall{path: r.URL.Path, body: string(raw)})
+		if i == 0 && sessionHeader != "" {
+			w.Header().Set("X-Lemma-Session", sessionHeader)
+		}
+		if i < len(replies) {
+			io.WriteString(w, replies[i])
+		} else {
+			// Over-driven: an empty/non-welcome body stops the walk cleanly.
+			io.WriteString(w, `{:event :error :reason :script-exhausted}`)
+		}
+		i++
+	}))
+	t.Cleanup(srv.Close)
+	return srv, calls
+}
+
+// The five canned HTTP replies the base (un-paginated) sequence answers. The
+// welcome omits lemma/cursor-pagination, so the paged tail is gated out.
+const httpWelcomeNoPagination = `{:event :welcome :version 1 :session #session "s-77" :world #world "default" ` +
+	`:capabilities #{:lemma/v1} :limits {:max-message-bytes 1048576} ` +
+	`:verbs {:core #{hello use-world propose assert query} :extensions {}}}`
+
+// The welcome WITH cursor pagination advertised — the full paged path runs.
+const httpWelcomeWithPagination = `{:event :welcome :version 1 :session #session "s-77" :world #world "default" ` +
+	`:capabilities #{:lemma/v1 :lemma/cursor-pagination} :limits {:max-message-bytes 1048576} ` +
+	`:verbs {:core #{hello use-world propose assert query continue} :extensions {}}}`
+
+const (
+	httpWorldSelected = `{:event :world-selected :world #world "default"}`
+	httpProposed      = `{:event :proposed :proposal #proposal "p-1"}`
+	httpAsserted      = `{:event :asserted}`
+	httpResult        = `{:event :result :rows [["venus"]] :done? true}`
+	// The paged drain: page 1 not done with a cursor, page 2 done.
+	httpPage1 = `{:event :result :rows [[#entity "sub-a"] [#entity "sub-b"]] :done? false :cursor #cursor "c-1"}`
+	httpPage2 = `{:event :result :rows [[#entity "sub-c"]] :done? true}`
+)
+
+// A welcome WITHOUT cursor pagination: mainRun prints the skip note, issues only
+// the five base calls, and never sends a continue or the paged (limit) query.
+func TestMainRun_NoPaginationCapability_SkipsPagedQuery(t *testing.T) {
+	replies := []string{
+		httpWelcomeNoPagination, httpWorldSelected, httpProposed, httpAsserted, httpResult,
+	}
+	srv, calls := scriptedHTTPServer(t, "s-77", replies)
+
+	out := captureStdout(t, func() { mainRun(srv.URL) })
+
+	if !strings.Contains(out, "does not advertise cursor pagination") {
+		t.Errorf("output missing the skip note: %q", out)
+	}
+	sent := *calls
+	if len(sent) != 5 {
+		t.Fatalf("mainRun issued %d HTTP call(s), want exactly 5 (paged tail gated out): %#v", len(sent), sent)
+	}
+	for i, c := range sent {
+		if strings.Contains(c.body, "(continue") {
+			t.Errorf("call %d issued a continue despite the gate: %q", i, c.body)
+		}
+		if strings.Contains(c.body, ":limit") {
+			t.Errorf("call %d issued the paged (limit) query despite the gate: %q", i, c.body)
+		}
+	}
+}
+
+// A welcome WITH cursor pagination: the full paged path runs — nine HTTP calls
+// (hello, use-world, propose, assert, query, seed-propose, assert, query, the
+// single continue), the two-page drain reaches the paged result line, and a
+// (continue …) is issued exactly once.
+func TestMainRun_WithPaginationCapability_RunsPagedPath(t *testing.T) {
+	replies := []string{
+		httpWelcomeWithPagination, httpWorldSelected, httpProposed, httpAsserted, httpResult,
+		httpProposed, httpAsserted, httpPage1, httpPage2,
+	}
+	srv, calls := scriptedHTTPServer(t, "s-77", replies)
+
+	out := captureStdout(t, func() { mainRun(srv.URL) })
+
+	if strings.Contains(out, "does not advertise cursor pagination") {
+		t.Errorf("paged run wrongly printed the skip note: %q", out)
+	}
+	if !strings.Contains(out, "paged query") {
+		t.Errorf("output did not reach the paged query result line: %q", out)
+	}
+	sent := *calls
+	if len(sent) != 9 {
+		t.Fatalf("paged mainRun issued %d HTTP call(s), want 9: %#v", len(sent), sent)
+	}
+	continues := 0
+	for _, c := range sent {
+		if strings.Contains(c.body, "(continue") {
+			continues++
+		}
+	}
+	if continues != 1 {
+		t.Errorf("paged run issued %d continue(s), want exactly 1", continues)
+	}
+}
+
+// ===========================================================================
+// (J) UDS capability gating: the paginated tail of mainUDS is gated the same
+//     way (SPEC §10), driven against the scriptedUDSServer helper.
+//
+// Parity reference: python/test_lemma_client.py's UdsCapabilityGatingTests. A
+// caps-less welcome: the skip note prints and the frame count stops at the five
+// base frames. A capped welcome: the paged frames appear (nine frames) and a
+// (continue …) is sent.
+// ===========================================================================
+
+// The UDS welcome variants mirror the HTTP ones but carry the session in the
+// BODY (:session), per the UDS protocol.
+const udsWelcomeNoPagination = `{:event :welcome :version 1 :session #session "s-uds-1" :world #world "default" ` +
+	`:capabilities #{:lemma/v1} :limits {:max-message-bytes 1048576} ` +
+	`:verbs {:core #{hello use-world propose assert query} :extensions {}}}`
+
+const udsWelcomeWithPagination = `{:event :welcome :version 1 :session #session "s-uds-1" :world #world "default" ` +
+	`:capabilities #{:lemma/v1 :lemma/cursor-pagination} :limits {:max-message-bytes 1048576} ` +
+	`:verbs {:core #{hello use-world propose assert query continue} :extensions {}}}`
+
+// A caps-less UDS welcome: mainUDS prints the skip note and the server sees only
+// the five base frames — the paged tail is gated out.
+func TestMainUDS_NoPaginationCapability_SkipsPagedQuery(t *testing.T) {
+	replies := []string{
+		udsWelcomeNoPagination, udsWorldSelected, udsProposed, udsAsserted, udsResult,
+	}
+	sockPath, recvd := scriptedUDSServer(t, replies)
+
+	out := captureStdout(t, func() { mainUDS(sockPath) })
+
+	if !strings.Contains(out, "does not advertise cursor pagination") {
+		t.Errorf("output missing the skip note: %q", out)
+	}
+	sent := *recvd
+	if len(sent) != 5 {
+		t.Fatalf("mainUDS sent %d frame(s), want exactly 5 (paged tail gated out): %#v", len(sent), sent)
+	}
+	for i, fr := range sent {
+		if strings.Contains(fr, "(continue") {
+			t.Errorf("frame %d is a continue despite the gate: %q", i, fr)
+		}
+	}
+}
+
+// A capped UDS welcome: the paged path runs — nine frames including a single
+// (continue …) — and the paged result line is reached.
+func TestMainUDS_WithPaginationCapability_RunsPagedPath(t *testing.T) {
+	replies := []string{
+		udsWelcomeWithPagination, udsWorldSelected, udsProposed, udsAsserted, udsResult,
+		udsProposed, udsAsserted,
+		`{:event :result :rows [[#entity "sub-a"] [#entity "sub-b"]] :done? false :cursor #cursor "c-1"}`,
+		`{:event :result :rows [[#entity "sub-c"]] :done? true}`,
+	}
+	sockPath, recvd := scriptedUDSServer(t, replies)
+
+	out := captureStdout(t, func() { mainUDS(sockPath) })
+
+	if strings.Contains(out, "does not advertise cursor pagination") {
+		t.Errorf("paged run wrongly printed the skip note: %q", out)
+	}
+	if !strings.Contains(out, "paged query") {
+		t.Errorf("output did not reach the paged query result line: %q", out)
+	}
+	sent := *recvd
+	if len(sent) != 9 {
+		t.Fatalf("paged mainUDS sent %d frame(s), want 9: %#v", len(sent), sent)
+	}
+	continues := 0
+	for _, fr := range sent {
+		if strings.Contains(fr, "(continue") {
+			continues++
+		}
+	}
+	if continues != 1 {
+		t.Errorf("paged run sent %d continue frame(s), want exactly 1", continues)
+	}
+}
+
 // captureStdout runs fn with os.Stdout redirected to a pipe and returns whatever
 // fn printed. mainUDS prints its status lines straight to stdout (it has no
 // injectable writer), so we capture at the os.Stdout level. The pipe is drained

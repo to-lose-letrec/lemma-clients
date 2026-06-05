@@ -69,6 +69,8 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"sort"
+	"strings"
 
 	"olympos.io/encoding/edn"
 )
@@ -395,6 +397,162 @@ func get(body interface{}, key string) interface{} {
 }
 
 // ---------------------------------------------------------------------------
+// Capabilities & limits:  the :welcome surface  ->  ServerInfo
+//
+// Every session opens with a (hello) whose :welcome reply advertises what the
+// server can do (SPEC §10): a :capabilities set of namespaced flag keywords, a
+// :limits map of resource caps, and the :verbs / :predicates the world exposes.
+// A well-behaved client reads this once and tailors itself to it — skipping
+// features the server doesn't advertise and staying under the byte caps it
+// enforces. ServerInfo is the parsed, queryable form of that surface; it is a
+// plain data record (not a new abstraction layer), so the round-trip code below
+// can ask "does this server paginate?" or "is my message small enough?" in one
+// readable call.
+//
+// go-edn decoding shapes (probed before this was built): an EDN set `#{…}`
+// decodes to map[interface{}]bool keyed by the decoded elements, so
+// :capabilities arrives as map[interface{}]bool with edn.Keyword keys and a
+// :core / :extensions surface arrives as map[interface{}]bool with edn.Symbol
+// keys. We narrow those generic maps into typed sets so the record below reads
+// as data rather than as a pile of interface{} assertions.
+// ---------------------------------------------------------------------------
+
+// ServerInfo is the parsed :welcome surface: what this server advertises
+// (SPEC §10). Fields mirror the welcome map. capabilities is a set of Keyword
+// flags (e.g. lemma/cursor-pagination); limits is a Keyword -> value map of
+// resource caps; verbs and predicates are flat sets of Symbol names with the
+// :core and :extensions surfaces merged. Every field has a zero-value-safe
+// default: a minimal welcome that omits a section yields an empty (non-nil)
+// set or map, so the lookups below never panic on a nil map.
+type ServerInfo struct {
+	Version      interface{}
+	Capabilities map[edn.Keyword]bool
+	Limits       map[edn.Keyword]interface{}
+	Verbs        map[edn.Symbol]bool
+	Predicates   map[edn.Symbol]bool
+}
+
+// supports reports whether capability (a Keyword) is in the advertised set.
+func (si ServerInfo) supports(capability edn.Keyword) bool {
+	return si.Capabilities[capability]
+}
+
+// maxMessageBytes returns the :max-message-bytes limit and true, or (0, false)
+// when the server advertised no such limit. The (int64, bool) shape is Go's
+// idiomatic "absent marker": go-edn decodes EDN ints to int64, so a present
+// limit asserts cleanly, and an unadvertised one is distinguishable from a real
+// zero. withinMessageLimit reads the bool to mean "unlimited".
+func (si ServerInfo) maxMessageBytes() (int64, bool) {
+	v, present := si.Limits[edn.Keyword("max-message-bytes")]
+	if !present {
+		return 0, false
+	}
+	n, ok := v.(int64)
+	return n, ok
+}
+
+// flattenSurface merges a {:core #{…} :extensions {pack #{…}}} map into one flat
+// set of Symbol names. The :verbs and :predicates entries of a welcome split
+// names into a :core set plus per-pack :extensions sets (SPEC §10); a client
+// mostly just wants "every name this server understands", so we union :core with
+// all the extension sets. A surface decodes to map[interface{}]interface{} and
+// each name set to map[interface{}]bool (an EDN set) — we copy out only the
+// edn.Symbol keys. Missing keys default to empty: a minimal welcome need not
+// carry every section, and the result is always a non-nil set.
+func flattenSurface(surface interface{}) map[edn.Symbol]bool {
+	names := map[edn.Symbol]bool{}
+	m, ok := surface.(map[interface{}]interface{})
+	if !ok {
+		return names
+	}
+	addSet := func(raw interface{}) {
+		set, ok := raw.(map[interface{}]bool)
+		if !ok {
+			return
+		}
+		for k := range set {
+			if sym, ok := k.(edn.Symbol); ok {
+				names[sym] = true
+			}
+		}
+	}
+	addSet(m[edn.Keyword("core")])
+	if exts, ok := m[edn.Keyword("extensions")].(map[interface{}]interface{}); ok {
+		for _, packNames := range exts {
+			addSet(packNames)
+		}
+	}
+	return names
+}
+
+// readWelcome parses a :welcome envelope (the parsed body map) into a
+// ServerInfo. We pull :version, :capabilities (an EDN set of Keyword flags),
+// :limits (a Keyword -> value map), and the flattened :verbs / :predicates
+// surfaces. Every key is optional: a server that omits a section yields an empty
+// default rather than an error, so this stays robust against minimal welcomes
+// (a bare {:event :welcome} parses to all-empty defaults with no nil-map panic).
+func readWelcome(body interface{}) ServerInfo {
+	si := ServerInfo{
+		Capabilities: map[edn.Keyword]bool{},
+		Limits:       map[edn.Keyword]interface{}{},
+		Verbs:        flattenSurface(get(body, "verbs")),
+		Predicates:   flattenSurface(get(body, "predicates")),
+		Version:      get(body, "version"),
+	}
+	// :capabilities is an EDN set, so it decodes to map[interface{}]bool keyed by
+	// edn.Keyword; narrow it to the typed flag set, ignoring any non-keyword key.
+	if caps, ok := get(body, "capabilities").(map[interface{}]bool); ok {
+		for k := range caps {
+			if kw, ok := k.(edn.Keyword); ok {
+				si.Capabilities[kw] = true
+			}
+		}
+	}
+	// :limits is an EDN map (map[interface{}]interface{}); keep its Keyword keys.
+	if limits, ok := get(body, "limits").(map[interface{}]interface{}); ok {
+		for k, v := range limits {
+			if kw, ok := k.(edn.Keyword); ok {
+				si.Limits[kw] = v
+			}
+		}
+	}
+	return si
+}
+
+// printServerInfo prints the one-line caps/limit summary both mains emit right
+// after the welcome, mirroring python's
+// `server: caps={…} max-message-bytes=…`. Cap names are sorted for a stable
+// line; an unadvertised :max-message-bytes prints as "none" (the absent marker),
+// otherwise the integer byte cap.
+func printServerInfo(info ServerInfo) {
+	names := make([]string, 0, len(info.Capabilities))
+	for c := range info.Capabilities {
+		// Python prints the keyword's bare name (no leading colon), e.g.
+		// "lemma/cursor-pagination" — string(c), not c.String() which re-adds ":".
+		names = append(names, string(c))
+	}
+	sort.Strings(names)
+	limit := "none"
+	if cap, advertised := info.maxMessageBytes(); advertised {
+		limit = fmt.Sprintf("%d", cap)
+	}
+	fmt.Printf("server: caps={%s} max-message-bytes=%s\n",
+		strings.Join(names, ", "), limit)
+}
+
+// withinMessageLimit reports whether ednText fits under the server's
+// :max-message-bytes cap. The limit is measured in UTF-8 BYTES (SPEC §10), which
+// for a Go string is simply len(ednText) — Go strings are already UTF-8. An
+// unadvertised limit means unlimited, so any message passes.
+func withinMessageLimit(si ServerInfo, ednText string) bool {
+	cap, advertised := si.maxMessageBytes()
+	if !advertised {
+		return true
+	}
+	return int64(len(ednText)) <= cap
+}
+
+// ---------------------------------------------------------------------------
 // Cursor pagination:  drain a (query …) across (continue #cursor …) pages
 //
 // A query with :limit returns a full first page with :done? false plus a
@@ -484,6 +642,13 @@ func mainRun(base string) {
 	fmt.Printf("hello -> :welcome  version=%s  session=%s  world=%s\n",
 		render(get(body, "version")), sid, render(get(body, "world")))
 
+	// 1a. Read the advertised capabilities and limits once, up front, so the rest
+	//     of the round-trip can tailor itself to this server (SPEC §10). The caps
+	//     line mirrors python's: a sorted, comma-joined cap-name set and the
+	//     :max-message-bytes limit (or "none" when unadvertised).
+	info := readWelcome(body)
+	printServerInfo(info)
+
 	// 2. Every later call rides the same session, on the named endpoint, with
 	//    the session id echoed in the request header.
 	named := func(form interface{}) (interface{}, error) {
@@ -552,64 +717,78 @@ func mainRun(base string) {
 	fmt.Printf("query (equivalent morningstar ?o) -> rows=%s  done?=%s\n",
 		render(get(body, "rows")), render(get(body, "done?")))
 
-	// 7. Paginated query: seed three subset-of facts in one propose, assert the
-	//    batch, then drain a :limit 2 query via queryAll / (continue #cursor …).
-	// Seed three subset-of facts in one propose, then assert the batch, so the
-	// paginated query below has more rows than a single page holds. subset-of is
-	// a pure-EDB (stored-fact) predicate, so a query over it has stable
-	// (tx-id, ref-id) ordering and can be paginated; a rule-headed predicate like
-	// member-of cannot be the sole outer :where pattern (the server rejects it
-	// :bad-args :unsupported-rule-call-ordering).
-	f1 := fact(edn.Symbol("subset-of"), entity("sub-a"), entity("group"))
-	f2 := fact(edn.Symbol("subset-of"), entity("sub-b"), entity("group"))
-	f3 := fact(edn.Symbol("subset-of"), entity("sub-c"), entity("group"))
-	proposeForm := verb{edn.Symbol("propose"), f1, f2, f3}
+	// 7. The paginated section is gated on the server advertising cursor
+	//    pagination — without it, draining pages via (continue #cursor …) is
+	//    unsupported, so we skip the whole block rather than guess.
+	if info.supports(edn.Keyword("lemma/cursor-pagination")) {
+		// Seed three subset-of facts in one propose, then assert the batch, so the
+		// paginated query below has more rows than a single page holds. subset-of is
+		// a pure-EDB (stored-fact) predicate, so a query over it has stable
+		// (tx-id, ref-id) ordering and can be paginated; a rule-headed predicate like
+		// member-of cannot be the sole outer :where pattern (the server rejects it
+		// :bad-args :unsupported-rule-call-ordering).
+		f1 := fact(edn.Symbol("subset-of"), entity("sub-a"), entity("group"))
+		f2 := fact(edn.Symbol("subset-of"), entity("sub-b"), entity("group"))
+		f3 := fact(edn.Symbol("subset-of"), entity("sub-c"), entity("group"))
+		proposeForm := verb{edn.Symbol("propose"), f1, f2, f3}
 
-	body, err = named(proposeForm)
-	if err != nil {
-		fmt.Println(err)
-		return
-	}
-	if isFailure(body) {
-		fmt.Printf("propose (3x subset-of) refused: %s\n", describeFailure(body))
-		return
-	}
-	proposal = get(body, "proposal")
-	fmt.Printf("propose (3x subset-of ? group) -> %s  proposal=%s\n",
-		render(get(body, "event")), render(proposal))
-	body, err = named(verb{edn.Symbol("assert"), proposal})
-	if err != nil {
-		fmt.Println(err)
-		return
-	}
-	if isFailure(body) {
-		fmt.Printf("assert (3x subset-of) refused: %s\n", describeFailure(body))
-		return
-	}
-	fmt.Printf("assert proposal -> %s\n", render(get(body, "event")))
+		// The batch propose is the largest representative message we send, so it is
+		// the one worth checking against :max-message-bytes. A real client checks
+		// every outbound message; this demo checks this one. withinMessageLimit
+		// measures the marshalled EDN in UTF-8 bytes.
+		if !withinMessageLimit(info, render(proposeForm)) {
+			fmt.Println("limit-exceeded: message exceeds max-message-bytes; skipping")
+			return
+		}
 
-	// 8. Paginated query: :limit 2 over 3 matching rows yields two pages (2 + 1).
-	//    queryAll drains them via (continue #cursor …). It wants a form -> body
-	//    closure; named already has that shape — it dropped the (header-threaded)
-	//    session id internally — so it passes straight through.
-	qform := verb{edn.Symbol("query"), map[edn.Keyword]interface{}{
-		edn.Keyword("find"): []interface{}{edn.Symbol("?x")},
-		edn.Keyword("where"): []interface{}{
-			[]interface{}{edn.Symbol("subset-of"), edn.Symbol("?x"), entity("group")},
-		},
-		edn.Keyword("limit"): 2,
-	}}
-	rows, pages, failure, err := queryAll(named, qform)
-	if err != nil {
-		fmt.Println(err)
-		return
+		body, err = named(proposeForm)
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+		if isFailure(body) {
+			fmt.Printf("propose (3x subset-of) refused: %s\n", describeFailure(body))
+			return
+		}
+		proposal = get(body, "proposal")
+		fmt.Printf("propose (3x subset-of ? group) -> %s  proposal=%s\n",
+			render(get(body, "event")), render(proposal))
+		body, err = named(verb{edn.Symbol("assert"), proposal})
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+		if isFailure(body) {
+			fmt.Printf("assert (3x subset-of) refused: %s\n", describeFailure(body))
+			return
+		}
+		fmt.Printf("assert proposal -> %s\n", render(get(body, "event")))
+
+		// 8. Paginated query: :limit 2 over 3 matching rows yields two pages (2 + 1).
+		//    queryAll drains them via (continue #cursor …). It wants a form -> body
+		//    closure; named already has that shape — it dropped the (header-threaded)
+		//    session id internally — so it passes straight through.
+		qform := verb{edn.Symbol("query"), map[edn.Keyword]interface{}{
+			edn.Keyword("find"): []interface{}{edn.Symbol("?x")},
+			edn.Keyword("where"): []interface{}{
+				[]interface{}{edn.Symbol("subset-of"), edn.Symbol("?x"), entity("group")},
+			},
+			edn.Keyword("limit"): 2,
+		}}
+		rows, pages, failure, err := queryAll(named, qform)
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+		if failure != nil {
+			fmt.Printf("paged query refused: %s\n", describeFailure(failure))
+			return
+		}
+		fmt.Printf("paged query (subset-of ? group), limit 2 -> %d rows over %d page(s): %s\n",
+			len(rows), pages, render(rows))
+	} else {
+		fmt.Println("server does not advertise cursor pagination; skipping paged query")
 	}
-	if failure != nil {
-		fmt.Printf("paged query refused: %s\n", describeFailure(failure))
-		return
-	}
-	fmt.Printf("paged query (subset-of ? group), limit 2 -> %d rows over %d page(s): %s\n",
-		len(rows), pages, render(rows))
 }
 
 // ---------------------------------------------------------------------------
@@ -751,6 +930,12 @@ func mainUDS(socketPath string) {
 		render(get(body, "version")), render(get(body, "session")),
 		render(get(body, "world")))
 
+	// 1a. Read the advertised capabilities and limits once, up front, so the rest
+	//     of the round-trip can tailor itself to this server (SPEC §10) — same
+	//     caps/limit line the HTTP path prints.
+	info := readWelcome(body)
+	printServerInfo(info)
+
 	// 2. Enter the world. (use-world #world "default")
 	body, err = call(verb{edn.Symbol("use-world"), world("default")})
 	if err != nil {
@@ -811,66 +996,79 @@ func mainUDS(socketPath string) {
 	}
 	fmt.Printf("query (equivalent morningstar ?o) -> rows=%s  done?=%s\n",
 		render(get(body, "rows")), render(get(body, "done?")))
-	// 6. Paginated query: seed three subset-of facts in one propose, assert the
-	//    batch, then drain a :limit 2 query via queryAll / (continue #cursor …).
-	// Seed three subset-of facts in one propose, then assert the batch, so the
-	// paginated query below spans more than one page. subset-of is a pure-EDB
-	// (stored-fact) predicate, so a query over it has stable (tx-id, ref-id)
-	// ordering and can be paginated; a rule-headed predicate like member-of
-	// cannot be the sole outer :where pattern (the server rejects it :bad-args
-	// :unsupported-rule-call-ordering).
-	f1 := fact(edn.Symbol("subset-of"), entity("sub-a"), entity("group"))
-	f2 := fact(edn.Symbol("subset-of"), entity("sub-b"), entity("group"))
-	f3 := fact(edn.Symbol("subset-of"), entity("sub-c"), entity("group"))
-	proposeForm := verb{edn.Symbol("propose"), f1, f2, f3}
 
-	body, err = call(proposeForm)
-	if err != nil {
-		// Over UDS the connection carries the whole sequence; a read/write error
-		// here (e.g. the server closed after the basic query) is a transport
-		// failure, so print it and stop cleanly rather than hang.
-		fmt.Println(err)
-		return
-	}
-	if isFailure(body) {
-		fmt.Printf("propose (3x subset-of) refused: %s\n", describeFailure(body))
-		return
-	}
-	proposal = get(body, "proposal")
-	fmt.Printf("propose (3x subset-of ? group) -> %s  proposal=%s\n",
-		render(get(body, "event")), render(proposal))
-	body, err = call(verb{edn.Symbol("assert"), proposal})
-	if err != nil {
-		fmt.Println(err)
-		return
-	}
-	if isFailure(body) {
-		fmt.Printf("assert (3x subset-of) refused: %s\n", describeFailure(body))
-		return
-	}
-	fmt.Printf("assert proposal -> %s\n", render(get(body, "event")))
+	// 6. The paginated section is gated on the server advertising cursor
+	//    pagination — same as the HTTP path. Without it we skip the paged block
+	//    rather than guess at draining pages via (continue #cursor …).
+	if info.supports(edn.Keyword("lemma/cursor-pagination")) {
+		// Seed three subset-of facts in one propose, then assert the batch, so the
+		// paginated query below spans more than one page. subset-of is a pure-EDB
+		// (stored-fact) predicate, so a query over it has stable (tx-id, ref-id)
+		// ordering and can be paginated; a rule-headed predicate like member-of
+		// cannot be the sole outer :where pattern (the server rejects it :bad-args
+		// :unsupported-rule-call-ordering).
+		f1 := fact(edn.Symbol("subset-of"), entity("sub-a"), entity("group"))
+		f2 := fact(edn.Symbol("subset-of"), entity("sub-b"), entity("group"))
+		f3 := fact(edn.Symbol("subset-of"), entity("sub-c"), entity("group"))
+		proposeForm := verb{edn.Symbol("propose"), f1, f2, f3}
 
-	// 7. Paginated query: :limit 2 over 3 matching rows yields two pages (2 + 1).
-	//    queryAll drains them via (continue #cursor …). The UDS call closure is
-	//    already form -> body, so it is passed directly.
-	qform := verb{edn.Symbol("query"), map[edn.Keyword]interface{}{
-		edn.Keyword("find"): []interface{}{edn.Symbol("?x")},
-		edn.Keyword("where"): []interface{}{
-			[]interface{}{edn.Symbol("subset-of"), edn.Symbol("?x"), entity("group")},
-		},
-		edn.Keyword("limit"): 2,
-	}}
-	rows, pages, failure, err := queryAll(call, qform)
-	if err != nil {
-		fmt.Println(err)
-		return
+		// The batch propose is the largest representative message we send, so it is
+		// the one worth checking against :max-message-bytes (measured in UTF-8 bytes).
+		if !withinMessageLimit(info, render(proposeForm)) {
+			fmt.Println("limit-exceeded: message exceeds max-message-bytes; skipping")
+			return
+		}
+
+		body, err = call(proposeForm)
+		if err != nil {
+			// Over UDS the connection carries the whole sequence; a read/write error
+			// here (e.g. the server closed after the basic query) is a transport
+			// failure, so print it and stop cleanly rather than hang.
+			fmt.Println(err)
+			return
+		}
+		if isFailure(body) {
+			fmt.Printf("propose (3x subset-of) refused: %s\n", describeFailure(body))
+			return
+		}
+		proposal = get(body, "proposal")
+		fmt.Printf("propose (3x subset-of ? group) -> %s  proposal=%s\n",
+			render(get(body, "event")), render(proposal))
+		body, err = call(verb{edn.Symbol("assert"), proposal})
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+		if isFailure(body) {
+			fmt.Printf("assert (3x subset-of) refused: %s\n", describeFailure(body))
+			return
+		}
+		fmt.Printf("assert proposal -> %s\n", render(get(body, "event")))
+
+		// 7. Paginated query: :limit 2 over 3 matching rows yields two pages (2 + 1).
+		//    queryAll drains them via (continue #cursor …). The UDS call closure is
+		//    already form -> body, so it is passed directly.
+		qform := verb{edn.Symbol("query"), map[edn.Keyword]interface{}{
+			edn.Keyword("find"): []interface{}{edn.Symbol("?x")},
+			edn.Keyword("where"): []interface{}{
+				[]interface{}{edn.Symbol("subset-of"), edn.Symbol("?x"), entity("group")},
+			},
+			edn.Keyword("limit"): 2,
+		}}
+		rows, pages, failure, err := queryAll(call, qform)
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+		if failure != nil {
+			fmt.Printf("paged query refused: %s\n", describeFailure(failure))
+			return
+		}
+		fmt.Printf("paged query (subset-of ? group), limit 2 -> %d rows over %d page(s): %s\n",
+			len(rows), pages, render(rows))
+	} else {
+		fmt.Println("server does not advertise cursor pagination; skipping paged query")
 	}
-	if failure != nil {
-		fmt.Printf("paged query refused: %s\n", describeFailure(failure))
-		return
-	}
-	fmt.Printf("paged query (subset-of ? group), limit 2 -> %d rows over %d page(s): %s\n",
-		len(rows), pages, render(rows))
 }
 
 // ---------------------------------------------------------------------------
