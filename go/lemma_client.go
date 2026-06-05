@@ -68,9 +68,12 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 
 	"olympos.io/encoding/edn"
 )
@@ -719,7 +722,9 @@ func mainRun(base string) {
 
 	// 7. The paginated section is gated on the server advertising cursor
 	//    pagination — without it, draining pages via (continue #cursor …) is
-	//    unsupported, so we skip the whole block rather than guess.
+	//    unsupported, so we skip the whole block rather than guess. The watch
+	//    section below has its own gate, so this one wraps only the paged path
+	//    rather than returning out of the whole walk.
 	if info.supports(edn.Keyword("lemma/cursor-pagination")) {
 		// Seed three subset-of facts in one propose, then assert the batch, so the
 		// paginated query below has more rows than a single page holds. subset-of is
@@ -769,7 +774,7 @@ func mainRun(base string) {
 		//    closure; named already has that shape — it dropped the (header-threaded)
 		//    session id internally — so it passes straight through.
 		qform := verb{edn.Symbol("query"), map[edn.Keyword]interface{}{
-			edn.Keyword("find"): []interface{}{edn.Symbol("?x")},
+			edn.Keyword("find"):  []interface{}{edn.Symbol("?x")},
 			edn.Keyword("where"): []interface{}{
 				[]interface{}{edn.Symbol("subset-of"), edn.Symbol("?x"), entity("group")},
 			},
@@ -789,6 +794,96 @@ func mainRun(base string) {
 	} else {
 		fmt.Println("server does not advertise cursor pagination; skipping paged query")
 	}
+
+	// 9. Watch: register a standing pattern and observe a matching change pushed
+	//    back on the SSE event stream. Gated on the server advertising
+	//    :lemma/watch — without it the (watch-pattern …) verb is unsupported, so
+	//    we skip the demo rather than guess.
+	if !info.supports(edn.Keyword("lemma/watch")) {
+		fmt.Println("server does not advertise watch; skipping watch demo")
+		return
+	}
+
+	// (watch-pattern :pattern [[subset-of ?x #entity "group"]]) — the args are
+	// FLAT keyword args (the :pattern keyword then the where-vector), NOT a
+	// wrapping map. The reply hands back a #watch handle to unwatch with.
+	pattern := []interface{}{
+		[]interface{}{edn.Symbol("subset-of"), edn.Symbol("?x"), entity("group")},
+	}
+	body, err = named(verb{edn.Symbol("watch-pattern"), edn.Keyword("pattern"), pattern})
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	if isFailure(body) {
+		fmt.Printf("watch-pattern refused: %s\n", describeFailure(body))
+		return
+	}
+	watch := get(body, "watch")
+	fmt.Printf("watch (subset-of ? group) -> %s  watch=%s\n",
+		render(get(body, "event")), render(watch))
+
+	// Ordering is load-bearing: Dianoia registers this session's SSE sink lazily,
+	// when the GET /events headers are written, and delivers a :watch-event only
+	// to sinks present at emit time (no backlog replay). So OPEN the stream first
+	// (registering the sink), THEN trigger the change, THEN drain — otherwise the
+	// push can fire within milliseconds of the assert, before our sink exists,
+	// and be silently lost.
+	stream, err := openSSEStream(base, sid, sseTimeout)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	// The server pushes only DELTAS, so the change must be new: a fact re-asserted
+	// verbatim is a no-op and fires nothing. We key the probe entity to this
+	// process so each run asserts a genuinely fresh fact.
+	probe := entity(fmt.Sprintf("watch-probe-%d", os.Getpid()))
+	body, err = named(verb{edn.Symbol("propose"), fact(edn.Symbol("subset-of"), probe, entity("group"))})
+	if err != nil {
+		stream.close()
+		fmt.Println(err)
+		return
+	}
+	if isFailure(body) {
+		stream.close()
+		fmt.Printf("watch-probe propose refused: %s\n", describeFailure(body))
+		return
+	}
+	body, err = named(verb{edn.Symbol("assert"), get(body, "proposal")})
+	if err != nil {
+		stream.close()
+		fmt.Println(err)
+		return
+	}
+	if isFailure(body) {
+		stream.close()
+		fmt.Printf("watch-probe assert refused: %s\n", describeFailure(body))
+		return
+	}
+
+	// Drain a single event, then ALWAYS release the SSE socket so the server
+	// drops the stream, whether or not an event arrived.
+	events := readSSEEvents(stream, 1)
+	stream.close()
+	if len(events) > 0 {
+		evt := events[0]
+		fmt.Printf("watch (subset-of ? group) -> %s type=%s data=%s\n",
+			render(get(evt, "event")), render(get(evt, "type")), render(get(evt, "data")))
+	} else {
+		fmt.Println("watch: no event observed before timeout")
+	}
+
+	// Tear the watch down. (unwatch #watch "w-N") -> :ok.
+	body, err = named(verb{edn.Symbol("unwatch"), watch})
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	if isFailure(body) {
+		fmt.Printf("unwatch refused: %s\n", describeFailure(body))
+		return
+	}
+	fmt.Printf("unwatch %s -> %s\n", render(watch), render(get(body, "event")))
 }
 
 // ---------------------------------------------------------------------------
@@ -859,6 +954,269 @@ func udsRecvFrame(conn net.Conn) (string, error) {
 			"reading frame body (%d bytes expected): %w", length, err)
 	}
 	return string(body), nil
+}
+
+// udsAwaitWatchEvent reads framed replies until a :watch-event arrives and
+// returns it, or nil if none does within the bound. Over UDS there is no
+// separate event channel: watch pushes interleave with ordinary command
+// responses on the SAME frame stream (uds.clj fans both onto the one
+// connection). So after triggering a change we read frames in a loop, skipping
+// command replies (the :asserted echo, etc.) until we see the :watch-event
+// envelope. The loop is bounded two ways so a missing push can never hang: by
+// maxFrames, and by a read deadline set on the connection before the loop — a
+// timed-out read surfaces as an error from udsRecvFrame, which ends the loop
+// and yields nil ("no event observed"). Mirrors python's _uds_await_watch_event.
+func udsAwaitWatchEvent(conn net.Conn, maxFrames int) interface{} {
+	// Bound every read so a missing push degrades to nil rather than blocking.
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	for i := 0; i < maxFrames; i++ {
+		raw, err := udsRecvFrame(conn)
+		if err != nil {
+			// EOF, a timeout, or a truncated frame: stop and report nothing.
+			return nil
+		}
+		var body interface{}
+		if err := edn.Unmarshal([]byte(raw), &body); err != nil {
+			continue // unparseable frame — skip and keep reading
+		}
+		if get(body, "event") == edn.Keyword("watch-event") {
+			return body
+		}
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Watch over HTTP:  the SSE event stream  ->  parsed :watch-event envelopes
+//
+// A (watch-pattern …) call registers a standing query; matching changes are
+// then *pushed* to the session rather than polled. Over HTTP those pushes
+// arrive on a separate Server-Sent-Events stream, GET /v1/sessions/{id}/events
+// (SPEC §9). SSE is a one-way text stream: each event is one or more `data:`
+// lines terminated by a blank line; `:`-prefixed lines are keep-alive comments
+// to be ignored.
+//
+// Why a raw net.Conn instead of net/http? Dianoia (http-kit) serves the stream
+// with Transfer-Encoding: chunked and writes an immediate size-0 chunk to flush
+// the response headers before any event exists. A standard chunked reader
+// (net/http) treats that size-0 chunk as end-of-body and reports EOF, closing
+// the stream before the first event ever arrives. So we speak HTTP by hand over
+// a raw net.Conn — the same plumbing the UDS transport already uses — and treat
+// a size-0 chunk as a keep-alive flush (skip it, keep reading) rather than as
+// the end of the stream. Every read is bounded by a deadline so a quiet stream
+// can never hang the demo.
+//
+// ORDERING IS LOAD-BEARING. Dianoia registers the per-session SSE sink LAZILY,
+// at the moment the GET /events connection's headers are written — and the
+// watch dispatcher delivers a :watch-event only to sinks present at emit time,
+// with NO backlog replay. So the stream must be OPENED (sink registered) BEFORE
+// the change that triggers the event, or the push races ahead of the sink and
+// is lost. We therefore split the work in two:
+//
+//   - openSSEStream — dial, send the GET, read PAST the status line and headers
+//     (writing the request + draining headers is what makes Dianoia register
+//     the sink), and hand back an open handle. Call this BEFORE the trigger.
+//   - readSSEEvents — drain parsed events from an already-open handle, AFTER the
+//     trigger. Bounded by the handle's read deadline.
+//
+// This is read-only and single-threaded by design. Stdlib only for the plumbing
+// (net + net/url); the EDN codec is the same go-edn used everywhere above.
+// ---------------------------------------------------------------------------
+
+// sseTimeout bounds every read on the SSE stream — the per-read deadline that
+// keeps a quiet stream from hanging the demo. Mirrors python's 10.0s.
+const sseTimeout = 10 * time.Second
+
+// sseStream is an open SSE connection: the raw conn plus the body bytes already
+// read past the header terminator. openSSEStream builds one (connection live,
+// headers consumed, server sink registered); readSSEEvents drains events from
+// it; close releases the conn so the server drops the stream. buf holds any
+// body bytes carried across the header read into the body decode so the chunked
+// decoder does not lose them. Mirrors python's _SSEStream.
+type sseStream struct {
+	conn net.Conn
+	buf  []byte
+}
+
+// close releases the connection, letting the server tear down the stream.
+func (s *sseStream) close() {
+	s.conn.Close()
+}
+
+// openSSEStream opens the SSE event stream for sessionID and returns an
+// *sseStream. It parses host/port from base (e.g. "http://127.0.0.1:8080"),
+// dials a raw connection, issues GET /v1/sessions/{id}/events with an
+// Accept: text/event-stream header, and reads PAST the status line and response
+// headers — stopping at the blank line that begins the body. It does NOT read
+// any event bodies; that is readSSEEvents's job.
+//
+// The split matters because writing the GET and draining its headers is what
+// makes Dianoia register this session's SSE sink, and the watch dispatcher only
+// delivers to sinks that exist when an event is emitted (no replay). So a caller
+// must open the stream BEFORE triggering the change it wants to observe, then
+// read AFTER — otherwise the push races ahead of the sink and is lost.
+//
+// A connection-level dial failure is the one error returned (the caller has no
+// handle to close). Once dialed, an early close or a timeout DURING the header
+// read still returns a (degraded) handle with an empty buffer rather than an
+// error, so the caller's close path stays uniform: the subsequent read will see
+// EOF and yield no events. Mirrors python's open_sse_stream.
+func openSSEStream(base, sessionID string, timeout time.Duration) (*sseStream, error) {
+	parts, err := url.Parse(base)
+	if err != nil {
+		return nil, fmt.Errorf("parsing SSE base URL %q: %w", base, err)
+	}
+	host := parts.Hostname()
+	port := parts.Port()
+	if port == "" {
+		port = "80"
+	}
+
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, port), timeout)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"could not open the Lemma SSE stream at %q (%v); is the server running?",
+			base, err)
+	}
+
+	request := "GET /v1/sessions/" + sessionID + "/events HTTP/1.1\r\n" +
+		"Host: " + net.JoinHostPort(host, port) + "\r\n" +
+		"Accept: text/event-stream\r\n" +
+		"X-Lemma-Session: " + sessionID + "\r\n" +
+		"Connection: keep-alive\r\n\r\n"
+	conn.SetReadDeadline(time.Now().Add(timeout))
+	if _, err := conn.Write([]byte(request)); err != nil {
+		// Write failed before the sink could register: hand back a degraded
+		// handle (empty buf) so the caller's close path is uniform.
+		return &sseStream{conn: conn, buf: nil}, nil
+	}
+
+	// Consume the status line and headers; the body starts after the blank
+	// line. Anything already read past it is retained on the handle so the
+	// chunked decoder in readSSEEvents does not lose those bytes. Draining the
+	// headers here is the act that registers the server-side sink.
+	var buf []byte
+	chunk := make([]byte, 4096)
+	for !bytes.Contains(buf, []byte("\r\n\r\n")) {
+		conn.SetReadDeadline(time.Now().Add(timeout))
+		n, err := conn.Read(chunk)
+		buf = append(buf, chunk[:n]...)
+		if err != nil {
+			// Server closed (EOF), a timeout, or a broken connection before the
+			// headers completed: hand back a degraded handle (empty body) so the
+			// caller's close path stays uniform; the read will see EOF and report
+			// no events.
+			return &sseStream{conn: conn, buf: nil}, nil
+		}
+	}
+	_, body, _ := bytes.Cut(buf, []byte("\r\n\r\n"))
+	return &sseStream{conn: conn, buf: body}, nil
+}
+
+// readSSEEvents drains up to maxEvents parsed envelopes from an open *sseStream.
+// The handle's conn is live and its headers already consumed. This hand-decodes
+// the chunked transfer body and parses Server-Sent Events out of it: each
+// event's `data:` lines are concatenated and run through the codec, so the
+// returned slice is the parsed envelopes (typically :watch-event maps).
+//
+// A read deadline (re-armed before each conn.Read) or end of stream ends the
+// read and returns whatever arrived so far, so a quiet stream degrades to an
+// empty slice rather than hanging — it never blocks. A size-0 chunk is
+// http-kit's header-flush keep-alive, NOT end-of-stream, so we skip it and keep
+// reading. A genuine connection close (Read returns 0, err) ends the read. The
+// caller owns the conn and closes it; this only reads. Mirrors python's
+// read_sse_events.
+func readSSEEvents(stream *sseStream, maxEvents int) []interface{} {
+	conn := stream.conn
+
+	// fill reads more bytes onto the stream buffer; a deadline or EOF surfaces
+	// as a non-nil error so the read loops below stop cleanly.
+	fill := func() error {
+		conn.SetReadDeadline(time.Now().Add(sseTimeout))
+		chunk := make([]byte, 4096)
+		n, err := conn.Read(chunk)
+		stream.buf = append(stream.buf, chunk[:n]...)
+		if n == 0 && err != nil {
+			return err
+		}
+		return nil
+	}
+
+	// readLine pulls one CRLF-delimited line (for chunk-size lines).
+	readLine := func() ([]byte, error) {
+		for !bytes.Contains(stream.buf, []byte("\r\n")) {
+			if err := fill(); err != nil {
+				return nil, err
+			}
+		}
+		line, rest, _ := bytes.Cut(stream.buf, []byte("\r\n"))
+		stream.buf = rest
+		return line, nil
+	}
+
+	// readN pulls exactly n bytes (for chunk bodies, plus the trailing CRLF).
+	readN := func(n int) ([]byte, error) {
+		for len(stream.buf) < n {
+			if err := fill(); err != nil {
+				return nil, err
+			}
+		}
+		out := stream.buf[:n]
+		stream.buf = stream.buf[n:]
+		return out, nil
+	}
+
+	var events []interface{}
+	var text string // decoded body bytes awaiting SSE framing
+	for len(events) < maxEvents {
+		sizeLine, err := readLine()
+		if err != nil {
+			break // EOF or read deadline: return what we gathered
+		}
+		sizeStr := strings.TrimSpace(string(sizeLine))
+		if sizeStr == "" {
+			continue // stray blank line between chunks — ignore
+		}
+		size, err := strconv.ParseInt(sizeStr, 16, 64)
+		if err != nil {
+			break // malformed chunk-size line: stop cleanly
+		}
+		if size == 0 {
+			continue // header-flush keep-alive, not end-of-stream
+		}
+		bodyBytes, err := readN(int(size))
+		if err != nil {
+			break
+		}
+		text += string(bodyBytes)
+		if _, err := readN(2); err != nil { // the CRLF trailing every chunk body
+			break
+		}
+
+		// An SSE event is the run of lines up to the next blank line.
+		// Concatenate its `data:` payloads (dropping `:` comment lines) and
+		// parse the result as one EDN envelope.
+		for strings.Contains(text, "\n\n") {
+			block, rest, _ := strings.Cut(text, "\n\n")
+			text = rest
+			var data []string
+			for _, line := range strings.Split(block, "\n") {
+				if strings.HasPrefix(line, "data:") {
+					data = append(data, strings.TrimLeft(line[len("data:"):], " "))
+				}
+			}
+			if len(data) > 0 {
+				var evt interface{}
+				if err := edn.Unmarshal([]byte(strings.Join(data, "\n")), &evt); err == nil {
+					events = append(events, evt)
+				}
+				if len(events) >= maxEvents {
+					break
+				}
+			}
+		}
+	}
+	return events
 }
 
 // ---------------------------------------------------------------------------
@@ -998,8 +1356,9 @@ func mainUDS(socketPath string) {
 		render(get(body, "rows")), render(get(body, "done?")))
 
 	// 6. The paginated section is gated on the server advertising cursor
-	//    pagination — same as the HTTP path. Without it we skip the paged block
-	//    rather than guess at draining pages via (continue #cursor …).
+	//    pagination — same as the HTTP path. Without it we skip just the paged
+	//    block (the watch section below has its own gate) rather than guess at
+	//    draining pages via (continue #cursor …).
 	if info.supports(edn.Keyword("lemma/cursor-pagination")) {
 		// Seed three subset-of facts in one propose, then assert the batch, so the
 		// paginated query below spans more than one page. subset-of is a pure-EDB
@@ -1049,7 +1408,7 @@ func mainUDS(socketPath string) {
 		//    queryAll drains them via (continue #cursor …). The UDS call closure is
 		//    already form -> body, so it is passed directly.
 		qform := verb{edn.Symbol("query"), map[edn.Keyword]interface{}{
-			edn.Keyword("find"): []interface{}{edn.Symbol("?x")},
+			edn.Keyword("find"):  []interface{}{edn.Symbol("?x")},
 			edn.Keyword("where"): []interface{}{
 				[]interface{}{edn.Symbol("subset-of"), edn.Symbol("?x"), entity("group")},
 			},
@@ -1069,6 +1428,83 @@ func mainUDS(socketPath string) {
 	} else {
 		fmt.Println("server does not advertise cursor pagination; skipping paged query")
 	}
+
+	// 8. Watch over UDS. Same standing-pattern idea as the HTTP path, but the push
+	//    has nowhere separate to go: it interleaves with command replies on this
+	//    one socket. Gated on the server advertising :lemma/watch.
+	if !info.supports(edn.Keyword("lemma/watch")) {
+		fmt.Println("server does not advertise watch; skipping watch demo")
+		return
+	}
+
+	// (watch-pattern :pattern [[subset-of ?x #entity "group"]]) — flat keyword
+	// args, as on HTTP (the :pattern keyword then the where-vector, NOT a wrapping
+	// map). The reply carries the #watch handle.
+	pattern := []interface{}{
+		[]interface{}{edn.Symbol("subset-of"), edn.Symbol("?x"), entity("group")},
+	}
+	body, err = call(verb{edn.Symbol("watch-pattern"), edn.Keyword("pattern"), pattern})
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	if isFailure(body) {
+		fmt.Printf("watch-pattern refused: %s\n", describeFailure(body))
+		return
+	}
+	watch := get(body, "watch")
+	fmt.Printf("watch (subset-of ? group) -> %s  watch=%s\n",
+		render(get(body, "event")), render(watch))
+
+	// Trigger a fresh delta (a verbatim re-assert is a no-op and fires nothing),
+	// keyed to this process so each run is genuinely new. The :asserted reply and
+	// the :watch-event push both land on this socket; we read the assert reply
+	// here via call, then demux the push below via udsAwaitWatchEvent.
+	probe := entity(fmt.Sprintf("watch-probe-%d", os.Getpid()))
+	body, err = call(verb{edn.Symbol("propose"), fact(edn.Symbol("subset-of"), probe, entity("group"))})
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	if isFailure(body) {
+		fmt.Printf("watch-probe propose refused: %s\n", describeFailure(body))
+		return
+	}
+	body, err = call(verb{edn.Symbol("assert"), get(body, "proposal")})
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	if isFailure(body) {
+		fmt.Printf("watch-probe assert refused: %s\n", describeFailure(body))
+		return
+	}
+
+	// Demux the watch push off the same frame stream. udsAwaitWatchEvent sets its
+	// own read deadline before the loop, so a missing push degrades to nil rather
+	// than hanging.
+	if evt := udsAwaitWatchEvent(conn, 8); evt != nil {
+		fmt.Printf("watch (subset-of ? group) -> %s type=%s data=%s\n",
+			render(get(evt, "event")), render(get(evt, "type")), render(get(evt, "data")))
+	} else {
+		fmt.Println("watch: no event observed before timeout")
+	}
+
+	// Tear the watch down. (unwatch #watch "w-N") -> :ok. udsAwaitWatchEvent left
+	// an absolute read deadline on the conn (possibly already elapsed if the push
+	// was missed); re-arm it so this final read is bounded afresh rather than
+	// failing instantly on a stale deadline.
+	conn.SetReadDeadline(time.Now().Add(sseTimeout))
+	body, err = call(verb{edn.Symbol("unwatch"), watch})
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	if isFailure(body) {
+		fmt.Printf("unwatch refused: %s\n", describeFailure(body))
+		return
+	}
+	fmt.Printf("unwatch %s -> %s\n", render(watch), render(get(body, "event")))
 }
 
 // ---------------------------------------------------------------------------

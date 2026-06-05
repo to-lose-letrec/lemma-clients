@@ -22,7 +22,9 @@
 package main
 
 import (
+	"bytes"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -32,6 +34,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"olympos.io/encoding/edn"
 )
@@ -1412,4 +1415,584 @@ func captureStdout(t *testing.T, fn func()) string {
 	w.Close()
 	os.Stdout = orig
 	return <-done
+}
+
+// ===========================================================================
+// (K) Watch / SSE: openSSEStream, readSSEEvents, udsAwaitWatchEvent, and the
+//     end-to-end mainUDS watch demux.
+//
+// Parity reference: python/test_lemma_client.py's SseStreamTestBase +
+// OpenSseStreamTests + ReadSseEventsTests + UdsAwaitWatchEventTests +
+// UdsWatchPathEndToEndTests.
+//
+// The seams split by their input type:
+//
+//   - openSSEStream dials host:port parsed from the base URL, so its natural
+//     seam is a raw net.Listener on a TCP loopback address: a goroutine accepts
+//     the dialed conn and scripts canned bytes onto it (an httptest-style raw
+//     server). net.Pipe cannot be dialed, so the listener approach is the right
+//     one here.
+//   - readSSEEvents and udsAwaitWatchEvent take an already-open *sseStream /
+//     net.Conn, so net.Pipe (a synchronous in-memory conn pair, no socket) is
+//     the natural seam: a goroutine-scripted peer writes canned bytes/frames.
+//
+// Determinism: every deadline-expiry path under test uses a SHORT timeout
+// (sseShortTimeout) so a "must not hang" assertion resolves fast — that is a
+// bounded-read assertion, not a sleep. No real network beyond loopback; no
+// shared mutable state across tests.
+// ===========================================================================
+
+// sseShortTimeout bounds the openSSEStream dial/header reads in tests where a
+// deadline-expiry (degraded-handle) path is the behaviour under test. Short so
+// the "does not hang" assertions resolve quickly.
+const sseShortTimeout = 200 * time.Millisecond
+
+// watchEventEDN is one :watch-event envelope's EDN payload, mirroring python's
+// _WATCH_EVENT_EDN: a :type :assert event whose :data is a #fact. It parses back
+// (via the real codec) into a map whose :data is a Fact, exactly what
+// readSSEEvents / udsAwaitWatchEvent hand the caller.
+const watchEventEDN = `{:event :watch-event :type :assert ` +
+	`:data #fact {:predicate subset-of :subject #entity "wp" :object #entity "group"}}`
+
+// sseChunk wraps payload as one HTTP chunked-transfer frame: `hexlen\r\n<bytes>\r\n`
+// — the exact framing http-kit emits and readSSEEvents transfer-decodes. Mirrors
+// python's _chunk.
+func sseChunk(payload []byte) []byte {
+	var out bytes.Buffer
+	fmt.Fprintf(&out, "%x\r\n", len(payload))
+	out.Write(payload)
+	out.WriteString("\r\n")
+	return out.Bytes()
+}
+
+// sseBlock is one SSE event block for watchEventEDN: a leading `:`-comment
+// keep-alive line (which readSSEEvents must DROP), then the `data:` payload,
+// terminated by the SSE blank line. Mirrors python's _SSE_BLOCK.
+func sseBlock() []byte {
+	return []byte(": keep-alive comment -- must be ignored\n" +
+		"data: " + watchEventEDN + "\n" +
+		"\n")
+}
+
+// sseResponseHead is the SSE HTTP/1.1 status line + headers + blank-line
+// terminator that openSSEStream consumes. Mirrors python's _canned_sse_response
+// head.
+const sseResponseHead = "HTTP/1.1 200 OK\r\n" +
+	"Content-Type: text/event-stream\r\n" +
+	"Transfer-Encoding: chunked\r\n" +
+	"\r\n"
+
+// cannedSSEBody assembles the chunked body that follows the headers: a size-0
+// header-flush keep-alive chunk FIRST (which readSSEEvents must skip rather than
+// treat as EOF), then one transfer-chunk per SSE block. Mirrors python's
+// _canned_sse_response body (no terminating size-0 chunk — the stream just goes
+// quiet and the peer closes, signalling EOF). nBlocks controls how many event
+// blocks are framed.
+func cannedSSEBody(nBlocks int) []byte {
+	var body bytes.Buffer
+	body.Write(sseChunk(nil)) // size-0 header-flush keep-alive
+	for i := 0; i < nBlocks; i++ {
+		body.Write(sseChunk(sseBlock()))
+	}
+	return body.Bytes()
+}
+
+// cannedSSEResponse is the full on-wire SSE response: headers then the chunked
+// body for nBlocks event blocks. Mirrors python's _canned_sse_response.
+func cannedSSEResponse(nBlocks int) []byte {
+	return append([]byte(sseResponseHead), cannedSSEBody(nBlocks)...)
+}
+
+// --- openSSEStream: a raw net.Listener seam -------------------------------
+
+// sseListener stands up a raw TCP listener on loopback and, for the first
+// accepted connection, records the request bytes the client wrote and then
+// writes scriptBytes back. It returns the base URL ("http://host:port") to hand
+// openSSEStream plus a pointer to the recorded request (read only after the call
+// returns). The accept goroutine reads the request up to the blank-line
+// terminator before writing the script, so the recorded bytes hold the full GET.
+// The listener is closed via t.Cleanup. handleConn lets a test customise the
+// per-connection behaviour (e.g. close immediately mid-headers); when nil the
+// default record-then-script behaviour is used.
+func sseListener(t *testing.T, scriptBytes []byte) (string, *[]byte) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listening on loopback: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+
+	got := &[]byte{}
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return // listener closed by cleanup
+		}
+		defer conn.Close()
+		// Read the request up to the header terminator so the full GET is
+		// recorded before we reply. A bounded read keeps a misbehaving client
+		// from hanging the goroutine.
+		conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		buf := make([]byte, 4096)
+		for !bytes.Contains(*got, []byte("\r\n\r\n")) {
+			n, err := conn.Read(buf)
+			*got = append(*got, buf[:n]...)
+			if err != nil {
+				break
+			}
+		}
+		conn.Write(scriptBytes)
+		// Leave the conn open for the reader to drain; cleanup/defer closes it
+		// so the reader eventually sees EOF.
+	}()
+
+	return "http://" + ln.Addr().String(), got
+}
+
+// sseClosingListener stands up a loopback listener that, on the first accepted
+// connection, writes only a partial status line (NO blank-line header
+// terminator) and then closes — the immediate-close-during-headers case.
+// openSSEStream must hand back a degraded (empty-buf) handle rather than hang or
+// error. Returns the base URL.
+func sseClosingListener(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listening on loopback: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		// Write a partial header (no \r\n\r\n) then close, so the header read
+		// sees EOF before the terminator.
+		conn.Write([]byte("HTTP/1.1 200 OK\r\n"))
+		conn.Close()
+	}()
+
+	return "http://" + ln.Addr().String()
+}
+
+// openSSEStream must dial the base, write GET /v1/sessions/{id}/events carrying
+// the Accept: text/event-stream and X-Lemma-Session headers, and consume only
+// the status line + headers — leaving EXACTLY the leftover body bytes on the
+// handle's buffer.
+func TestOpenSSEStream_WritesGETWithHeadersAndBuffersLeftoverBody(t *testing.T) {
+	body := cannedSSEBody(1)
+	base, sentReq := sseListener(t, append([]byte(sseResponseHead), body...))
+
+	stream, err := openSSEStream(base, "s-9", sseTimeout)
+	if err != nil {
+		t.Fatalf("openSSEStream: %v", err)
+	}
+	t.Cleanup(stream.close)
+
+	req := string(*sentReq)
+	if !strings.Contains(req, "GET /v1/sessions/s-9/events HTTP/1.1") {
+		t.Errorf("request line missing or wrong: %q", req)
+	}
+	if !strings.Contains(req, "Accept: text/event-stream") {
+		t.Errorf("request missing Accept: text/event-stream: %q", req)
+	}
+	if !strings.Contains(req, "X-Lemma-Session: s-9") {
+		t.Errorf("request missing X-Lemma-Session header: %q", req)
+	}
+	// The handle holds EXACTLY the body bytes past the header terminator —
+	// headers consumed, body retained for the chunked decoder.
+	if !bytes.Equal(stream.buf, body) {
+		t.Errorf("handle buffer = %q, want exactly the leftover body %q", stream.buf, body)
+	}
+	// Sanity: no header bytes leaked into the buffer.
+	if bytes.Contains(stream.buf, []byte("HTTP/1.1")) {
+		t.Errorf("handle buffer retained header bytes: %q", stream.buf)
+	}
+}
+
+// An immediate connection close DURING the header read must yield a degraded
+// handle (empty buffer) rather than an error, and a subsequent readSSEEvents on
+// it must return empty without hanging.
+func TestOpenSSEStream_ImmediateCloseDuringHeaders_YieldsDegradedHandle(t *testing.T) {
+	base := sseClosingListener(t)
+
+	stream, err := openSSEStream(base, "s-1", sseShortTimeout)
+	if err != nil {
+		t.Fatalf("openSSEStream returned an error on early close, want a degraded handle: %v", err)
+	}
+	t.Cleanup(stream.close)
+	if len(stream.buf) != 0 {
+		t.Errorf("degraded handle buffer = %q, want empty", stream.buf)
+	}
+
+	// The degraded handle must drain to empty without hanging: the conn is
+	// already closed, so the read sees EOF.
+	events := readSSEEvents(stream, 1)
+	if len(events) != 0 {
+		t.Errorf("readSSEEvents on a degraded handle = %#v, want empty", events)
+	}
+}
+
+// A dial failure (nothing listening at the base) is the one error openSSEStream
+// returns, naming the base so the failure is actionable.
+func TestOpenSSEStream_DialFailure_ReturnsErrorNamingBase(t *testing.T) {
+	// Bind a listener to capture a free address, then close it so the dial is
+	// refused — deterministic, no fixed port.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listening on loopback: %v", err)
+	}
+	base := "http://" + ln.Addr().String()
+	ln.Close()
+
+	stream, err := openSSEStream(base, "s-1", sseShortTimeout)
+	if err == nil {
+		stream.close()
+		t.Fatalf("expected a dial error against a closed listener %q, got a handle", base)
+	}
+	if !strings.Contains(err.Error(), base) {
+		t.Errorf("error %q does not name the base %q", err.Error(), base)
+	}
+}
+
+// --- readSSEEvents: a net.Pipe seam ---------------------------------------
+
+// pipeStream builds an *sseStream over one half of a net.Pipe and a
+// goroutine-scripted peer that writes scriptBytes then closes its end (so the
+// reader eventually sees EOF and the bounded read terminates). The initial
+// handle buffer is empty — all body bytes arrive through the conn — exercising
+// the fill()/readN()/readLine() loops for real. Both ends are closed via
+// t.Cleanup.
+func pipeStream(t *testing.T, scriptBytes []byte) *sseStream {
+	t.Helper()
+	client, peer := net.Pipe()
+	t.Cleanup(func() { client.Close(); peer.Close() })
+	go func() {
+		// A single Write may block until the reader consumes it (net.Pipe is
+		// synchronous); writing then closing drip-feeds the script and signals
+		// EOF deterministically without a sleep.
+		peer.Write(scriptBytes)
+		peer.Close()
+	}()
+	return &sseStream{conn: client}
+}
+
+// readSSEEvents must transfer-decode the chunked body and parse the :watch-event
+// envelope off it, reconstructing the typed :data #fact via the real codec.
+func TestReadSSEEvents_ParsesWatchEventOffChunkedStream(t *testing.T) {
+	stream := pipeStream(t, cannedSSEBody(1))
+
+	events := readSSEEvents(stream, 1)
+
+	if len(events) != 1 {
+		t.Fatalf("readSSEEvents returned %d event(s), want 1: %#v", len(events), events)
+	}
+	evt := events[0]
+	if get(evt, "event") != edn.Keyword("watch-event") {
+		t.Errorf("event :event = %#v, want :watch-event", get(evt, "event"))
+	}
+	if get(evt, "type") != edn.Keyword("assert") {
+		t.Errorf("event :type = %#v, want :assert", get(evt, "type"))
+	}
+	// The :data carried a #fact, which round-trips into the typed Fact.
+	wantData := get(parse(t, []byte(watchEventEDN)), "data")
+	if !reflect.DeepEqual(get(evt, "data"), wantData) {
+		t.Errorf("event :data = %#v, want %#v", get(evt, "data"), wantData)
+	}
+}
+
+// The size-0 keep-alive chunk that LEADS the body (before the event chunk) must
+// be skipped, not treated as end-of-stream: the event still arrives. cannedSSEBody
+// puts a size-0 chunk first, so getting the event back proves the skip.
+func TestReadSSEEvents_LeadingSizeZeroChunkIsSkippedNotEOF(t *testing.T) {
+	stream := pipeStream(t, cannedSSEBody(1))
+
+	events := readSSEEvents(stream, 1)
+
+	if len(events) != 1 {
+		t.Fatalf("size-0 keep-alive chunk ended the stream early: got %d event(s), want 1", len(events))
+	}
+	if get(events[0], "event") != edn.Keyword("watch-event") {
+		t.Errorf("event :event = %#v, want :watch-event", get(events[0], "event"))
+	}
+}
+
+// A `:`-comment keep-alive line inside the SSE block must be dropped: only the
+// `data:` line feeds the parse. A clean :watch-event parse (the block carries a
+// leading `: keep-alive comment` line) proves the comment was not folded into the
+// EDN — which would have made the parse fail or the envelope malformed.
+func TestReadSSEEvents_ColonCommentLineIsDropped(t *testing.T) {
+	stream := pipeStream(t, cannedSSEBody(1))
+
+	events := readSSEEvents(stream, 1)
+
+	if len(events) != 1 {
+		t.Fatalf("comment line broke the parse: got %d event(s), want 1", len(events))
+	}
+	if get(events[0], "event") != edn.Keyword("watch-event") {
+		t.Errorf("event :event = %#v, want :watch-event", get(events[0], "event"))
+	}
+}
+
+// maxEvents is honoured: two events are scripted but maxEvents=1 returns exactly
+// one, even though more data remains on the wire.
+func TestReadSSEEvents_HonorsMaxEvents_ReturnsOneOfTwo(t *testing.T) {
+	stream := pipeStream(t, cannedSSEBody(2))
+
+	events := readSSEEvents(stream, 1)
+
+	if len(events) != 1 {
+		t.Fatalf("readSSEEvents(maxEvents=1) returned %d event(s), want 1", len(events))
+	}
+}
+
+// With maxEvents=2 and two events scripted, both are drained and both are
+// :watch-event envelopes.
+func TestReadSSEEvents_DrainsBothWhenMaxEventsAllows(t *testing.T) {
+	stream := pipeStream(t, cannedSSEBody(2))
+
+	events := readSSEEvents(stream, 2)
+
+	if len(events) != 2 {
+		t.Fatalf("readSSEEvents(maxEvents=2) returned %d event(s), want 2", len(events))
+	}
+	for i, evt := range events {
+		if get(evt, "event") != edn.Keyword("watch-event") {
+			t.Errorf("event %d :event = %#v, want :watch-event", i, get(evt, "event"))
+		}
+	}
+}
+
+// Stream end (peer close) before any event arrives must return empty WITHOUT
+// hanging: headers + a lone size-0 keep-alive chunk, then EOF. The bounded read
+// terminates and yields an empty slice.
+func TestReadSSEEvents_StreamEndBeforeEvent_ReturnsEmptyWithoutHanging(t *testing.T) {
+	// Just the size-0 header-flush chunk, no event chunk, then the peer closes.
+	stream := pipeStream(t, sseChunk(nil))
+
+	events := readSSEEvents(stream, 1)
+
+	if len(events) != 0 {
+		t.Errorf("readSSEEvents on an event-less stream = %#v, want empty", events)
+	}
+}
+
+// --- udsAwaitWatchEvent: a net.Pipe seam ----------------------------------
+
+// pipeWatchConn returns one half of a net.Pipe whose peer writes each EDN string
+// in edns as a length-prefixed UDS frame, in order, then closes. The returned
+// conn is what udsAwaitWatchEvent reads from. Both ends close via t.Cleanup.
+func pipeWatchConn(t *testing.T, edns []string) net.Conn {
+	t.Helper()
+	client, peer := net.Pipe()
+	t.Cleanup(func() { client.Close(); peer.Close() })
+	go func() {
+		for _, e := range edns {
+			if _, err := peer.Write(frame(e)); err != nil {
+				return
+			}
+		}
+		peer.Close()
+	}()
+	return client
+}
+
+// udsAwaitWatchEvent must skip leading command-reply frames and return the
+// :watch-event once it arrives.
+func TestUDSAwaitWatchEvent_SkipsLeadingCommandRepliesReturnsEvent(t *testing.T) {
+	conn := pipeWatchConn(t, []string{
+		`{:event :asserted}`,       // a command echo — must be skipped
+		`{:event :world-selected}`, // another non-event — skipped
+		watchEventEDN,              // the event we want
+	})
+
+	evt := udsAwaitWatchEvent(conn, 8)
+
+	if evt == nil {
+		t.Fatalf("udsAwaitWatchEvent returned nil, want the watch-event")
+	}
+	if get(evt, "event") != edn.Keyword("watch-event") {
+		t.Errorf("event :event = %#v, want :watch-event", get(evt, "event"))
+	}
+	if get(evt, "type") != edn.Keyword("assert") {
+		t.Errorf("event :type = %#v, want :assert", get(evt, "type"))
+	}
+}
+
+// When the :watch-event is the very first frame, udsAwaitWatchEvent returns it
+// immediately.
+func TestUDSAwaitWatchEvent_ReturnsEventWhenFirstFrame(t *testing.T) {
+	conn := pipeWatchConn(t, []string{watchEventEDN})
+
+	evt := udsAwaitWatchEvent(conn, 8)
+
+	if evt == nil {
+		t.Fatalf("udsAwaitWatchEvent returned nil, want the watch-event")
+	}
+	if get(evt, "event") != edn.Keyword("watch-event") {
+		t.Errorf("event :event = %#v, want :watch-event", get(evt, "event"))
+	}
+}
+
+// With only non-event frames and a maxFrames bound below their count (we script
+// maxFrames+1 non-events), the bounded loop gives up and returns nil rather than
+// hanging or running past the bound.
+func TestUDSAwaitWatchEvent_NoEventWithinMaxFrames_ReturnsNil(t *testing.T) {
+	const maxFrames = 3
+	// maxFrames+1 non-event frames available: the loop must stop at maxFrames.
+	conn := pipeWatchConn(t, []string{
+		`{:event :asserted}`,
+		`{:event :asserted}`,
+		`{:event :asserted}`,
+		`{:event :asserted}`,
+	})
+
+	evt := udsAwaitWatchEvent(conn, maxFrames)
+
+	if evt != nil {
+		t.Errorf("udsAwaitWatchEvent = %#v, want nil (no event within %d frames)", evt, maxFrames)
+	}
+}
+
+// A frame stream that closes (EOF) before any frame arrives makes udsRecvFrame
+// error, which udsAwaitWatchEvent swallows and reports as nil — no hang.
+func TestUDSAwaitWatchEvent_PrematureClose_ReturnsNil(t *testing.T) {
+	conn := pipeWatchConn(t, nil) // peer closes immediately -> EOF
+
+	evt := udsAwaitWatchEvent(conn, 8)
+
+	if evt != nil {
+		t.Errorf("udsAwaitWatchEvent = %#v, want nil on premature close", evt)
+	}
+}
+
+// --- mainUDS watch end-to-end: the scriptedUDSServer seam -----------------
+
+// The watch-tail reply fixtures, mirroring python's _UDS_WATCH_* constants. The
+// welcome advertises BOTH pagination and watch so the full sequence runs; the
+// :watch-event is interleaved AFTER a stray command echo and BEFORE the unwatch
+// reply, so the demux must discard at least one frame before landing on it.
+const (
+	udsWelcomeWithWatch = `{:event :welcome :version 1 :session #session "s-uds-1" :world #world "default" ` +
+		`:capabilities #{:lemma/v1 :lemma/cursor-pagination :lemma/watch} :limits {:max-message-bytes 1048576} ` +
+		`:verbs {:core #{hello use-world propose assert query continue watch-pattern unwatch} :extensions {}}}`
+	udsWatchEstablished = `{:event :watch-established :watch #watch "w-1"}`
+	udsWatchProbeProp   = `{:event :proposed :proposal #proposal "p-3"}`
+	udsStrayEcho        = `{:event :asserted}`
+	udsUnwatched        = `{:event :ok}`
+	udsPage1            = `{:event :result :rows [[#entity "sub-a"] [#entity "sub-b"]] :done? false :cursor #cursor "c-1"}`
+	udsPage2            = `{:event :result :rows [[#entity "sub-c"]] :done? true}`
+)
+
+// scriptedUDSWatchServer is the watch-aware sibling of scriptedUDSServer. Over
+// UDS the :watch-event push is NOT a reply to a request — it interleaves on the
+// shared frame stream, and the client's udsAwaitWatchEvent reads frames WITHOUT
+// sending. A strict one-reply-per-request server cannot deliver that push, so
+// here the script is a SLICE OF FRAME GROUPS: for each inbound request frame the
+// server writes ALL frames in the next group. A group with more than one frame
+// is how an extra push (the stray echo + the watch-event) rides out on the back
+// of the triggering request without the client having to send for it. Records
+// every decoded request frame in *recvd (read only after mainUDS returns).
+func scriptedUDSWatchServer(t *testing.T, groups [][]string) (string, *[]string) {
+	t.Helper()
+	dir := t.TempDir()
+	sockPath := filepath.Join(dir, "dianoia.sock")
+	ln, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatalf("listening on %q: %v", sockPath, err)
+	}
+	t.Cleanup(func() { ln.Close() })
+
+	recvd := &[]string{}
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return // listener closed by cleanup
+		}
+		defer conn.Close()
+		for _, group := range groups {
+			req, err := udsRecvFrame(conn)
+			if err != nil {
+				return // client hung up early
+			}
+			*recvd = append(*recvd, req)
+			for _, reply := range group {
+				if err := udsSendFrame(conn, reply); err != nil {
+					return
+				}
+			}
+		}
+	}()
+	return sockPath, recvd
+}
+
+// mainUDS against a scripted listener whose welcome advertises both pagination
+// AND watch must: run the paged tail, register the watch, demux the interleaved
+// :watch-event off the shared frame stream (past the stray echo), print the
+// observed event line, and tear the watch down with an (unwatch #watch …). We
+// assert the printed event line plus that a (watch-pattern …) frame and an
+// (unwatch …) frame were both sent.
+//
+// The client sends 12 request frames before the watch demux (hello, use-world,
+// propose, assert, query, propose-3x, assert, paged-query, continue,
+// watch-pattern, watch-probe propose, watch-probe assert), then reads the push
+// frames WITHOUT sending, then sends the unwatch. So the assert-probe request's
+// reply GROUP carries three frames — the :asserted echo, a stray command echo,
+// and the interleaved :watch-event — and the demux must discard the echoes
+// before landing on the event.
+func TestMainUDS_WatchPath_DemuxesEventAndUnwatchesEndToEnd(t *testing.T) {
+	groups := [][]string{
+		{udsWelcomeWithWatch}, {udsWorldSelected}, {udsProposed}, {udsAsserted}, {udsResult},
+		{udsProposed}, {udsAsserted}, {udsPage1}, {udsPage2},
+		{udsWatchEstablished}, {udsWatchProbeProp},
+		// The watch-probe assert reply, plus the two interleaved pushes that the
+		// demux reads without sending: a stray command echo then the watch-event.
+		{udsAsserted, udsStrayEcho, watchEventEDN},
+		{udsUnwatched},
+	}
+	sockPath, recvd := scriptedUDSWatchServer(t, groups)
+
+	out := captureStdout(t, func() { mainUDS(sockPath) })
+
+	// The interleaved :watch-event was picked out and reported (not "no event").
+	if !strings.Contains(out, ":watch-event") {
+		t.Errorf("output did not report the demuxed watch-event: %q", out)
+	}
+	if strings.Contains(out, "no event observed") {
+		t.Errorf("watch demux missed the interleaved event: %q", out)
+	}
+	if !strings.Contains(out, "unwatch") {
+		t.Errorf("output did not reach the unwatch line: %q", out)
+	}
+
+	sent := *recvd
+	var sawWatchPattern, sawUnwatch bool
+	for _, fr := range sent {
+		if strings.HasPrefix(fr, "(watch-pattern") {
+			sawWatchPattern = true
+		}
+		if strings.HasPrefix(fr, "(unwatch") {
+			sawUnwatch = true
+		}
+	}
+	if !sawWatchPattern {
+		t.Errorf("no (watch-pattern …) frame was sent; frames: %#v", sent)
+	}
+	if !sawUnwatch {
+		t.Errorf("no (unwatch …) frame was sent; frames: %#v", sent)
+	}
+
+	// The unwatch frame carries the #watch handle from the watch-established
+	// reply. It is the last frame the client sent.
+	if len(sent) == 0 {
+		t.Fatalf("server received no frames")
+	}
+	last := parse(t, []byte(sent[len(sent)-1])).([]interface{})
+	if len(last) != 2 || last[0] != edn.Symbol("unwatch") {
+		t.Fatalf("last frame = %#v, want (unwatch #watch …)", last)
+	}
+	if last[1] != (Handle{Name: "watch", Value: "w-1"}) {
+		t.Errorf("unwatch handle = %#v, want #watch \"w-1\"", last[1])
+	}
 }
