@@ -5,8 +5,9 @@
 // server speaks, and to turn the server's EDN responses back into Go values.
 // Rather than hand-roll that codec, this client leans on go-edn
 // (olympos.io/encoding/edn — the one third-party dependency); everything else
-// is the standard library. On top of the codec sits an HTTP transport and a
-// runnable main() that walks the full propose/assert/query round-trip.
+// is the standard library. On top of the codec sit an HTTP transport, a UDS
+// transport, and a runnable main() that walks the propose/assert/query
+// round-trip over either.
 //
 // EDN in a nutshell
 // -----------------
@@ -62,8 +63,10 @@ package main
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 
@@ -492,18 +495,223 @@ func mainRun(base string) {
 }
 
 // ---------------------------------------------------------------------------
+// UDS transport:  EDN form  ->  length-prefixed frame  ->  parsed EDN response
+//
+// A second transport that speaks the same EDN codec over a Unix domain socket
+// instead of HTTP. It sits alongside postEDN rather than replacing it — same
+// "encode, send, decode" shape, different plumbing. Two things differ from HTTP:
+//
+//   - Framing. There is no HTTP envelope, so each message is delimited
+//     explicitly: a 4-byte big-endian UNSIGNED length prefix followed by that
+//     many UTF-8 bytes of EDN. This matches Dianoia's transport/uds.clj
+//     write-frame / read-frame exactly (DataOutputStream.writeInt is a 4-byte
+//     big-endian int).
+//   - Session binding. Over HTTP the client threads the session id back into
+//     each request header. Over UDS the server binds the session to the
+//     *connection*: it captures the id from the welcome envelope and attaches
+//     it to the socket (see uds.clj handle-frame / build-ctx). So the client
+//     must NOT echo the session id into later frames — it just keeps sending on
+//     the same socket, and the server already knows who it is.
+//
+// Stdlib only for the plumbing: net for the connection, encoding/binary for the
+// length prefix; the EDN codec is the same go-edn used everywhere above.
+// ---------------------------------------------------------------------------
+
+// DefaultSocket is where a locally booted Dianoia UDS listener binds by default
+// (see uds.clj start! :socket-path). Override per call via the socketPath
+// argument to mainUDS.
+const DefaultSocket = "/tmp/dianoia.sock"
+
+// udsSendFrame frames ednStr and writes it: a 4-byte big-endian length prefix,
+// then the body. The body is the UTF-8 encoding of ednStr (Go strings are
+// already UTF-8); the prefix is its byte length as a big-endian uint32.
+// binary.Write emits the four prefix bytes, and conn.Write on a stream socket
+// keeps writing until every byte is accepted, so a single Write of the body
+// suffices. Mirrors uds.clj write-frame.
+func udsSendFrame(conn net.Conn, ednStr string) error {
+	body := []byte(ednStr)
+	if err := binary.Write(conn, binary.BigEndian, uint32(len(body))); err != nil {
+		return fmt.Errorf("writing frame length prefix: %w", err)
+	}
+	if _, err := conn.Write(body); err != nil {
+		return fmt.Errorf("writing frame body: %w", err)
+	}
+	return nil
+}
+
+// udsRecvFrame reads one length-prefixed frame and returns its body as a string.
+// The inverse of udsSendFrame: read the 4-byte big-endian length, then read
+// exactly that many body bytes, then interpret them as UTF-8 (a Go string holds
+// the bytes verbatim). io.ReadFull is the loop-until-satisfied read — a single
+// conn.Read may return fewer bytes than asked, and a peer that closes mid-frame
+// surfaces as io.ErrUnexpectedEOF. We name how many bytes were still expected
+// (prefix vs. body) so a truncated frame is actionable, mirroring python's
+// _recv_exactly message shape. Mirrors uds.clj read-frame.
+func udsRecvFrame(conn net.Conn) (string, error) {
+	var prefix [4]byte
+	if _, err := io.ReadFull(conn, prefix[:]); err != nil {
+		// A clean io.EOF here means the peer closed before any of the next
+		// frame arrived; io.ErrUnexpectedEOF means it closed mid-prefix.
+		return "", fmt.Errorf(
+			"reading frame length prefix (4 bytes expected): %w", err)
+	}
+	length := binary.BigEndian.Uint32(prefix[:])
+	body := make([]byte, length)
+	if _, err := io.ReadFull(conn, body); err != nil {
+		return "", fmt.Errorf(
+			"reading frame body (%d bytes expected): %w", length, err)
+	}
+	return string(body), nil
+}
+
+// ---------------------------------------------------------------------------
+// Runnable recipe:  the full Lemma round-trip, over UDS
+//
+// Step for step this is mainRun — hello → use-world → propose → assert → query,
+// one printed line per step, stopping cleanly on a failure envelope — but spoken
+// over a UDS frame stream. The one protocol difference is session handling: the
+// server binds the session to the connection from the welcome envelope (uds.clj
+// handle-frame), so we do NOT thread the session id into later frames, and the
+// :welcome carries the session in its BODY (:session) rather than in a header as
+// HTTP does. Every call after hello simply rides the same open socket.
+// ---------------------------------------------------------------------------
+
+// mainUDS walks the propose/assert/query round-trip against a Lemma server over
+// a Unix domain socket. socketPath is the listener's path (e.g.
+// /tmp/dianoia.sock).
+func mainUDS(socketPath string) {
+	// Dial the socket. A failure here — the socket file is missing, or nothing
+	// is accepting on it — is the one transport error we name up front, pointing
+	// at the path so the failure is actionable rather than a bare errno.
+	conn, err := net.Dial("unix", socketPath)
+	if err != nil {
+		fmt.Printf(
+			"could not connect to the Lemma UDS server at %q (%v); is the server running?\n",
+			socketPath, err)
+		return
+	}
+	// The socket is always closed when we leave, whatever the round-trip does;
+	// closing also lets the server's reader observe EOF and drop the session.
+	defer conn.Close()
+
+	// One round-trip: frame out, frame in, parse. The session lives on the
+	// connection — no id is echoed back, unlike the HTTP transport. A transport
+	// error (write/read/parse) is returned so the caller can stop cleanly.
+	call := func(form interface{}) (interface{}, error) {
+		payload, err := edn.Marshal(form)
+		if err != nil {
+			return nil, fmt.Errorf("encoding EDN request: %w", err)
+		}
+		if err := udsSendFrame(conn, string(payload)); err != nil {
+			return nil, err
+		}
+		raw, err := udsRecvFrame(conn)
+		if err != nil {
+			return nil, err
+		}
+		var body interface{}
+		if err := edn.Unmarshal([]byte(raw), &body); err != nil {
+			return nil, fmt.Errorf("parsing EDN response %q: %w", raw, err)
+		}
+		return body, nil
+	}
+
+	// 1. Anonymous hello. The welcome reply carries the session id, which the
+	//    server has already pinned to this connection for us — so unlike HTTP we
+	//    read it from the body (:session), not a header.
+	body, err := call(verb{edn.Symbol("hello")})
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	if get(body, "event") != edn.Keyword("welcome") {
+		fmt.Printf("hello: expected :welcome, got %s -- %s\n",
+			render(get(body, "event")), describeFailure(body))
+		return
+	}
+	fmt.Printf("hello -> :welcome  version=%s  session=%s  world=%s\n",
+		render(get(body, "version")), render(get(body, "session")),
+		render(get(body, "world")))
+
+	// 2. Enter the world. (use-world #world "default")
+	body, err = call(verb{edn.Symbol("use-world"), world("default")})
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	if isFailure(body) {
+		fmt.Printf("use-world refused: %s\n", describeFailure(body))
+		return
+	}
+	fmt.Printf("use-world \"default\" -> %s  world=%s\n",
+		render(get(body, "event")), render(get(body, "world")))
+
+	// 3. Propose a fact: morningstar is equivalent to venus. The reply hands
+	//    back a #proposal handle we feed straight into the assert.
+	f := fact(edn.Symbol("equivalent"), entity("morningstar"), entity("venus"))
+	body, err = call(verb{edn.Symbol("propose"), f})
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	if isFailure(body) {
+		fmt.Printf("propose refused: %s\n", describeFailure(body))
+		return
+	}
+	proposal := get(body, "proposal")
+	fmt.Printf("propose (equivalent morningstar venus) -> %s  proposal=%s\n",
+		render(get(body, "event")), render(proposal))
+
+	// 4. Assert the proposed fact into the world.
+	body, err = call(verb{edn.Symbol("assert"), proposal})
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	if isFailure(body) {
+		fmt.Printf("assert refused: %s\n", describeFailure(body))
+		return
+	}
+	fmt.Printf("assert proposal -> %s\n", render(get(body, "event")))
+
+	// 5. Query it back. As in the HTTP path, :find / :where are VECTORS
+	//    ([]interface{}) and the where-clause is a vector of vectors; only the
+	//    verb head is a list, and the query variable ?o stays a Symbol.
+	body, err = call(verb{edn.Symbol("query"), map[edn.Keyword]interface{}{
+		edn.Keyword("find"): []interface{}{edn.Symbol("?o")},
+		edn.Keyword("where"): []interface{}{
+			[]interface{}{edn.Symbol("equivalent"), entity("morningstar"), edn.Symbol("?o")},
+		},
+	}})
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	if isFailure(body) {
+		fmt.Printf("query refused: %s\n", describeFailure(body))
+		return
+	}
+	fmt.Printf("query (equivalent morningstar ?o) -> rows=%s  done?=%s\n",
+		render(get(body, "rows")), render(get(body, "done?")))
+}
+
+// ---------------------------------------------------------------------------
 // Dispatcher
 //
 // dispatch routes the CLI args to a transport. No args runs the HTTP round-trip
-// against DefaultBase. A leading "uds" is reserved for the Unix-domain-socket
-// transport (not yet implemented). Any other leading argument is an HTTP base
-// URL.
+// against DefaultBase. A leading "uds" selects the Unix-domain-socket transport,
+// taking an optional second argument as the socket path (else DefaultSocket).
+// Any other leading argument is an HTTP base URL.
 // ---------------------------------------------------------------------------
 
 func dispatch(args []string) {
 	switch {
 	case len(args) > 0 && args[0] == "uds":
-		fmt.Println("uds transport: not yet implemented")
+		if len(args) > 1 {
+			mainUDS(args[1])
+		} else {
+			mainUDS(DefaultSocket)
+		}
 	case len(args) > 0:
 		mainRun(args[0])
 	default:

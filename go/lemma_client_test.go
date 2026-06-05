@@ -22,10 +22,13 @@
 package main
 
 import (
+	"encoding/binary"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -464,4 +467,325 @@ func TestDispatch_IsDrivenByExplicitArgsNotProcessArgv(t *testing.T) {
 	// This is a documentation guard, not a behavioural assertion: it simply
 	// records that the dispatch tests above pass explicit slices. Nothing to
 	// assert beyond the suite compiling and the other dispatch tests passing.
+}
+
+// ===========================================================================
+// (D) UDS framing: udsSendFrame / udsRecvFrame over an in-memory net.Pipe.
+//
+// Parity reference: python/test_lemma_client.py's UdsSendFrameTests,
+// UdsRecvFrameTests, and RecvExactlyTests. net.Pipe gives us a synchronous,
+// unbuffered conn pair with no real socket: a Write blocks until the peer
+// Reads it, so a goroutine-scripted peer drives the exchange deterministically
+// (no sleeps). Closing one end surfaces as EOF / io.ErrUnexpectedEOF on the
+// other, which is exactly how we exercise the truncation paths.
+//
+// frame builds the wire bytes (4-byte big-endian length prefix + UTF-8 body)
+// the way udsSendFrame does, so a scripted peer can hand the reader byte-correct
+// input without going through the sender.
+// ===========================================================================
+
+// frame builds a length-prefixed UDS frame for ednStr: a 4-byte big-endian
+// uint32 byte-length prefix followed by the UTF-8 body. Mirrors udsSendFrame's
+// wire shape so a scripted peer can emit canned frames directly.
+func frame(ednStr string) []byte {
+	body := []byte(ednStr)
+	out := make([]byte, 4+len(body))
+	binary.BigEndian.PutUint32(out[:4], uint32(len(body)))
+	copy(out[4:], body)
+	return out
+}
+
+// A frame written by udsSendFrame must read back through udsRecvFrame as the
+// EXACT same EDN string. A goroutine-scripted peer sends on its half of the
+// pipe while the test reads on the other; net.Pipe's synchronous semantics mean
+// no sleep is needed.
+func TestUDSFrame_RoundTripsEDNStringAcrossPipe(t *testing.T) {
+	ednStr := string(marshal(t, verb{edn.Symbol("hello")}))
+	client, peer := net.Pipe()
+	t.Cleanup(func() { client.Close(); peer.Close() })
+
+	sendErr := make(chan error, 1)
+	go func() { sendErr <- udsSendFrame(peer, ednStr) }()
+
+	got, err := udsRecvFrame(client)
+	if err != nil {
+		t.Fatalf("udsRecvFrame: %v", err)
+	}
+	if err := <-sendErr; err != nil {
+		t.Fatalf("udsSendFrame: %v", err)
+	}
+	if got != ednStr {
+		t.Errorf("round-trip = %q, want %q", got, ednStr)
+	}
+}
+
+// The frame prefix must be EXACTLY four bytes, big-endian, carrying the body's
+// byte length. We capture the raw bytes udsSendFrame puts on the wire for a
+// known-length body and assert the first four bytes equal the big-endian
+// encoding of that length.
+func TestUDSFrame_PrefixIsFourByteBigEndianLength(t *testing.T) {
+	// A 5-byte ASCII body: prefix must be 00 00 00 05.
+	const ednStr = "hello"
+	client, peer := net.Pipe()
+	t.Cleanup(func() { client.Close(); peer.Close() })
+
+	sendErr := make(chan error, 1)
+	go func() { sendErr <- udsSendFrame(peer, ednStr) }()
+
+	raw := make([]byte, 4+len(ednStr))
+	if _, err := io.ReadFull(client, raw); err != nil {
+		t.Fatalf("reading raw frame: %v", err)
+	}
+	if err := <-sendErr; err != nil {
+		t.Fatalf("udsSendFrame: %v", err)
+	}
+	wantPrefix := []byte{0x00, 0x00, 0x00, 0x05}
+	if string(raw[:4]) != string(wantPrefix) {
+		t.Errorf("prefix = % x, want % x", raw[:4], wantPrefix)
+	}
+	if string(raw[4:]) != ednStr {
+		t.Errorf("body = %q, want %q", raw[4:], ednStr)
+	}
+}
+
+// udsRecvFrame must reassemble a frame delivered in several small chunks: a
+// single conn.Read can return fewer bytes than asked, and io.ReadFull loops
+// until satisfied. The peer writes the prefix one byte at a time, then the body
+// in two pieces; the reader must still reconstruct the whole EDN string.
+func TestUDSRecvFrame_ReassemblesFrameSplitAcrossChunks(t *testing.T) {
+	ednStr := `{:event :result :rows [["venus"]] :done? true}`
+	wire := frame(ednStr)
+	client, peer := net.Pipe()
+	t.Cleanup(func() { client.Close(); peer.Close() })
+
+	go func() {
+		// Four single-byte prefix writes, then the body in two halves. Each
+		// Write blocks on the reader's matching Read (net.Pipe is synchronous),
+		// so this drip-feeds without any sleep.
+		for i := 0; i < 4; i++ {
+			peer.Write(wire[i : i+1])
+		}
+		body := wire[4:]
+		mid := len(body) / 2
+		peer.Write(body[:mid])
+		peer.Write(body[mid:])
+	}()
+
+	got, err := udsRecvFrame(client)
+	if err != nil {
+		t.Fatalf("udsRecvFrame: %v", err)
+	}
+	if got != ednStr {
+		t.Errorf("reassembled = %q, want %q", got, ednStr)
+	}
+}
+
+// A peer that closes mid-prefix (fewer than 4 prefix bytes delivered) must make
+// udsRecvFrame return an error naming the prefix read and the 4 expected bytes
+// — io.ReadFull surfaces the early close as io.ErrUnexpectedEOF.
+func TestUDSRecvFrame_PrematureEOFInPrefix_Errors(t *testing.T) {
+	client, peer := net.Pipe()
+	t.Cleanup(func() { client.Close() })
+
+	go func() {
+		peer.Write([]byte{0x00, 0x00}) // two of four prefix bytes
+		peer.Close()                   // close mid-prefix -> reader sees EOF
+	}()
+
+	_, err := udsRecvFrame(client)
+	if err == nil {
+		t.Fatalf("expected an error on a truncated prefix, got nil")
+	}
+	if !strings.Contains(err.Error(), "4 bytes expected") {
+		t.Errorf("error %q does not name the 4 expected prefix bytes", err.Error())
+	}
+}
+
+// A peer that sends a full prefix but then closes mid-body must make
+// udsRecvFrame return an error naming the body read and the declared length.
+func TestUDSRecvFrame_PrematureEOFInBody_Errors(t *testing.T) {
+	client, peer := net.Pipe()
+	t.Cleanup(func() { client.Close() })
+
+	go func() {
+		// Declare a 10-byte body, then deliver only 5 before closing.
+		peer.Write([]byte{0x00, 0x00, 0x00, 0x0a})
+		peer.Write([]byte("short"))
+		peer.Close()
+	}()
+
+	_, err := udsRecvFrame(client)
+	if err == nil {
+		t.Fatalf("expected an error on a truncated body, got nil")
+	}
+	if !strings.Contains(err.Error(), "10 bytes expected") {
+		t.Errorf("error %q does not name the 10 expected body bytes", err.Error())
+	}
+}
+
+// ===========================================================================
+// (E) UDS round-trip: drive mainUDS against a scripted unix-socket listener.
+//
+// Parity reference: python/test_lemma_client.py's UdsHandshakeSuccessTests +
+// UdsConnectFailureTests. mainUDS dials a real path, so here (and ONLY here) we
+// stand up a net.Listener on a unix socket in t.TempDir() with a goroutine that
+// reads each request frame and replies with the matching canned frame. The Go
+// mainUDS sends exactly five frames (hello, use-world, propose, assert, query)
+// — no pagination/watch — so the script answers five requests in order.
+// Determinism: synchronous frame exchange, no sleeps, listener closed via
+// t.Cleanup.
+// ===========================================================================
+
+// The five canned reply bodies for the Go mainUDS sequence. The welcome carries
+// the connection-bound session in its BODY (:session), per the UDS protocol.
+const (
+	udsWelcome       = `{:event :welcome :version 1 :session #session "s-uds-1" :world #world "default"}`
+	udsWorldSelected = `{:event :world-selected :world #world "default"}`
+	udsProposed      = `{:event :proposed :proposal #proposal "p-1"}`
+	udsAsserted      = `{:event :asserted}`
+	udsResult        = `{:event :result :rows [["venus"]] :done? true}`
+)
+
+// scriptedUDSServer listens on a unix socket inside t.TempDir() and, for the
+// first accepted connection, replies to each inbound frame with the next canned
+// reply in order. It records every request frame's decoded EDN body in *recvd
+// (guarded by the goroutine lifecycle: the test reads it only after mainUDS
+// returns, by which point the conn has been drained). Returns the socket path.
+func scriptedUDSServer(t *testing.T, replies []string) (string, *[]string) {
+	t.Helper()
+	dir := t.TempDir()
+	sockPath := filepath.Join(dir, "dianoia.sock")
+	ln, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatalf("listening on %q: %v", sockPath, err)
+	}
+	t.Cleanup(func() { ln.Close() })
+
+	recvd := &[]string{}
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return // listener closed by cleanup
+		}
+		defer conn.Close()
+		for _, reply := range replies {
+			req, err := udsRecvFrame(conn)
+			if err != nil {
+				return // client hung up early
+			}
+			*recvd = append(*recvd, req)
+			if err := udsSendFrame(conn, reply); err != nil {
+				return
+			}
+		}
+	}()
+	return sockPath, recvd
+}
+
+// mainUDS against a scripted listener must walk the full sequence and print the
+// query result line (captured from stdout); the FIRST frame it sends is the
+// anonymous (hello) carrying no session; and NO frame after the hello echoes
+// the session handle (over UDS the server binds the session to the connection).
+func TestMainUDS_FullSequence_ReachesResultLineAndNeverEchoesSession(t *testing.T) {
+	replies := []string{udsWelcome, udsWorldSelected, udsProposed, udsAsserted, udsResult}
+	sockPath, recvd := scriptedUDSServer(t, replies)
+
+	out := captureStdout(t, func() { mainUDS(sockPath) })
+
+	// The run reached the query result line.
+	if !strings.Contains(out, "rows=") {
+		t.Errorf("output did not reach the query result line: %q", out)
+	}
+	if !strings.Contains(out, `"venus"`) {
+		t.Errorf("result line did not carry the queried row: %q", out)
+	}
+
+	sent := *recvd
+	if len(sent) == 0 {
+		t.Fatalf("server received no frames")
+	}
+	// The first sent frame is the anonymous hello, with no session attached.
+	if sent[0] != "(hello)" {
+		t.Errorf("first sent frame = %q, want (hello)", sent[0])
+	}
+	if strings.Contains(sent[0], "session") {
+		t.Errorf("hello frame %q must not carry a session", sent[0])
+	}
+	// CRITICAL: no later frame re-sends the session handle or its value — the
+	// server already pinned the session to this connection.
+	for i, fr := range sent[1:] {
+		if strings.Contains(fr, "#session") || strings.Contains(fr, "s-uds-1") || strings.Contains(fr, ":session") {
+			t.Errorf("frame %d after hello echoed the session: %q", i+1, fr)
+		}
+	}
+}
+
+// The proposal handle returned in the :proposed reply must be threaded verbatim
+// into the assert frame — proving the round-trip plumbs server output back into
+// the next request.
+func TestMainUDS_ThreadsProposalHandleIntoAssertFrame(t *testing.T) {
+	replies := []string{udsWelcome, udsWorldSelected, udsProposed, udsAsserted, udsResult}
+	sockPath, recvd := scriptedUDSServer(t, replies)
+
+	captureStdout(t, func() { mainUDS(sockPath) })
+
+	sent := *recvd
+	if len(sent) < 4 {
+		t.Fatalf("server received %d frames, want at least 4: %#v", len(sent), sent)
+	}
+	// Frame index 3 is the assert: (assert #proposal "p-1"). Parse it back to a
+	// sequence and compare structurally, so the exact tag/payload spacing the
+	// codec emits (Compact may strip the space) does not make the test brittle.
+	parsed, ok := parse(t, []byte(sent[3])).([]interface{})
+	if !ok || len(parsed) != 2 {
+		t.Fatalf("assert frame parsed to %#v, want a 2-element sequence", parse(t, []byte(sent[3])))
+	}
+	if parsed[0] != edn.Symbol("assert") {
+		t.Errorf("assert verb head = %#v, want edn.Symbol(\"assert\")", parsed[0])
+	}
+	if parsed[1] != (Handle{Name: "proposal", Value: "p-1"}) {
+		t.Errorf("assert arg = %#v, want #proposal \"p-1\"", parsed[1])
+	}
+}
+
+// mainUDS pointed at a nonexistent socket path must fail FAST (no hang),
+// printing the actionable line that names the path — net.Dial returns
+// immediately when the socket file is absent.
+func TestMainUDS_NonexistentSocketPath_FailsFastNamingPath(t *testing.T) {
+	// A path inside a fresh temp dir that was never bound by any listener.
+	missing := filepath.Join(t.TempDir(), "absent.sock")
+
+	out := captureStdout(t, func() { mainUDS(missing) })
+
+	if !strings.Contains(out, missing) {
+		t.Errorf("connect-failure line %q does not name the path %q", out, missing)
+	}
+	if !strings.Contains(out, "is the server running?") {
+		t.Errorf("connect-failure line %q is not the actionable message", out)
+	}
+}
+
+// captureStdout runs fn with os.Stdout redirected to a pipe and returns whatever
+// fn printed. mainUDS prints its status lines straight to stdout (it has no
+// injectable writer), so we capture at the os.Stdout level. The pipe is drained
+// on a goroutine so a large write cannot deadlock, and stdout is always restored.
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	orig := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("creating stdout pipe: %v", err)
+	}
+	os.Stdout = w
+	done := make(chan string, 1)
+	go func() {
+		b, _ := io.ReadAll(r)
+		done <- string(b)
+	}()
+
+	fn()
+
+	w.Close()
+	os.Stdout = orig
+	return <-done
 }
