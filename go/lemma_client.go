@@ -395,6 +395,65 @@ func get(body interface{}, key string) interface{} {
 }
 
 // ---------------------------------------------------------------------------
+// Cursor pagination:  drain a (query …) across (continue #cursor …) pages
+//
+// A query with :limit returns a full first page with :done? false plus a
+// #cursor handle (SPEC §8); (continue #cursor) carries the next :rows / :cursor
+// / :done? until :done? is true. queryAll runs that drain loop so a caller can
+// treat a paginated result as one flat row set. The send closure is the
+// per-transport "form -> body" call (HTTP named with the session id dropped, or
+// the UDS call as-is); a transport-level error propagates as err so the caller
+// stops cleanly, while a server failure envelope (e.g. an expired cursor) is
+// returned as failure rather than err — the two failure modes stay distinct.
+// ---------------------------------------------------------------------------
+
+// queryAll runs queryForm and drains every page via (continue #cursor …). The
+// first send is the query form itself. Returns (rows, pages, failure, err):
+//
+//   - A failure envelope on the very first reply yields ([], 0, body, nil) — the
+//     query was refused before any page came back.
+//   - Otherwise :rows are collected and, while :done? is false, the per-page
+//     #cursor is read and (continue <cursor>) sent. :cursor is present EXACTLY
+//     when :done? is false — the server omits it on a single-page result — so we
+//     read it only inside the loop, never on an already-done body.
+//   - A failure envelope on a continue (e.g. an expired cursor coming back as
+//     :error :unknown-handle, server idle TTL ~300s per SPEC §8) stops the drain
+//     cleanly, returning the rows gathered so far plus that failure body; a real
+//     client would re-issue the original query to start a fresh page.
+//   - A transport-level error from send propagates as err.
+func queryAll(send func(form interface{}) (interface{}, error), queryForm interface{}) (rows []interface{}, pages int, failure interface{}, err error) {
+	body, err := send(queryForm)
+	if err != nil {
+		return nil, 0, nil, err
+	}
+	if isFailure(body) {
+		return []interface{}{}, 0, body, nil
+	}
+
+	if r, ok := get(body, "rows").([]interface{}); ok {
+		rows = append(rows, r...)
+	}
+	pages = 1
+	for get(body, "done?") != true {
+		// :cursor is present exactly when :done? is false — the server omits it
+		// on a single-page (already-done) result, so we only read it here.
+		cursor := get(body, "cursor")
+		body, err = send(verb{edn.Symbol("continue"), cursor})
+		if err != nil {
+			return rows, pages, nil, err
+		}
+		if isFailure(body) {
+			return rows, pages, body, nil
+		}
+		if r, ok := get(body, "rows").([]interface{}); ok {
+			rows = append(rows, r...)
+		}
+		pages++
+	}
+	return rows, pages, nil, nil
+}
+
+// ---------------------------------------------------------------------------
 // Runnable recipe:  the full Lemma round-trip
 //
 // A flat, linear retelling of the protocol's hello → use-world → propose →
@@ -492,6 +551,65 @@ func mainRun(base string) {
 	}
 	fmt.Printf("query (equivalent morningstar ?o) -> rows=%s  done?=%s\n",
 		render(get(body, "rows")), render(get(body, "done?")))
+
+	// 7. Paginated query: seed three subset-of facts in one propose, assert the
+	//    batch, then drain a :limit 2 query via queryAll / (continue #cursor …).
+	// Seed three subset-of facts in one propose, then assert the batch, so the
+	// paginated query below has more rows than a single page holds. subset-of is
+	// a pure-EDB (stored-fact) predicate, so a query over it has stable
+	// (tx-id, ref-id) ordering and can be paginated; a rule-headed predicate like
+	// member-of cannot be the sole outer :where pattern (the server rejects it
+	// :bad-args :unsupported-rule-call-ordering).
+	f1 := fact(edn.Symbol("subset-of"), entity("sub-a"), entity("group"))
+	f2 := fact(edn.Symbol("subset-of"), entity("sub-b"), entity("group"))
+	f3 := fact(edn.Symbol("subset-of"), entity("sub-c"), entity("group"))
+	proposeForm := verb{edn.Symbol("propose"), f1, f2, f3}
+
+	body, err = named(proposeForm)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	if isFailure(body) {
+		fmt.Printf("propose (3x subset-of) refused: %s\n", describeFailure(body))
+		return
+	}
+	proposal = get(body, "proposal")
+	fmt.Printf("propose (3x subset-of ? group) -> %s  proposal=%s\n",
+		render(get(body, "event")), render(proposal))
+	body, err = named(verb{edn.Symbol("assert"), proposal})
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	if isFailure(body) {
+		fmt.Printf("assert (3x subset-of) refused: %s\n", describeFailure(body))
+		return
+	}
+	fmt.Printf("assert proposal -> %s\n", render(get(body, "event")))
+
+	// 8. Paginated query: :limit 2 over 3 matching rows yields two pages (2 + 1).
+	//    queryAll drains them via (continue #cursor …). It wants a form -> body
+	//    closure; named already has that shape — it dropped the (header-threaded)
+	//    session id internally — so it passes straight through.
+	qform := verb{edn.Symbol("query"), map[edn.Keyword]interface{}{
+		edn.Keyword("find"): []interface{}{edn.Symbol("?x")},
+		edn.Keyword("where"): []interface{}{
+			[]interface{}{edn.Symbol("subset-of"), edn.Symbol("?x"), entity("group")},
+		},
+		edn.Keyword("limit"): 2,
+	}}
+	rows, pages, failure, err := queryAll(named, qform)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	if failure != nil {
+		fmt.Printf("paged query refused: %s\n", describeFailure(failure))
+		return
+	}
+	fmt.Printf("paged query (subset-of ? group), limit 2 -> %d rows over %d page(s): %s\n",
+		len(rows), pages, render(rows))
 }
 
 // ---------------------------------------------------------------------------
@@ -693,6 +811,66 @@ func mainUDS(socketPath string) {
 	}
 	fmt.Printf("query (equivalent morningstar ?o) -> rows=%s  done?=%s\n",
 		render(get(body, "rows")), render(get(body, "done?")))
+	// 6. Paginated query: seed three subset-of facts in one propose, assert the
+	//    batch, then drain a :limit 2 query via queryAll / (continue #cursor …).
+	// Seed three subset-of facts in one propose, then assert the batch, so the
+	// paginated query below spans more than one page. subset-of is a pure-EDB
+	// (stored-fact) predicate, so a query over it has stable (tx-id, ref-id)
+	// ordering and can be paginated; a rule-headed predicate like member-of
+	// cannot be the sole outer :where pattern (the server rejects it :bad-args
+	// :unsupported-rule-call-ordering).
+	f1 := fact(edn.Symbol("subset-of"), entity("sub-a"), entity("group"))
+	f2 := fact(edn.Symbol("subset-of"), entity("sub-b"), entity("group"))
+	f3 := fact(edn.Symbol("subset-of"), entity("sub-c"), entity("group"))
+	proposeForm := verb{edn.Symbol("propose"), f1, f2, f3}
+
+	body, err = call(proposeForm)
+	if err != nil {
+		// Over UDS the connection carries the whole sequence; a read/write error
+		// here (e.g. the server closed after the basic query) is a transport
+		// failure, so print it and stop cleanly rather than hang.
+		fmt.Println(err)
+		return
+	}
+	if isFailure(body) {
+		fmt.Printf("propose (3x subset-of) refused: %s\n", describeFailure(body))
+		return
+	}
+	proposal = get(body, "proposal")
+	fmt.Printf("propose (3x subset-of ? group) -> %s  proposal=%s\n",
+		render(get(body, "event")), render(proposal))
+	body, err = call(verb{edn.Symbol("assert"), proposal})
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	if isFailure(body) {
+		fmt.Printf("assert (3x subset-of) refused: %s\n", describeFailure(body))
+		return
+	}
+	fmt.Printf("assert proposal -> %s\n", render(get(body, "event")))
+
+	// 7. Paginated query: :limit 2 over 3 matching rows yields two pages (2 + 1).
+	//    queryAll drains them via (continue #cursor …). The UDS call closure is
+	//    already form -> body, so it is passed directly.
+	qform := verb{edn.Symbol("query"), map[edn.Keyword]interface{}{
+		edn.Keyword("find"): []interface{}{edn.Symbol("?x")},
+		edn.Keyword("where"): []interface{}{
+			[]interface{}{edn.Symbol("subset-of"), edn.Symbol("?x"), entity("group")},
+		},
+		edn.Keyword("limit"): 2,
+	}}
+	rows, pages, failure, err := queryAll(call, qform)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	if failure != nil {
+		fmt.Printf("paged query refused: %s\n", describeFailure(failure))
+		return
+	}
+	fmt.Printf("paged query (subset-of ? group), limit 2 -> %d rows over %d page(s): %s\n",
+		len(rows), pages, render(rows))
 }
 
 // ---------------------------------------------------------------------------

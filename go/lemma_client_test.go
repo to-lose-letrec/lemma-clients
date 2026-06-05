@@ -29,6 +29,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -762,6 +763,248 @@ func TestMainUDS_NonexistentSocketPath_FailsFastNamingPath(t *testing.T) {
 	}
 	if !strings.Contains(out, "is the server running?") {
 		t.Errorf("connect-failure line %q is not the actionable message", out)
+	}
+}
+
+// ===========================================================================
+// (F) Cursor pagination: drive queryAll with a scripted send closure.
+//
+// Parity reference: python/test_lemma_client.py's QueryAllTests + _ScriptedSend.
+// queryAll's only seam is its `send func(form) (body, error)` argument, so we
+// hand it a scripted stand-in: a closure over a slice of canned EDN reply
+// strings, each parsed via the REAL codec (edn.Unmarshal) so a `#cursor "c-1"`
+// payload becomes the real Handle type queryAll reads back and threads into the
+// (continue …) form. The closure records every form it was sent, so we can
+// assert the drain issued exactly the right requests. No network: send never
+// touches a socket. Running past the script fails the test — over-driving send
+// is a bug worth surfacing, not a silent empty read.
+//
+// scriptedSend parses bodies once up front (failing the test on a bad canned
+// string) and returns a recording closure plus a pointer to the recorded forms.
+// ===========================================================================
+
+// scriptedSend builds a queryAll `send` stand-in over canned EDN reply bodies.
+// Each body is parsed once via the real codec; the returned closure hands them
+// back in order, recording every form it is called with into *forms. Calling
+// past the end of the script fails the test (an over-driven drain is a bug).
+func scriptedSend(t *testing.T, bodies []string) (func(form interface{}) (interface{}, error), *[]interface{}) {
+	t.Helper()
+	parsed := make([]interface{}, len(bodies))
+	for i, b := range bodies {
+		parsed[i] = parse(t, []byte(b))
+	}
+	forms := &[]interface{}{}
+	next := 0
+	send := func(form interface{}) (interface{}, error) {
+		*forms = append(*forms, form)
+		if next >= len(parsed) {
+			t.Fatalf("send over-driven: called %d time(s) but only %d canned repl(ies) scripted",
+				next+1, len(parsed))
+		}
+		body := parsed[next]
+		next++
+		return body, nil
+	}
+	return send, forms
+}
+
+// A representative initial (query …) form. queryAll never inspects it — it just
+// hands it to send unchanged on the first call — so its shape only needs to be
+// plausible, not server-validated.
+func paginationQueryForm() verb {
+	return verb{edn.Symbol("query"), map[edn.Keyword]interface{}{
+		edn.Keyword("find"): []interface{}{edn.Symbol("?x")},
+		edn.Keyword("where"): []interface{}{
+			[]interface{}{edn.Symbol("subset-of"), edn.Symbol("?x"), entity("group")},
+		},
+		edn.Keyword("limit"): 2,
+	}}
+}
+
+// (A) Multi-page drain: a first page with :done? false + a #cursor, then a
+// final page with :done? true, must concatenate every row in order across the
+// pages, report pages == 2, and surface no failure.
+func TestQueryAll_MultiPage_ConcatenatesRowsInOrder(t *testing.T) {
+	send, _ := scriptedSend(t, []string{
+		`{:event :result :rows [[#entity "a"] [#entity "b"]] :done? false :cursor #cursor "c-1"}`,
+		`{:event :result :rows [[#entity "c"]] :done? true}`,
+	})
+
+	rows, pages, failure, err := queryAll(send, paginationQueryForm())
+	if err != nil {
+		t.Fatalf("unexpected transport error: %v", err)
+	}
+	if failure != nil {
+		t.Fatalf("unexpected failure envelope: %#v", failure)
+	}
+	if pages != 2 {
+		t.Errorf("pages = %d, want 2", pages)
+	}
+	want := []interface{}{
+		[]interface{}{entity("a")},
+		[]interface{}{entity("b")},
+		[]interface{}{entity("c")},
+	}
+	if !reflect.DeepEqual(rows, want) {
+		t.Errorf("rows = %#v, want %#v", rows, want)
+	}
+}
+
+// (A) Multi-page drain: the SECOND form queryAll sends must be exactly
+// (continue <the cursor from page 1>). We compare the threaded cursor against
+// the Handle value parsed out of reply 1 — both structurally (==) and by
+// re-marshalled wire text — to prove queryAll read the real #cursor handle and
+// fed it back verbatim, rather than a string or a fresh value.
+func TestQueryAll_MultiPage_SecondFormIsContinueCarryingTheCursor(t *testing.T) {
+	page1 := `{:event :result :rows [[#entity "a"] [#entity "b"]] :done? false :cursor #cursor "c-1"}`
+	send, forms := scriptedSend(t, []string{
+		page1,
+		`{:event :result :rows [[#entity "c"]] :done? true}`,
+	})
+
+	queryForm := paginationQueryForm()
+	if _, _, _, err := queryAll(send, queryForm); err != nil {
+		t.Fatalf("unexpected transport error: %v", err)
+	}
+
+	sent := *forms
+	if len(sent) != 2 {
+		t.Fatalf("queryAll sent %d form(s), want 2: %#v", len(sent), sent)
+	}
+	// The first form is the original query, passed through untouched.
+	if !reflect.DeepEqual(sent[0], interface{}(queryForm)) {
+		t.Errorf("first form = %#v, want the original query form %#v", sent[0], queryForm)
+	}
+
+	// Recover the exact #cursor handle reply 1 carried, independent of queryAll.
+	wantCursor := get(parse(t, []byte(page1)), "cursor").(Handle)
+
+	// The second form must be the verb (continue <cursor>).
+	cont, ok := sent[1].(verb)
+	if !ok {
+		t.Fatalf("second form is %T, want verb (continue …)", sent[1])
+	}
+	if len(cont) != 2 {
+		t.Fatalf("continue form has %d element(s), want 2: %#v", len(cont), cont)
+	}
+	if cont[0] != edn.Symbol("continue") {
+		t.Errorf("continue head = %#v, want edn.Symbol(\"continue\")", cont[0])
+	}
+	// Structural equality: the threaded arg IS the parsed cursor handle.
+	if cont[1] != interface{}(wantCursor) {
+		t.Errorf("continue cursor = %#v, want %#v", cont[1], wantCursor)
+	}
+	// And it re-marshals to the same wire text as the original cursor handle —
+	// proving a faithful round-trip back onto the wire.
+	if got, want := string(marshal(t, cont[1])), string(marshal(t, wantCursor)); got != want {
+		t.Errorf("continue cursor wire text = %q, want %q", got, want)
+	}
+}
+
+// (B) Single page: a lone reply with :done? true and NO :cursor key must drain
+// in exactly one send (no continue), return that page's rows, and not panic on
+// the absent :cursor — the continue branch and its cursor read are never
+// reached when the first page is already done.
+func TestQueryAll_SinglePage_OneSendNoContinueNoCursorKey(t *testing.T) {
+	send, forms := scriptedSend(t, []string{
+		`{:event :result :rows [[#entity "a"]] :done? true}`,
+	})
+
+	queryForm := paginationQueryForm()
+	rows, pages, failure, err := queryAll(send, queryForm)
+	if err != nil {
+		t.Fatalf("unexpected transport error: %v", err)
+	}
+	if failure != nil {
+		t.Fatalf("unexpected failure envelope: %#v", failure)
+	}
+	if pages != 1 {
+		t.Errorf("pages = %d, want 1", pages)
+	}
+	want := []interface{}{[]interface{}{entity("a")}}
+	if !reflect.DeepEqual(rows, want) {
+		t.Errorf("rows = %#v, want %#v", rows, want)
+	}
+	// Exactly one send, and it was the original query — no continue was issued.
+	sent := *forms
+	if len(sent) != 1 {
+		t.Fatalf("queryAll sent %d form(s), want exactly 1: %#v", len(sent), sent)
+	}
+	if !reflect.DeepEqual(sent[0], interface{}(queryForm)) {
+		t.Errorf("only form = %#v, want the original query form %#v", sent[0], queryForm)
+	}
+}
+
+// (C) Failure on continue (e.g. an expired cursor): a not-done first page
+// followed by an :error envelope on the continue must stop the drain cleanly —
+// returning the rows gathered from page 1, the error body as failure, pages
+// counting only the drained first page, and a nil transport error.
+func TestQueryAll_ContinueFailure_PropagatesFailureWithRowsSoFar(t *testing.T) {
+	send, forms := scriptedSend(t, []string{
+		`{:event :result :rows [[#entity "a"] [#entity "b"]] :done? false :cursor #cursor "c-1"}`,
+		`{:event :error :reason :unknown-handle :message "cursor c-1 has expired"}`,
+	})
+
+	rows, pages, failure, err := queryAll(send, paginationQueryForm())
+	if err != nil {
+		t.Fatalf("a failure envelope must not surface as a transport error, got: %v", err)
+	}
+	if failure == nil {
+		t.Fatalf("expected the :error envelope as failure, got nil")
+	}
+	// The failure is the error envelope returned verbatim.
+	if got := get(failure, "event"); got != edn.Keyword("error") {
+		t.Errorf("failure :event = %#v, want :error", got)
+	}
+	if got := get(failure, "reason"); got != edn.Keyword("unknown-handle") {
+		t.Errorf("failure :reason = %#v, want :unknown-handle", got)
+	}
+	// Rows gathered before the cursor expired are preserved.
+	want := []interface{}{[]interface{}{entity("a")}, []interface{}{entity("b")}}
+	if !reflect.DeepEqual(rows, want) {
+		t.Errorf("rows = %#v, want %#v", rows, want)
+	}
+	// pages counts only the successfully-drained first page.
+	if pages != 1 {
+		t.Errorf("pages = %d, want 1 (only the drained first page)", pages)
+	}
+	// Exactly two sends: the query and the (failed) continue.
+	if sent := *forms; len(sent) != 2 {
+		t.Errorf("queryAll sent %d form(s), want 2 (query + continue): %#v", len(sent), sent)
+	}
+}
+
+// (D) Failure on the FIRST reply: a query refused before any page lands must
+// yield empty rows, zero pages, the failure body, and a nil error — and issue
+// no continue.
+func TestQueryAll_FirstReplyFailure_ReturnsEmptyRowsZeroPages(t *testing.T) {
+	send, forms := scriptedSend(t, []string{
+		`{:event :rejected :reason :forbidden :message "not allowed"}`,
+	})
+
+	rows, pages, failure, err := queryAll(send, paginationQueryForm())
+	if err != nil {
+		t.Fatalf("a failure envelope must not surface as a transport error, got: %v", err)
+	}
+	if failure == nil {
+		t.Fatalf("expected the :rejected envelope as failure, got nil")
+	}
+	if got := get(failure, "event"); got != edn.Keyword("rejected") {
+		t.Errorf("failure :event = %#v, want :rejected", got)
+	}
+	// Empty (non-nil) rows and zero pages: nothing came back.
+	if len(rows) != 0 {
+		t.Errorf("rows = %#v, want empty", rows)
+	}
+	if rows == nil {
+		t.Errorf("rows is nil, want a non-nil empty slice ([] not nil)")
+	}
+	if pages != 0 {
+		t.Errorf("pages = %d, want 0", pages)
+	}
+	// Exactly one send: the query, and no continue.
+	if sent := *forms; len(sent) != 1 {
+		t.Errorf("queryAll sent %d form(s), want exactly 1 (no continue): %#v", len(sent), sent)
 	}
 }
 
