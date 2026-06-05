@@ -47,3 +47,7 @@ A language graduates when at least one of these is true:
 - An independent contributor wants to maintain a packaged version.
 
 At graduation: spin out a dedicated repo, keep the demo here as a one-screen "see `<language>-lemma` for the maintained library" pointer.
+
+## License
+
+Apache License 2.0. See [LICENSE](./LICENSE).
