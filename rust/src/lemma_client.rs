@@ -180,6 +180,88 @@ fn render(value: Option<&Value>) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Cursor pagination:  drain a (query …) across (continue #cursor …) pages
+//
+// A (query …) with a :limit returns a FULL first page — `:rows` plus
+// `:done? false` and a `#cursor` handle. Each `(continue #cursor)` carries the
+// next page's `:rows` / `:cursor` / `:done?`, until `:done?` is true (SPEC §8).
+// `query_all` walks that chain into one flat row set. It is transport-agnostic:
+// the caller hands in a `send` closure (HTTP or UDS) that turns one verb form
+// into one parsed reply body, and query_all threads the cursor through it.
+// ---------------------------------------------------------------------------
+
+/// The parsed `:rows` of a result envelope, as a borrowed slice.
+///
+/// `:rows` is a `Value::Vector` of row vectors; anything else (absent, or a
+/// non-vector) reads as the empty slice so a malformed page never panics.
+fn rows_of(body: &Value) -> &[Value] {
+    match get(body, "rows") {
+        Some(Value::Vector(rows)) => rows,
+        _ => &[],
+    }
+}
+
+/// Whether a result envelope's `:done?` flag is the literal `true`.
+///
+/// Treats anything other than `:done? true` (including an absent flag) as "not
+/// done", so a page that omits the flag keeps the drain loop honest rather than
+/// ending it early.
+fn is_done(body: &Value) -> bool {
+    get(body, "done?") == Some(&Value::Boolean(true))
+}
+
+/// Run `query_form` and drain every page via `(continue #cursor …)`.
+///
+/// `send` is the per-transport `form -> body` closure (HTTP `named` or the UDS
+/// `call`, each adapted to take the form by value and yield the parsed reply).
+/// Returns `(rows, pages, failure)`:
+///
+///   * `rows`    — every row across all pages, flattened in page order.
+///   * `pages`   — how many result envelopes were drained (1 for a single page).
+///   * `failure` — `None` on success, or the offending `:error` / `:rejected`
+///     body when the server refuses a call mid-drain.
+///
+/// A failure envelope on the FIRST reply (the query itself) yields
+/// `Ok((vec![], 0, Some(body)))`. A failure on a later `(continue …)` — e.g. an
+/// expired cursor coming back `:error :unknown-handle` (server idle TTL ~300s,
+/// SPEC §8) — yields `Ok((rows_so_far, pages, Some(body)))`; a real client would
+/// re-issue the original query for a fresh page, but this demo surfaces it. A
+/// transport-level error from `send` propagates as `Err`.
+///
+/// The `:cursor` is present EXACTLY when `:done?` is not true, so we read it only
+/// inside the loop — and feed the parsed `#cursor` `TaggedElement` back verbatim,
+/// never reconstructing it from text.
+fn query_all<E>(
+    send: &mut impl FnMut(Value) -> Result<Value, E>,
+    query_form: Value,
+) -> Result<(Vec<Value>, usize, Option<Value>), E> {
+    let mut body = send(query_form)?;
+    if is_failure(&body) {
+        return Ok((Vec::new(), 0, Some(body)));
+    }
+
+    let mut rows: Vec<Value> = rows_of(&body).to_vec();
+    let mut pages = 1usize;
+    while !is_done(&body) {
+        // :cursor is present only while :done? is falsey; the server omits it on
+        // an already-done page, so reading it here (not before the loop) is safe.
+        // A page that is not done yet still lacks a cursor would leave us nothing
+        // to continue with, so we stop with what we have rather than spin.
+        let cursor = match get(&body, "cursor") {
+            Some(c) => c.clone(),
+            None => break,
+        };
+        body = send(verb(vec![sym("continue"), cursor]))?;
+        if is_failure(&body) {
+            return Ok((rows, pages, Some(body)));
+        }
+        rows.extend_from_slice(rows_of(&body));
+        pages += 1;
+    }
+    Ok((rows, pages, None))
+}
+
+// ---------------------------------------------------------------------------
 // HTTP transport:  EDN form  ->  hand-rolled POST  ->  parsed EDN response
 //
 // With the codec in hand, talking to a Lemma server is just "encode, POST,
@@ -469,6 +551,102 @@ fn main_run(base: &str) {
         render(get(&body, "rows")),
         render(get(&body, "done?"))
     );
+
+    // 7. Paginated query: seed three subset-of facts in one batched propose,
+    //    assert, then drain a :limit 2 query via query_all / (continue #cursor …).
+    // Seed three subset-of facts in ONE batched propose, then assert the
+    // batch, so the paginated query below spans more than a single page.
+    // subset-of is a pure-EDB (stored-fact) predicate: a query over it has
+    // stable ordering and so can be paginated. A rule-headed predicate like
+    // member-of cannot be the sole outer :where pattern — the server rejects
+    // that :bad-args :unsupported-rule-call-ordering.
+    let f1 = fact_value("subset-of", entity("sub-a"), entity("group"));
+    let f2 = fact_value("subset-of", entity("sub-b"), entity("group"));
+    let f3 = fact_value("subset-of", entity("sub-c"), entity("group"));
+    let propose_form = verb(vec![sym("propose"), f1, f2, f3]);
+    let body = match named(&propose_form) {
+        Ok(b) => b,
+        Err(err) => {
+            println!("{err}");
+            return;
+        }
+    };
+    if is_failure(&body) {
+        println!(
+            "propose (3x subset-of) refused: {}",
+            describe_failure(&body)
+        );
+        return;
+    }
+    let proposal = match get(&body, "proposal") {
+        Some(p) => p.clone(),
+        None => {
+            println!(
+                "propose (3x subset-of) -> {} but no :proposal handle",
+                render(get(&body, "event"))
+            );
+            return;
+        }
+    };
+    println!(
+        "propose (3x subset-of ? group) -> {}  proposal={}",
+        render(get(&body, "event")),
+        emit_str(&proposal)
+    );
+    let body = match named(&verb(vec![sym("assert"), proposal])) {
+        Ok(b) => b,
+        Err(err) => {
+            println!("{err}");
+            return;
+        }
+    };
+    if is_failure(&body) {
+        println!("assert (3x subset-of) refused: {}", describe_failure(&body));
+        return;
+    }
+    println!("assert proposal -> {}", render(get(&body, "event")));
+
+    // 8. Paginated query: :limit 2 over 3 matching rows yields two pages
+    //    (2 + 1). query_all drains them via (continue #cursor …). named takes
+    //    a &Value and returns just the body (the session id rides the header,
+    //    not the return), so we adapt it to the form -> body closure
+    //    query_all wants.
+    let mut paged_query = std::collections::BTreeMap::new();
+    paged_query.insert(
+        Value::Keyword(Keyword::from_name("find")),
+        Value::Vector(vec![sym("?x")]),
+    );
+    paged_query.insert(
+        Value::Keyword(Keyword::from_name("where")),
+        Value::Vector(vec![Value::Vector(vec![
+            sym("subset-of"),
+            sym("?x"),
+            entity("group"),
+        ])]),
+    );
+    paged_query.insert(
+        Value::Keyword(Keyword::from_name("limit")),
+        Value::Integer(2),
+    );
+    let qform = verb(vec![sym("query"), Value::Map(paged_query)]);
+    let mut send = |form: Value| named(&form);
+    match query_all(&mut send, qform) {
+        Ok((rows, pages, failure)) => {
+            if let Some(failure) = failure {
+                println!("paged query refused: {}", describe_failure(&failure));
+                return;
+            }
+            println!(
+                "paged query (subset-of ? group), limit 2 -> {} rows over {} page(s): {}",
+                rows.len(),
+                pages,
+                emit_str(&Value::Vector(rows))
+            );
+        }
+        Err(err) => {
+            println!("{err}");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -697,6 +875,101 @@ fn main_uds(socket_path: &str) {
         render(get(&body, "rows")),
         render(get(&body, "done?"))
     );
+
+    // 6. Paginated query: seed three subset-of facts in one batched propose,
+    //    assert, then drain a :limit 2 query via query_all / (continue #cursor …).
+    // Seed three subset-of facts in ONE batched propose, then assert the
+    // batch, so the paginated query below spans more than a single page.
+    // subset-of is pure-EDB (stored facts) with stable ordering, so it
+    // paginates; a rule-headed predicate like member-of cannot be the sole
+    // outer :where pattern (server :bad-args :unsupported-rule-call-ordering).
+    let f1 = fact_value("subset-of", entity("sub-a"), entity("group"));
+    let f2 = fact_value("subset-of", entity("sub-b"), entity("group"));
+    let f3 = fact_value("subset-of", entity("sub-c"), entity("group"));
+    let propose_form = verb(vec![sym("propose"), f1, f2, f3]);
+    let body = match call(&mut stream, &propose_form) {
+        Ok(b) => b,
+        Err(err) => {
+            println!("{err}");
+            return;
+        }
+    };
+    if is_failure(&body) {
+        println!(
+            "propose (3x subset-of) refused: {}",
+            describe_failure(&body)
+        );
+        return;
+    }
+    let proposal = match get(&body, "proposal") {
+        Some(p) => p.clone(),
+        None => {
+            println!(
+                "propose (3x subset-of) -> {} but no :proposal handle",
+                render(get(&body, "event"))
+            );
+            return;
+        }
+    };
+    println!(
+        "propose (3x subset-of ? group) -> {}  proposal={}",
+        render(get(&body, "event")),
+        emit_str(&proposal)
+    );
+    let body = match call(&mut stream, &verb(vec![sym("assert"), proposal])) {
+        Ok(b) => b,
+        Err(err) => {
+            println!("{err}");
+            return;
+        }
+    };
+    if is_failure(&body) {
+        println!("assert (3x subset-of) refused: {}", describe_failure(&body));
+        return;
+    }
+    println!("assert proposal -> {}", render(get(&body, "event")));
+
+    // 7. Paginated query: :limit 2 over 3 matching rows yields two pages
+    //    (2 + 1). query_all drains them via (continue #cursor …). The UDS
+    //    `call` is (stream, form) -> body, so we wrap it in a form -> body
+    //    closure that threads the one open socket — the session already rides
+    //    the connection.
+    let mut paged_query = std::collections::BTreeMap::new();
+    paged_query.insert(
+        Value::Keyword(Keyword::from_name("find")),
+        Value::Vector(vec![sym("?x")]),
+    );
+    paged_query.insert(
+        Value::Keyword(Keyword::from_name("where")),
+        Value::Vector(vec![Value::Vector(vec![
+            sym("subset-of"),
+            sym("?x"),
+            entity("group"),
+        ])]),
+    );
+    paged_query.insert(
+        Value::Keyword(Keyword::from_name("limit")),
+        Value::Integer(2),
+    );
+    let qform = verb(vec![sym("query"), Value::Map(paged_query)]);
+    let mut send = |form: Value| call(&mut stream, &form);
+    match query_all(&mut send, qform) {
+        Ok((rows, pages, failure)) => {
+            if let Some(failure) = failure {
+                println!("paged query refused: {}", describe_failure(&failure));
+                return;
+            }
+            println!(
+                "paged query (subset-of ? group), limit 2 -> {} rows over {} page(s): {}",
+                rows.len(),
+                pages,
+                emit_str(&Value::Vector(rows))
+            );
+        }
+        Err(err) => {
+            println!("{err}");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1452,5 +1725,249 @@ mod tests {
             Some(&Value::Keyword(Keyword::from_name("welcome")))
         );
         assert_eq!(get(&body, "missing"), None);
+    }
+
+    // ===================================================================
+    // (F) Cursor pagination: query_all(send, query_form)
+    //     -> (rows, pages, failure). Mirrors python QueryAllTests /
+    //     _ScriptedSend.
+    //
+    //     query_all is transport-agnostic: it takes a `form -> body` closure
+    //     and drains a paginated query by threading the #cursor through
+    //     (continue ...) until :done? is true. We drive it with a purely
+    //     in-memory scripted fake -- no socket, no TcpStream -- that parses a
+    //     canned EDN reply STRING per call (via parse_str AT CALL TIME, so
+    //     `#cursor "c-1"` decodes to the same TaggedElement the loop feeds back
+    //     into (continue #cursor ...)) and records the form it was handed each
+    //     call into a Vec the test inspects afterwards.
+    // ===================================================================
+
+    /// A scripted `form -> body` stand-in for `query_all`'s `send` closure.
+    ///
+    /// Holds a list of scripted replies; each call pops the next and either
+    /// parses a canned EDN body STRING via `parse_str` at call time (so a
+    /// `#cursor "c-1"` decodes into the real `TaggedElement` the loop feeds
+    /// back) or yields a transport `Err`. Every `form` it is handed is recorded
+    /// into `forms` for after-the-fact inspection. Running past the script
+    /// panics -- over-driving `send` is a bug worth surfacing, not a silent
+    /// empty read. Mirrors python's `_ScriptedSend`.
+    enum ScriptedReply {
+        /// A canned EDN reply body, parsed with `parse_str` when popped.
+        Body(&'static str),
+        /// A transport-level failure: `send` returns `Err(message)`.
+        TransportErr(&'static str),
+    }
+
+    struct ScriptedSend {
+        replies: Vec<ScriptedReply>,
+        next: usize,
+        /// Every form handed to `send`, in call order, for the test to inspect.
+        forms: Vec<Value>,
+    }
+
+    impl ScriptedSend {
+        fn new(replies: Vec<ScriptedReply>) -> Self {
+            ScriptedSend {
+                replies,
+                next: 0,
+                forms: Vec::new(),
+            }
+        }
+
+        /// One `send` invocation: record `form`, then yield the next scripted
+        /// reply (parsing the EDN string now) or a transport `Err`.
+        fn call(&mut self, form: Value) -> Result<Value, String> {
+            self.forms.push(form);
+            let reply = self
+                .replies
+                .get(self.next)
+                .expect("ScriptedSend over-driven: query_all called send past its script");
+            self.next += 1;
+            match reply {
+                ScriptedReply::Body(edn) => {
+                    Ok(parse_str(edn).expect("scripted reply must be valid EDN"))
+                }
+                ScriptedReply::TransportErr(msg) => Err((*msg).to_string()),
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.forms.len()
+        }
+    }
+
+    /// A representative initial `(query …)` form. `query_all` never inspects it
+    /// -- it just hands it to `send` unchanged on the first call -- so the shape
+    /// only needs to be plausible, not server-validated. Mirrors python's
+    /// `_QFORM`.
+    fn qform() -> Value {
+        let mut map = BTreeMap::new();
+        map.insert(
+            Value::Keyword(Keyword::from_name("find")),
+            Value::Vector(vec![sym("?x")]),
+        );
+        map.insert(
+            Value::Keyword(Keyword::from_name("where")),
+            Value::Vector(vec![Value::Vector(vec![
+                sym("subset-of"),
+                sym("?x"),
+                entity("group"),
+            ])]),
+        );
+        map.insert(
+            Value::Keyword(Keyword::from_name("limit")),
+            Value::Integer(2),
+        );
+        verb(vec![sym("query"), Value::Map(map)])
+    }
+
+    // --- (A) Multi-page drain ---------------------------------------------
+
+    #[test]
+    fn test_query_all_multi_page_concatenates_rows_in_order() {
+        // Page 1: rows [a b], not done, cursor #cursor "c-1".
+        // Page 2: rows [c], done. Rows flatten in page order; pages == 2;
+        // failure is None.
+        let mut send = ScriptedSend::new(vec![
+            ScriptedReply::Body(
+                r#"{:event :result :rows [[#entity "a"] [#entity "b"]] :done? false :cursor #cursor "c-1"}"#,
+            ),
+            ScriptedReply::Body(r#"{:event :result :rows [[#entity "c"]] :done? true}"#),
+        ]);
+
+        let (rows, pages, failure) = query_all(&mut |f| send.call(f), qform()).unwrap();
+
+        assert_eq!(failure, None);
+        assert_eq!(pages, 2);
+        assert_eq!(
+            rows,
+            vec![
+                Value::Vector(vec![entity("a")]),
+                Value::Vector(vec![entity("b")]),
+                Value::Vector(vec![entity("c")]),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_query_all_second_form_is_continue_carrying_the_page_one_cursor() {
+        // The first recorded form is the original query; the second is exactly
+        // (continue <the page-1 cursor>), verified BOTH by Value equality and by
+        // emit_str wire text -- the cursor is the parsed #cursor TaggedElement
+        // from page 1, fed back verbatim (never reconstructed from text).
+        let mut send = ScriptedSend::new(vec![
+            ScriptedReply::Body(
+                r#"{:event :result :rows [[#entity "a"] [#entity "b"]] :done? false :cursor #cursor "c-1"}"#,
+            ),
+            ScriptedReply::Body(r#"{:event :result :rows [[#entity "c"]] :done? true}"#),
+        ]);
+
+        query_all(&mut |f| send.call(f), qform()).unwrap();
+
+        assert_eq!(send.forms[0], qform());
+        // The page-1 cursor, exactly as it parsed off the wire.
+        let page_one_cursor =
+            Value::TaggedElement(Symbol::from_name("cursor"), Box::new(Value::from("c-1")));
+        let expected_continue = verb(vec![sym("continue"), page_one_cursor]);
+        // By Value equality.
+        assert_eq!(send.forms[1], expected_continue);
+        // And by exact wire text.
+        assert_eq!(emit_str(&send.forms[1]), emit_str(&expected_continue));
+        assert_eq!(emit_str(&send.forms[1]), r#"(continue #cursor "c-1")"#);
+    }
+
+    // --- (B) Single page ---------------------------------------------------
+
+    #[test]
+    fn test_query_all_single_page_done_true_sends_once_without_continue() {
+        // :done? true on the first page with NO :cursor key: exactly one send,
+        // rows returned, no continue issued, and the missing :cursor never
+        // panics (the continue branch is unreached).
+        let mut send = ScriptedSend::new(vec![ScriptedReply::Body(
+            r#"{:event :result :rows [[#entity "a"]] :done? true}"#,
+        )]);
+
+        let (rows, pages, failure) = query_all(&mut |f| send.call(f), qform()).unwrap();
+
+        assert_eq!(failure, None);
+        assert_eq!(pages, 1);
+        assert_eq!(rows, vec![Value::Vector(vec![entity("a")])]);
+        assert_eq!(send.call_count(), 1);
+        assert_eq!(send.forms, vec![qform()]);
+    }
+
+    // --- (C) Continue failure (expired cursor) -----------------------------
+
+    #[test]
+    fn test_query_all_continue_failure_returns_rows_so_far_and_the_envelope() {
+        // Page 1 not done + cursor; the (continue …) comes back an :error
+        // :unknown-handle envelope. query_all yields Ok with the rows gathered
+        // from page 1, pages == 1 (only the drained page counts), and the error
+        // body returned verbatim as `failure`.
+        let error_envelope =
+            r#"{:event :error :reason :unknown-handle :message "cursor c-1 has expired"}"#;
+        let mut send = ScriptedSend::new(vec![
+            ScriptedReply::Body(
+                r#"{:event :result :rows [[#entity "a"] [#entity "b"]] :done? false :cursor #cursor "c-1"}"#,
+            ),
+            ScriptedReply::Body(error_envelope),
+        ]);
+
+        let (rows, pages, failure) = query_all(&mut |f| send.call(f), qform()).unwrap();
+
+        assert_eq!(
+            rows,
+            vec![
+                Value::Vector(vec![entity("a")]),
+                Value::Vector(vec![entity("b")]),
+            ]
+        );
+        assert_eq!(pages, 1);
+        assert_eq!(failure, Some(parse_str(error_envelope).unwrap()));
+        // Two sends: the query and the failing continue.
+        assert_eq!(send.call_count(), 2);
+    }
+
+    // --- (D) First-reply failure -------------------------------------------
+
+    #[test]
+    fn test_query_all_first_reply_failure_returns_empty_zero_pages_no_continue() {
+        // A query that is refused outright (a :rejected envelope on the FIRST
+        // reply) yields Ok((empty rows, 0 pages, Some(envelope))) and never
+        // issues a continue.
+        let rejected = r#"{:event :rejected :reason :forbidden :message "no read access"}"#;
+        let mut send = ScriptedSend::new(vec![ScriptedReply::Body(rejected)]);
+
+        let (rows, pages, failure) = query_all(&mut |f| send.call(f), qform()).unwrap();
+
+        assert_eq!(rows, Vec::<Value>::new());
+        assert_eq!(pages, 0);
+        assert_eq!(failure, Some(parse_str(rejected).unwrap()));
+        // Exactly one send: the failing query. No continue was issued.
+        assert_eq!(send.call_count(), 1);
+        assert_eq!(send.forms, vec![qform()]);
+    }
+
+    // --- (E) Transport-error propagation (exceeds python parity) -----------
+
+    #[test]
+    fn test_query_all_transport_error_mid_drain_propagates_as_err() {
+        // Beyond the python suite: the Rust signature returns Result<_, E>, so a
+        // `send` that returns Err mid-drain (page 1 OK and not done, then the
+        // continue's transport fails) propagates straight out as Err rather than
+        // being folded into the failure envelope.
+        let mut send = ScriptedSend::new(vec![
+            ScriptedReply::Body(
+                r#"{:event :result :rows [[#entity "a"] [#entity "b"]] :done? false :cursor #cursor "c-1"}"#,
+            ),
+            ScriptedReply::TransportErr("connection reset mid-drain"),
+        ]);
+
+        let result = query_all(&mut |f| send.call(f), qform());
+
+        let err = result.expect_err("a transport Err mid-drain must propagate as Err");
+        assert_eq!(err, "connection reset mid-drain");
+        // The query and the failing continue were both attempted.
+        assert_eq!(send.call_count(), 2);
     }
 }
