@@ -10,3 +10,6 @@ node_modules/
 
 # Clojure
 .cpcache/
+
+# Go (the compiled demo binary)
+go/lemmaclient
