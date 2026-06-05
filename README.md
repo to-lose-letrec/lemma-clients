@@ -12,14 +12,15 @@ This is deliberately distinct from libraries-people-install-and-depend-on. When 
 
 ## Starter languages
 
-Initial three, plus Go, ranked by audience reach more than by author preference:
+Initial three, plus Go and Rust, ranked by audience reach more than by author preference:
 
 - `python/` — most likely first graduate; ML/AI integration audience lives here. At parity with `typescript/` (both transports, pagination, capabilities/limits, watch/SSE).
 - `typescript/` — anything browser- or Node-side; matters for any web client. At parity with `python/` (both transports, pagination, capabilities/limits, watch/SSE).
 - `clojure/` — the protocol's native language; the smallest demo by line count. Now at parity with `python/` and `typescript/` (both transports, pagination, capabilities/limits, watch/SSE).
-- `go/` — infrastructure and systems tooling; the protocol's server-side peers often live in Go shops. At parity with the other three (both transports, pagination, capabilities/limits, watch/SSE). Leans on one third-party dependency (`olympos.io/encoding/edn`) for the codec, within the demo's one-EDN-reader budget.
+- `go/` — infrastructure and systems tooling; the protocol's server-side peers often live in Go shops. At parity with the other four (both transports, pagination, capabilities/limits, watch/SSE). Leans on one third-party dependency (`olympos.io/encoding/edn`) for the codec, within the demo's one-EDN-reader budget.
+- `rust/` — systems programmers, the audience most likely to reimplement the protocol from the wire up; this demo shows the rawest view of it, with even HTTP hand-rolled over `std::net::TcpStream` since Rust's standard library ships no HTTP client. At parity with the other four (both transports, pagination, capabilities/limits, watch/SSE). Leans on one third-party dependency (`edn-format`) for the codec, within the demo's one-EDN-reader budget.
 
-Go has joined the demos this run. Rust comes later if a sustained user surfaces. Building libraries for languages that have only the maintainer as a user is maintenance burden, not an asset.
+All five starter languages now have demos. The maintenance-burden line still holds at the next gate: demos are cheap, but a packaged library for a language whose only user is the maintainer is maintenance burden, not an asset — so graduation waits for a sustained user, not just a working demo.
 
 ## Demo constraints
 
@@ -33,7 +34,7 @@ The dep-surface constraint exists because a client that pulls in thirty transiti
 
 ## What's not in scope (yet)
 
-- Rich, long-lived watch/SSE streams. The `python/`, `typescript/`, `clojure/`, and `go/` demos all now show a minimal watch round-trip — a single `watch-pattern` subscription and one `:watch-event`, over both transports (interleaved on the UDS socket, on the separate SSE stream over HTTP) — so the protocol's push shape is demonstrated. The richer streaming surface stays out of scope: watch-gap / slow-consumer `:watch-closed` handling, multiple concurrent watches, and reconnection. These are nontrivial in some languages and would inflate the demos past the readability threshold.
+- Rich, long-lived watch/SSE streams. The `python/`, `typescript/`, `clojure/`, `go/`, and `rust/` demos all now show a minimal watch round-trip — a single `watch-pattern` subscription and one `:watch-event`, over both transports (interleaved on the UDS socket, on the separate SSE stream over HTTP) — so the protocol's push shape is demonstrated. The richer streaming surface stays out of scope: watch-gap / slow-consumer `:watch-closed` handling, multiple concurrent watches, and reconnection. These are nontrivial in some languages and would inflate the demos past the readability threshold.
 - Authentication / TLS framing. v1 Lemma doesn't advertise TLS over the wire; deployments terminate at a reverse proxy. Demos talk to a local Dianoia over UDS or plain HTTP.
 - Convenience surface (verb wrappers, pooled connections, retry semantics). These are library concerns. Demos are recipes.
 
