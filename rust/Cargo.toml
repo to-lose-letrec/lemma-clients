@@ -1,0 +1,16 @@
+[package]
+name = "lemma-client"
+version = "0.1.0"
+edition = "2024"
+
+# One third-party dependency: the EDN codec. Everything else is std — the HTTP
+# transport is hand-rolled over std::net::TcpStream (see the module doc in
+# src/lemma_client.rs for why).
+[dependencies]
+edn-format = "3.3"
+
+# Name the binary after the sibling clients (lemma_client.py / lemma_client.go),
+# pointing at the recipe source file so `cargo run` walks the round-trip.
+[[bin]]
+name = "lemma-client"
+path = "src/lemma_client.rs"
