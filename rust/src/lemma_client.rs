@@ -72,6 +72,7 @@
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::os::unix::net::UnixStream;
+use std::time::Duration;
 
 use edn_format::{Keyword, Symbol, Value, emit_str, parse_str};
 
@@ -845,6 +846,143 @@ fn main_run(base: &str) {
     } else {
         println!("server does not advertise cursor pagination; skipping paged query");
     }
+
+    // 9. Watch: register a standing pattern and observe a matching change pushed
+    //    back on the SSE event stream. Gated on the server advertising
+    //    :lemma/watch — without it the (watch-pattern …) verb is unsupported, so
+    //    we skip the demo rather than guess (SPEC §10). This block follows the
+    //    paginated if/else above unconditionally, so it runs regardless of
+    //    whether the server paginates.
+    if info.supports("lemma/watch") {
+        // (watch-pattern :pattern [[subset-of ?x #entity "group"]]) — the args
+        // are FLAT keyword args (the :pattern keyword then the where-vector), NOT
+        // a wrapping map. The reply hands back a #watch handle to unwatch with.
+        let pattern = Value::Vector(vec![Value::Vector(vec![
+            sym("subset-of"),
+            sym("?x"),
+            entity("group"),
+        ])]);
+        let body = match named(&verb(vec![
+            sym("watch-pattern"),
+            Value::Keyword(Keyword::from_name("pattern")),
+            pattern,
+        ])) {
+            Ok(b) => b,
+            Err(err) => {
+                println!("{err}");
+                return;
+            }
+        };
+        if is_failure(&body) {
+            println!("watch-pattern refused: {}", describe_failure(&body));
+            return;
+        }
+        let watch = match get(&body, "watch") {
+            Some(w) => w.clone(),
+            None => {
+                println!(
+                    "watch-pattern -> {} but no :watch handle",
+                    render(get(&body, "event"))
+                );
+                return;
+            }
+        };
+        println!(
+            "watch (subset-of ? group) -> {}  watch={}",
+            render(get(&body, "event")),
+            emit_str(&watch)
+        );
+
+        // Ordering is load-bearing: Dianoia registers this session's SSE sink
+        // lazily, when the GET /events headers are written, and delivers a
+        // :watch-event only to sinks present at emit time (no backlog replay). So
+        // OPEN the stream first (registering the sink), THEN trigger the change,
+        // THEN drain — otherwise the push can fire within milliseconds of the
+        // assert, before our sink exists, and be silently lost.
+        let mut sse = match open_sse_stream(base, &session, SSE_TIMEOUT) {
+            Ok(s) => s,
+            Err(err) => {
+                println!("{err}");
+                return;
+            }
+        };
+        // The server pushes only DELTAS, so the change must be new: a fact
+        // re-asserted verbatim is a no-op and fires nothing. We key the probe
+        // entity to this process so each run asserts a genuinely fresh fact. The
+        // SSE handle drops (closing the socket) on every return below — RAII, no
+        // explicit close needed.
+        let probe = entity(&format!("watch-probe-{}", std::process::id()));
+        let body = match named(&verb(vec![
+            sym("propose"),
+            fact_value("subset-of", probe, entity("group")),
+        ])) {
+            Ok(b) => b,
+            Err(err) => {
+                println!("{err}");
+                return;
+            }
+        };
+        if is_failure(&body) {
+            println!("watch-probe propose refused: {}", describe_failure(&body));
+            return;
+        }
+        let proposal = match get(&body, "proposal") {
+            Some(p) => p.clone(),
+            None => {
+                println!(
+                    "watch-probe propose -> {} but no :proposal handle",
+                    render(get(&body, "event"))
+                );
+                return;
+            }
+        };
+        let body = match named(&verb(vec![sym("assert"), proposal])) {
+            Ok(b) => b,
+            Err(err) => {
+                println!("{err}");
+                return;
+            }
+        };
+        if is_failure(&body) {
+            println!("watch-probe assert refused: {}", describe_failure(&body));
+            return;
+        }
+
+        // Drain a single event. The handle drops at this scope's end on every
+        // path (RAII), releasing the socket so the server drops the stream,
+        // whether or not an event arrived.
+        let events = read_sse_events(&mut sse, 1);
+        if let Some(event) = events.first() {
+            println!(
+                "watch (subset-of ? group) -> {} type={} data={}",
+                render(get(event, "event")),
+                render(get(event, "type")),
+                render(get(event, "data"))
+            );
+        } else {
+            println!("watch: no event observed before timeout");
+        }
+
+        // Tear the watch down. (unwatch #watch "w-N") -> :ok.
+        let body = match named(&verb(vec![sym("unwatch"), watch.clone()])) {
+            Ok(b) => b,
+            Err(err) => {
+                println!("{err}");
+                return;
+            }
+        };
+        if is_failure(&body) {
+            println!("unwatch refused: {}", describe_failure(&body));
+            return;
+        }
+        println!(
+            "unwatch {} -> {}",
+            emit_str(&watch),
+            render(get(&body, "event"))
+        );
+    } else {
+        println!("server does not advertise watch; skipping watch demo");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -919,6 +1057,310 @@ fn uds_recv_frame(stream: &mut UnixStream) -> io::Result<String> {
     String::from_utf8(body).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
 }
 
+/// Read framed replies until a `:watch-event` arrives, returning it (or `None`).
+///
+/// Over UDS there is no separate event channel: watch pushes interleave with
+/// ordinary command responses on the SAME frame stream (uds.clj fans both onto
+/// the one connection). So after triggering a change we read frames in a loop,
+/// skipping command replies (the `:asserted` echo, etc.) and any unparseable
+/// frame, until we see the `:watch-event` envelope. The loop is bounded two ways
+/// so a missing push can never hang: by `max_frames`, and by the read timeout we
+/// set on the socket BEFORE the loop — a timed-out read surfaces as an `Err` from
+/// `uds_recv_frame`, which ends the loop and yields `None` ("no event observed").
+/// Mirrors python's `_uds_await_watch_event` / go's `udsAwaitWatchEvent`.
+fn uds_await_watch_event(stream: &mut UnixStream, max_frames: usize) -> Option<Value> {
+    // Bound every read so a missing push degrades to None rather than blocking.
+    // (A failure to arm the timeout still leaves the loop bounded by max_frames.)
+    let _ = stream.set_read_timeout(Some(SSE_TIMEOUT));
+    for _ in 0..max_frames {
+        // EOF, a read timeout, or a truncated frame: stop and report nothing.
+        let raw = uds_recv_frame(stream).ok()?;
+        // An unparseable frame is skipped, not fatal — keep reading.
+        let Ok(body) = parse_str(&raw) else {
+            continue;
+        };
+        if get(&body, "event") == Some(&Value::Keyword(Keyword::from_name("watch-event"))) {
+            return Some(body);
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Watch over HTTP:  the SSE event stream  ->  parsed :watch-event envelopes
+//
+// A (watch-pattern …) call registers a standing query; matching changes are then
+// *pushed* to the session rather than polled. Over HTTP those pushes arrive on a
+// separate Server-Sent-Events stream, GET /v1/sessions/{id}/events (SPEC §9). SSE
+// is a one-way text stream: each event is one or more `data:` lines terminated by
+// a blank line; `:`-prefixed lines are keep-alive comments to be ignored.
+//
+// Why a raw TcpStream instead of a chunked HTTP reader? Dianoia (http-kit) serves
+// the stream with Transfer-Encoding: chunked and writes an immediate size-0 chunk
+// to flush the response headers before any event exists. A standard chunked reader
+// treats that size-0 chunk as end-of-body and reports EOF, closing the stream
+// before the first event ever arrives. So we hand-decode the chunked stream — the
+// same TcpStream plumbing post_edn already uses — and treat a size-0 chunk as a
+// keep-alive flush (skip it, keep reading) rather than as the end of the stream.
+// Every read is bounded by a timeout so a quiet stream can never hang the demo.
+//
+// ORDERING IS LOAD-BEARING. Dianoia registers the per-session SSE sink LAZILY, at
+// the moment the GET /events connection's headers are written — and the watch
+// dispatcher delivers a :watch-event only to sinks present at emit time, with NO
+// backlog replay. So the stream must be OPENED (sink registered) BEFORE the change
+// that triggers the event, or the push races ahead of the sink and is lost. We
+// therefore split the work in two:
+//
+//   * open_sse_stream — connect, send the GET, read PAST the status line and
+//     headers (writing the request + draining headers is what makes Dianoia
+//     register the sink), and hand back an open handle. Call this BEFORE the
+//     trigger.
+//   * read_sse_events — drain parsed events from an already-open handle, AFTER the
+//     trigger. Bounded by the handle's read timeout.
+//
+// This is read-only and single-threaded by design. Pure std for the plumbing
+// (TcpStream); the EDN codec is the same edn-format used everywhere above.
+// ---------------------------------------------------------------------------
+
+/// Bounds every read on the SSE stream — the per-read timeout that keeps a quiet
+/// stream from hanging the demo. Mirrors python's 10.0s / go's `sseTimeout`.
+const SSE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// An open SSE connection: the raw `TcpStream` plus the body bytes already read
+/// past the header terminator.
+///
+/// `open_sse_stream` builds one (connection live, headers consumed, server sink
+/// registered); `read_sse_events` drains events from it. `buf` holds any body
+/// bytes carried across the header read into the body decode so the chunked
+/// decoder does not lose them. Mirrors python's `_SSEStream` / go's `sseStream`.
+///
+/// Closing is RAII: dropping the handle closes the `TcpStream`, which lets the
+/// server tear the stream down — so unlike python (an explicit `close`) and go
+/// (a `close` method called on every path), no teardown call is needed. Every
+/// scope exit in the watch demo drops the handle and releases the socket. A
+/// one-line `close` would read no better here; the Drop is the close.
+struct SseStream {
+    // `stream` is read by `read_sse_events`; `_` would hide that it is the live
+    // socket. It is dropped (and thus closed) when the handle goes out of scope.
+    stream: TcpStream,
+    buf: Vec<u8>,
+}
+
+/// Open the SSE event stream for `session_id` and return an [`SseStream`].
+///
+/// Parses host/port from `base` (reusing [`parse_host_port`], the same parser
+/// post_edn uses), dials a `TcpStream`, issues `GET /v1/sessions/{id}/events`
+/// with an `Accept: text/event-stream` header, and reads PAST the status line and
+/// response headers — stopping at the blank line that begins the body. It does
+/// NOT read any event bodies; that is [`read_sse_events`]'s job.
+///
+/// The split matters because writing the GET and draining its headers is what
+/// makes Dianoia register this session's SSE sink, and the watch dispatcher only
+/// delivers to sinks that exist when an event is emitted (no replay). So a caller
+/// must open the stream BEFORE triggering the change it wants to observe, then
+/// read AFTER — otherwise the push races ahead of the sink and is lost.
+///
+/// A connection-level dial failure is the one `Err` (the caller has no handle to
+/// drop). Once dialed, an early close, a read timeout, or a write failure DURING
+/// the header read still returns a DEGRADED handle (empty `buf`) rather than an
+/// error, so the caller's path stays uniform: the subsequent read sees EOF and
+/// yields no events. Mirrors python's `open_sse_stream` / go's `openSSEStream`.
+fn open_sse_stream(base: &str, session_id: &str, timeout: Duration) -> Result<SseStream, String> {
+    let (host, port) = parse_host_port(base);
+
+    let mut stream = TcpStream::connect((host.as_str(), port)).map_err(|err| {
+        format!("could not open the Lemma SSE stream at {base:?} ({err}); is the server running?")
+    })?;
+    // Every read on this socket — the header drain here and the body reads in
+    // read_sse_events — is bounded by this timeout so a quiet stream cannot hang.
+    let _ = stream.set_read_timeout(Some(timeout));
+
+    let request = format!(
+        "GET /v1/sessions/{session_id}/events HTTP/1.1\r\n\
+         Host: {host}:{port}\r\n\
+         Accept: text/event-stream\r\n\
+         X-Lemma-Session: {session_id}\r\n\
+         Connection: keep-alive\r\n\r\n"
+    );
+    if stream.write_all(request.as_bytes()).is_err() {
+        // Write failed before the sink could register: hand back a degraded
+        // handle (empty buf) so the caller's drop path is uniform.
+        return Ok(SseStream {
+            stream,
+            buf: Vec::new(),
+        });
+    }
+
+    // Consume the status line and headers; the body starts after the blank line.
+    // Anything already read past it is retained on the handle so the chunked
+    // decoder in read_sse_events does not lose those bytes. Draining the headers
+    // here is the act that registers the server-side sink.
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 4096];
+    while buf.windows(4).position(|w| w == b"\r\n\r\n").is_none() {
+        match stream.read(&mut chunk) {
+            Ok(0) => {
+                // Server closed before the headers completed: degraded handle.
+                return Ok(SseStream {
+                    stream,
+                    buf: Vec::new(),
+                });
+            }
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(_) => {
+                // A timeout or broken connection during the header read: still
+                // hand back a handle (empty body) so the caller's drop path is
+                // uniform; the read will see EOF and report no events.
+                return Ok(SseStream {
+                    stream,
+                    buf: Vec::new(),
+                });
+            }
+        }
+    }
+    // Split at the header terminator; everything after it is the start of body.
+    let split = buf
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|i| i + 4)
+        .unwrap_or(buf.len());
+    Ok(SseStream {
+        stream,
+        buf: buf.split_off(split),
+    })
+}
+
+/// Drain up to `max_events` parsed envelopes from an open [`SseStream`].
+///
+/// The handle's socket is live and its headers already consumed. This hand-decodes
+/// the chunked transfer body and parses Server-Sent Events out of it: each event's
+/// `data:` lines are concatenated and run through `parse_str`, so the returned
+/// `Vec` holds the parsed envelopes (typically `:watch-event` maps).
+///
+/// A read timeout (the per-read timeout set by [`open_sse_stream`], surfacing as
+/// `io::ErrorKind::WouldBlock` OR `TimedOut` — the kind is platform-dependent, so
+/// we handle BOTH) or end of stream ends the read and returns whatever arrived so
+/// far, so a quiet stream degrades to an empty `Vec` rather than hanging — it
+/// NEVER blocks indefinitely. A size-0 chunk is http-kit's header-flush
+/// keep-alive, NOT end-of-stream, so we skip it and keep reading; a genuine
+/// connection close (read returns 0) ends the read. The caller owns the handle and
+/// drops it (RAII close); this only reads. Mirrors python's `read_sse_events` /
+/// go's `readSSEEvents`.
+fn read_sse_events(stream: &mut SseStream, max_events: usize) -> Vec<Value> {
+    // Pull more bytes onto the buffer. Returns Err on a timeout or EOF so the
+    // readers below stop cleanly — both WouldBlock and TimedOut are the per-read
+    // timeout (which kind fires is platform-dependent), so both end the read.
+    fn fill(stream: &mut SseStream) -> Result<(), ()> {
+        let mut chunk = [0u8; 4096];
+        match stream.stream.read(&mut chunk) {
+            Ok(0) => Err(()), // genuine connection close
+            Ok(n) => {
+                stream.buf.extend_from_slice(&chunk[..n]);
+                Ok(())
+            }
+            Err(err)
+                if err.kind() == io::ErrorKind::WouldBlock
+                    || err.kind() == io::ErrorKind::TimedOut =>
+            {
+                Err(()) // the per-read timeout: a quiet stream, stop here
+            }
+            Err(_) => Err(()), // any other read error ends the drain cleanly
+        }
+    }
+
+    // Pull one CRLF-delimited line off the buffer (for chunk-size lines).
+    fn read_line(stream: &mut SseStream) -> Result<Vec<u8>, ()> {
+        while stream.buf.windows(2).position(|w| w == b"\r\n").is_none() {
+            fill(stream)?;
+        }
+        let idx = stream.buf.windows(2).position(|w| w == b"\r\n").unwrap();
+        let line = stream.buf[..idx].to_vec();
+        stream.buf.drain(..idx + 2);
+        Ok(line)
+    }
+
+    // Pull exactly n bytes off the buffer (for chunk bodies + the trailing CRLF).
+    fn read_n(stream: &mut SseStream, n: usize) -> Result<Vec<u8>, ()> {
+        while stream.buf.len() < n {
+            fill(stream)?;
+        }
+        let out = stream.buf[..n].to_vec();
+        stream.buf.drain(..n);
+        Ok(out)
+    }
+
+    let mut events: Vec<Value> = Vec::new();
+    let mut text = String::new(); // decoded body bytes awaiting SSE framing
+    while events.len() < max_events {
+        let size_line = match read_line(stream) {
+            Ok(line) => line,
+            Err(()) => break, // EOF or read timeout: return what we gathered
+        };
+        // Trim the trailing CR (and any stray whitespace) off the hex size line.
+        let size_str = String::from_utf8_lossy(&size_line);
+        let size_str = size_str.trim();
+        if size_str.is_empty() {
+            continue; // stray blank line between chunks — ignore
+        }
+        let size = match usize::from_str_radix(size_str, 16) {
+            Ok(size) => size,
+            Err(_) => break, // malformed chunk-size line: stop cleanly
+        };
+        if size == 0 {
+            continue; // header-flush keep-alive, NOT end-of-stream
+        }
+        let body_bytes = match read_n(stream, size) {
+            Ok(bytes) => bytes,
+            Err(()) => break,
+        };
+        text.push_str(&String::from_utf8_lossy(&body_bytes));
+        if read_n(stream, 2).is_err() {
+            break; // the CRLF that trails every chunk body
+        }
+
+        // An SSE event is the run of lines up to the next blank line. Concatenate
+        // its `data:` payloads (dropping `:` comment lines) and parse the result
+        // as one EDN envelope.
+        while let Some(idx) = text.find("\n\n") {
+            let block = text[..idx].to_string();
+            text = text[idx + 2..].to_string();
+            let data: Vec<&str> = block
+                .lines()
+                .filter(|line| line.starts_with("data:"))
+                .map(|line| line["data:".len()..].trim_start())
+                .collect();
+            if !data.is_empty() {
+                if let Ok(event) = parse_str(&data.join("\n")) {
+                    events.push(event);
+                }
+                if events.len() >= max_events {
+                    break;
+                }
+            }
+        }
+    }
+    events
+}
+
+/// Walk the same propose/assert/query round-trip as [`main_run`], but over a
+/// Unix domain socket frame stream instead of HTTP. `socket_path` is the path
+/// the Dianoia UDS listener binds (e.g. `/tmp/dianoia.sock`).
+///
+/// Step for step this mirrors `main_run` — hello, enter a world, propose a fact,
+/// assert it, query it back — with one protocol difference: the server binds the
+/// session to the CONNECTION from the welcome envelope (uds.clj handle-frame),
+/// so we do NOT thread the session id into later frames. Every call after hello
+/// simply rides the same open socket, and we read the id for display out of the
+/// welcome body's `:session` rather than echoing it anywhere.
+///
+/// As in `main_run`, after each reply we check `:event`; an `:error` /
+/// `:rejected` envelope is printed (via `describe_failure`) and the sequence
+/// returns cleanly rather than panicking — NO unwrap()/expect() on
+/// server-controlled data. Where python needed a try/finally and Go a
+/// `defer conn.Close()` to close the socket on every exit path, Rust's RAII
+/// drops `stream` at the end of scope automatically: every `return` below closes
+/// the connection (which also lets the server's reader observe EOF and drop the
+/// session) with no explicit cleanup.
 fn main_uds(socket_path: &str) {
     // Dial the socket. A failure here — the socket file is missing, or nothing
     // is accepting on it — is the one transport error we name up front, pointing
@@ -1186,6 +1628,137 @@ fn main_uds(socket_path: &str) {
     } else {
         println!("server does not advertise cursor pagination; skipping paged query");
     }
+
+    // 8. Watch over UDS. Same standing-pattern idea as the HTTP path, but the push
+    //    has nowhere separate to go: it interleaves with command replies on this
+    //    one socket. Gated on the server advertising :lemma/watch. This block
+    //    follows the paginated if/else above unconditionally.
+    if info.supports("lemma/watch") {
+        // (watch-pattern :pattern [[subset-of ?x #entity "group"]]) — flat keyword
+        // args, as on HTTP (the :pattern keyword then the where-vector, NOT a
+        // wrapping map). The reply carries the #watch handle.
+        let pattern = Value::Vector(vec![Value::Vector(vec![
+            sym("subset-of"),
+            sym("?x"),
+            entity("group"),
+        ])]);
+        let body = match call(
+            &mut stream,
+            &verb(vec![
+                sym("watch-pattern"),
+                Value::Keyword(Keyword::from_name("pattern")),
+                pattern,
+            ]),
+        ) {
+            Ok(b) => b,
+            Err(err) => {
+                println!("{err}");
+                return;
+            }
+        };
+        if is_failure(&body) {
+            println!("watch-pattern refused: {}", describe_failure(&body));
+            return;
+        }
+        let watch = match get(&body, "watch") {
+            Some(w) => w.clone(),
+            None => {
+                println!(
+                    "watch-pattern -> {} but no :watch handle",
+                    render(get(&body, "event"))
+                );
+                return;
+            }
+        };
+        println!(
+            "watch (subset-of ? group) -> {}  watch={}",
+            render(get(&body, "event")),
+            emit_str(&watch)
+        );
+
+        // Trigger a fresh delta (a verbatim re-assert is a no-op and fires
+        // nothing), keyed to this process so each run is genuinely new. The
+        // :asserted reply and the :watch-event push both land on this socket; we
+        // read the assert reply here via call, then demux the push below.
+        let probe = entity(&format!("watch-probe-{}", std::process::id()));
+        let body = match call(
+            &mut stream,
+            &verb(vec![
+                sym("propose"),
+                fact_value("subset-of", probe, entity("group")),
+            ]),
+        ) {
+            Ok(b) => b,
+            Err(err) => {
+                println!("{err}");
+                return;
+            }
+        };
+        if is_failure(&body) {
+            println!("watch-probe propose refused: {}", describe_failure(&body));
+            return;
+        }
+        let proposal = match get(&body, "proposal") {
+            Some(p) => p.clone(),
+            None => {
+                println!(
+                    "watch-probe propose -> {} but no :proposal handle",
+                    render(get(&body, "event"))
+                );
+                return;
+            }
+        };
+        let body = match call(&mut stream, &verb(vec![sym("assert"), proposal])) {
+            Ok(b) => b,
+            Err(err) => {
+                println!("{err}");
+                return;
+            }
+        };
+        if is_failure(&body) {
+            println!("watch-probe assert refused: {}", describe_failure(&body));
+            return;
+        }
+
+        // Demux the watch push off the same frame stream. uds_await_watch_event
+        // sets its own read timeout before the loop, so a missing push degrades to
+        // None rather than hanging.
+        if let Some(event) = uds_await_watch_event(&mut stream, 8) {
+            println!(
+                "watch (subset-of ? group) -> {} type={} data={}",
+                render(get(&event, "event")),
+                render(get(&event, "type")),
+                render(get(&event, "data"))
+            );
+        } else {
+            println!("watch: no event observed before timeout");
+        }
+
+        // Tear the watch down. (unwatch #watch "w-N") -> :ok. uds_await_watch_event
+        // left a read timeout on the socket; clear it so the final unwatch recv is
+        // not poisoned by a stale per-read bound — mirroring the go fix.
+        let _ = stream.set_read_timeout(None);
+        let body = match call(&mut stream, &verb(vec![sym("unwatch"), watch.clone()])) {
+            Ok(b) => b,
+            Err(err) => {
+                println!("{err}");
+                return;
+            }
+        };
+        if is_failure(&body) {
+            println!("unwatch refused: {}", describe_failure(&body));
+            return;
+        }
+        println!(
+            "unwatch {} -> {}",
+            emit_str(&watch),
+            render(get(&body, "event"))
+        );
+    } else {
+        println!("server does not advertise watch; skipping watch demo");
+    }
+    // RAII: `stream` is dropped here, closing the socket on this success path
+    // exactly as it is on every early `return` above — no try/finally, no defer.
 }
 
 // ---------------------------------------------------------------------------
@@ -2591,5 +3164,643 @@ mod tests {
             .collect();
         assert_eq!(continues.len(), 1);
         assert_eq!(continues[0], r#"(continue #cursor "c-1")"#);
+    }
+
+    // ===================================================================
+    // (J) Watch over HTTP: open_sse_stream + read_sse_events.
+    //     Mirrors python OpenSseStreamTests / ReadSseEventsTests and the
+    //     _FakeSseSocket / _chunk / _canned_sse_response byte helpers.
+    //
+    //     open_sse_stream dials host:port, so we drive it against a scripted
+    //     TcpListener bound to 127.0.0.1:0 whose peer thread records the GET
+    //     request bytes and replays canned response bytes. read_sse_events
+    //     takes &mut SseStream, so we build one DIRECTLY over a real connected
+    //     TcpStream pair (its fields are visible in-file) and have a peer thread
+    //     script the chunked-body writes. Determinism: blocking I/O bounded by
+    //     scripted closes and thread joins -- short read timeouts appear ONLY
+    //     where a timeout expiry is itself the behaviour under test (there are
+    //     none here: every quiet path is a real peer drop -> EOF, not a timer).
+    // ===================================================================
+
+    /// Wrap `payload` as one HTTP chunked-transfer frame: `hexlen\r\n<bytes>\r\n`.
+    /// The exact framing http-kit emits and read_sse_events transfer-decodes.
+    /// Mirrors python's `_chunk`.
+    fn chunk(payload: &[u8]) -> Vec<u8> {
+        let mut out = format!("{:x}\r\n", payload.len()).into_bytes();
+        out.extend_from_slice(payload);
+        out.extend_from_slice(b"\r\n");
+        out
+    }
+
+    /// One :watch-event envelope's EDN text -- a `#fact` delta. Mirrors python's
+    /// `_WATCH_EVENT_EDN`.
+    const WATCH_EVENT_EDN: &str = concat!(
+        r#"{:event :watch-event :type :assert "#,
+        r#":data #fact {:predicate subset-of :subject #entity "wp" :object #entity "group"}}"#,
+    );
+
+    /// One SSE block: a `:`-comment keep-alive line (to be dropped) then the
+    /// `data:` payload, ending in the SSE blank line. Mirrors python's
+    /// `_SSE_BLOCK`.
+    fn sse_block() -> Vec<u8> {
+        format!(": keep-alive comment -- must be ignored\ndata: {WATCH_EVENT_EDN}\n\n").into_bytes()
+    }
+
+    /// Assemble a full chunked SSE HTTP/1.1 response: headers, then a size-0
+    /// keep-alive flush chunk (which is NOT end-of-stream), then one
+    /// transfer-chunk per SSE block. NO terminating size-0 chunk -- the stream
+    /// just goes quiet and the peer signals EOF by closing. Mirrors python's
+    /// `_canned_sse_response`.
+    fn canned_sse_response(blocks: &[Vec<u8>]) -> Vec<u8> {
+        let mut out = b"HTTP/1.1 200 OK\r\n\
+            Content-Type: text/event-stream\r\n\
+            Transfer-Encoding: chunked\r\n\r\n"
+            .to_vec();
+        out.extend_from_slice(&chunk(b"")); // size-0 header-flush keep-alive
+        for block in blocks {
+            out.extend_from_slice(&chunk(block));
+        }
+        out
+    }
+
+    /// Just the chunked BODY bytes (no HTTP head): the size-0 keep-alive flush
+    /// followed by one chunk per SSE block. This is what a read_sse_events test
+    /// feeds an already-open handle whose headers were "consumed" by the split.
+    fn canned_sse_body(blocks: &[Vec<u8>]) -> Vec<u8> {
+        let mut out = chunk(b""); // size-0 header-flush keep-alive
+        for block in blocks {
+            out.extend_from_slice(&chunk(block));
+        }
+        out
+    }
+
+    /// Spawn a one-shot scripted SSE peer on a fresh 127.0.0.1 port.
+    ///
+    /// The thread accepts one connection, reads the GET request (status line +
+    /// headers up to the blank line), writes `response_bytes` verbatim, then
+    /// CLOSES (drops the stream) so the client's reads see EOF. Returns the
+    /// dialable base URL and a handle yielding the captured request head text.
+    fn spawn_scripted_sse_peer(response_bytes: Vec<u8>) -> (String, JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let port = listener.local_addr().expect("local addr").port();
+        let base = format!("http://127.0.0.1:{port}");
+        let handle = thread::spawn(move || {
+            let (mut stream, _peer) = listener.accept().expect("accept connection");
+            // Read the request head up to the blank line. The client always
+            // writes the full GET, so the terminator arrives without a timeout.
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            loop {
+                let n = stream.read(&mut byte).expect("read request byte");
+                assert_ne!(n, 0, "peer closed before the GET headers completed");
+                head.push(byte[0]);
+                if head.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            stream.write_all(&response_bytes).expect("write response");
+            // Drop `stream` -> client sees EOF on any further read.
+            String::from_utf8_lossy(&head).to_string()
+        });
+        (base, handle)
+    }
+
+    /// A real connected TcpStream pair on loopback: `(client, peer)`. The client
+    /// half is handed to a directly-constructed `SseStream`; the peer half is
+    /// scripted by the test (write the chunked body, then drop for EOF). Built
+    /// over a throwaway listener so both ends are genuine OS sockets -- no fake.
+    fn connected_tcp_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        let client = TcpStream::connect(addr).expect("connect loopback");
+        let (peer, _) = listener.accept().expect("accept loopback");
+        (client, peer)
+    }
+
+    /// Build an open `SseStream` over a connected TcpStream pair, returning the
+    /// handle (with the given leftover `buf`) plus the scripted peer half. The
+    /// handle's `stream` is live; the test writes the chunked body on `peer`.
+    fn sse_stream_over_pair(buf: Vec<u8>) -> (SseStream, TcpStream) {
+        let (client, peer) = connected_tcp_pair();
+        (
+            SseStream {
+                stream: client,
+                buf,
+            },
+            peer,
+        )
+    }
+
+    // --- (J.1) open_sse_stream: the GET, the headers, the leftover buf ------
+
+    #[test]
+    fn test_open_sse_stream_writes_get_on_events_endpoint_with_required_headers() {
+        // The opening GET must target /v1/sessions/{id}/events and carry the
+        // X-Lemma-Session and Accept: text/event-stream headers -- the request
+        // that makes Dianoia register this session's SSE sink.
+        let (base, peer) = spawn_scripted_sse_peer(canned_sse_response(&[sse_block()]));
+
+        let stream = open_sse_stream(&base, "s-9", SSE_TIMEOUT).expect("open the stream");
+        drop(stream); // release the socket before joining the peer
+        let head = peer.join().unwrap();
+
+        let request_line = head.lines().next().unwrap_or("");
+        assert_eq!(request_line, "GET /v1/sessions/s-9/events HTTP/1.1");
+        assert!(
+            head.contains("Accept: text/event-stream"),
+            "GET must request the SSE content type, got head: {head}"
+        );
+        assert!(
+            head.contains("X-Lemma-Session: s-9"),
+            "GET must carry the session header, got head: {head}"
+        );
+    }
+
+    #[test]
+    fn test_open_sse_stream_consumes_only_status_and_headers_leaving_body_in_buf() {
+        // open_sse_stream reads PAST the blank-line header terminator (the act
+        // that registers the sink) but must NOT consume any body bytes: the
+        // handle's buf must hold EXACTLY the leftover chunked-body bytes that
+        // followed the headers, byte-for-byte.
+        let body = canned_sse_body(&[sse_block()]);
+        let mut response = b"HTTP/1.1 200 OK\r\n\
+            Content-Type: text/event-stream\r\n\
+            Transfer-Encoding: chunked\r\n\r\n"
+            .to_vec();
+        response.extend_from_slice(&body);
+        let (base, peer) = spawn_scripted_sse_peer(response);
+
+        let stream = open_sse_stream(&base, "s-1", SSE_TIMEOUT).expect("open the stream");
+        let buf = stream.buf.clone();
+        drop(stream);
+        peer.join().unwrap();
+
+        // No header bytes leaked into the body buffer.
+        assert!(
+            !buf.windows(8).any(|w| w == b"HTTP/1.1"),
+            "header bytes leaked into buf"
+        );
+        // The buffer is EXACTLY the leftover body (size-0 flush + the data chunk).
+        assert_eq!(buf, body);
+    }
+
+    #[test]
+    fn test_open_sse_stream_immediate_close_during_headers_yields_degraded_empty_handle() {
+        // The peer writes a partial status line then closes BEFORE the blank-line
+        // terminator. open_sse_stream must still return a handle (degraded: empty
+        // buf) rather than Err, and read_sse_events over it returns empty without
+        // hanging -- the subsequent read sees EOF.
+        let (base, peer) = spawn_scripted_sse_peer(b"HTTP/1.1 200 OK\r\n".to_vec());
+
+        let mut stream = open_sse_stream(&base, "s-1", SSE_TIMEOUT)
+            .expect("a mid-header close must still yield a handle, not Err");
+        assert!(
+            stream.buf.is_empty(),
+            "a degraded handle carries an empty buf"
+        );
+
+        // And draining it terminates at EOF with no events, no hang.
+        let events = read_sse_events(&mut stream, 1);
+        drop(stream);
+        peer.join().unwrap();
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn test_open_sse_stream_connection_failure_errs_naming_the_base() {
+        // Bind to claim a port, note it, then drop the listener so nothing is
+        // listening -- the dial must fail with an Err that names the base.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let port = listener.local_addr().expect("local addr").port();
+        let base = format!("http://127.0.0.1:{port}");
+        drop(listener);
+
+        let result = open_sse_stream(&base, "s-1", SSE_TIMEOUT);
+
+        // Match by hand rather than expect_err: SseStream is intentionally not
+        // Debug (the non-test half is off-limits), so we cannot unwrap the Ok side.
+        let err = match result {
+            Err(err) => err,
+            Ok(_) => panic!("dialing a dropped listener must fail, got an open handle"),
+        };
+        assert!(
+            err.contains(&base),
+            "the error should name the base {base:?}, got: {err}"
+        );
+    }
+
+    // --- (J.2) read_sse_events: chunked + SSE decode off a real socket ------
+
+    /// Script `bytes` onto the peer half, then drop it (EOF), joining the writer.
+    /// Returns once the writer thread has finished, so the bytes are on the wire.
+    fn script_peer_then_close(peer: TcpStream, bytes: Vec<u8>) -> JoinHandle<()> {
+        thread::spawn(move || {
+            let mut peer = peer;
+            peer.write_all(&bytes).expect("write scripted body");
+            // Drop `peer` -> client read sees EOF after the scripted bytes.
+        })
+    }
+
+    #[test]
+    fn test_read_sse_events_parses_the_watch_event_off_a_canned_chunked_stream() {
+        // The happy path: one :watch-event, EDN built via emit_str's wire shape
+        // and framed as data: lines in a hex-sized chunk, is decoded and parsed.
+        let (mut stream, peer) = sse_stream_over_pair(Vec::new());
+        let writer = script_peer_then_close(peer, canned_sse_body(&[sse_block()]));
+
+        let events = read_sse_events(&mut stream, 1);
+        writer.join().unwrap();
+
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(
+            get(event, "event"),
+            Some(&Value::Keyword(Keyword::from_name("watch-event")))
+        );
+        assert_eq!(
+            get(event, "type"),
+            Some(&Value::Keyword(Keyword::from_name("assert")))
+        );
+        // The :data is the #fact delta, exactly as the canned EDN parses.
+        let expected_data = get(&parse_str(WATCH_EVENT_EDN).unwrap(), "data")
+            .cloned()
+            .unwrap();
+        assert_eq!(get(event, "data"), Some(&expected_data));
+    }
+
+    #[test]
+    fn test_read_sse_events_skips_a_size_zero_chunk_before_the_event_chunk() {
+        // THE load-bearing case: canned_sse_body leads with a size-0 chunk BEFORE
+        // the data chunk. A reader that mistook size-0 for EOF would return []
+        // before ever seeing the event. Getting the event back proves the size-0
+        // chunk was skipped (kept reading), not treated as end-of-stream.
+        let (mut stream, peer) = sse_stream_over_pair(Vec::new());
+        let body = canned_sse_body(&[sse_block()]);
+        // Sanity: the very first chunk on the wire is the size-0 flush.
+        assert!(
+            body.starts_with(b"0\r\n\r\n"),
+            "body must lead with a size-0 chunk"
+        );
+        let writer = script_peer_then_close(peer, body);
+
+        let events = read_sse_events(&mut stream, 1);
+        writer.join().unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            get(&events[0], "event"),
+            Some(&Value::Keyword(Keyword::from_name("watch-event")))
+        );
+    }
+
+    #[test]
+    fn test_read_sse_events_drops_colon_comment_lines() {
+        // The SSE block carries a leading `: comment` keep-alive line before the
+        // data: line. If the comment leaked into the EDN, parse_str would fail or
+        // the envelope would be malformed. A clean :watch-event parse proves the
+        // comment was dropped and only the data: payload fed the parse.
+        let (mut stream, peer) = sse_stream_over_pair(Vec::new());
+        // Confirm the block actually contains a comment line to drop.
+        let block = sse_block();
+        assert!(
+            String::from_utf8_lossy(&block).contains(": keep-alive comment"),
+            "the fixture block must contain a : comment line"
+        );
+        let writer = script_peer_then_close(peer, canned_sse_body(&[block]));
+
+        let events = read_sse_events(&mut stream, 1);
+        writer.join().unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            get(&events[0], "event"),
+            Some(&Value::Keyword(Keyword::from_name("watch-event")))
+        );
+    }
+
+    #[test]
+    fn test_read_sse_events_honors_max_events_one_of_two() {
+        // Two events on the wire but max_events 1: the loop stops at one even
+        // though more data remains.
+        let (mut stream, peer) = sse_stream_over_pair(Vec::new());
+        let writer = script_peer_then_close(peer, canned_sse_body(&[sse_block(), sse_block()]));
+
+        let events = read_sse_events(&mut stream, 1);
+        writer.join().unwrap();
+
+        assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn test_read_sse_events_drains_both_when_max_events_two() {
+        // Two events on the wire, max_events 2: both are drained and parsed.
+        let (mut stream, peer) = sse_stream_over_pair(Vec::new());
+        let writer = script_peer_then_close(peer, canned_sse_body(&[sse_block(), sse_block()]));
+
+        let events = read_sse_events(&mut stream, 2);
+        writer.join().unwrap();
+
+        assert_eq!(events.len(), 2);
+        assert!(
+            events.iter().all(
+                |e| get(e, "event") == Some(&Value::Keyword(Keyword::from_name("watch-event")))
+            )
+        );
+    }
+
+    #[test]
+    fn test_read_sse_events_stream_end_before_any_event_returns_empty_without_hanging() {
+        // Only a lone size-0 keep-alive chunk, then the peer drops (EOF): no event
+        // ever arrives. read_sse_events must terminate and return [] rather than
+        // blocking. The size-0 chunk is skipped, then the read sees a clean EOF.
+        let (mut stream, peer) = sse_stream_over_pair(Vec::new());
+        let writer = script_peer_then_close(peer, chunk(b"")); // size-0 flush only
+
+        let events = read_sse_events(&mut stream, 1);
+        writer.join().unwrap();
+
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn test_read_sse_events_peer_drop_with_no_body_returns_empty_without_hanging() {
+        // The peer drops immediately with NOTHING written: the very first
+        // read_line fill() sees EOF and the drain ends cleanly with [].
+        let (mut stream, peer) = sse_stream_over_pair(Vec::new());
+        drop(peer); // immediate EOF, no body at all
+
+        let events = read_sse_events(&mut stream, 1);
+
+        assert!(events.is_empty());
+    }
+
+    // ===================================================================
+    // (K) Watch over UDS: uds_await_watch_event demux off the frame stream.
+    //     Mirrors python UdsAwaitWatchEventTests. The helper takes
+    //     &mut UnixStream, so we drive it over a UnixStream::pair(): a peer
+    //     thread frames the scripted replies onto one half, and the helper
+    //     reads the other. uds_await_watch_event arms its OWN read timeout, so
+    //     a missing/absent event degrades to None via that bound + max_frames;
+    //     the present-event cases terminate the instant the event frame arrives.
+    // ===================================================================
+
+    /// Spawn a peer that frames each EDN string in `frames` onto `peer` in order,
+    /// then drops it (EOF). Returns the join handle. Pure blocking writes; the
+    /// drop is the only termination signal -- no sleeps.
+    fn spawn_uds_frame_writer(mut peer: UnixStream, frames: Vec<String>) -> JoinHandle<()> {
+        thread::spawn(move || {
+            for f in &frames {
+                let body = f.as_bytes();
+                peer.write_all(&(body.len() as u32).to_be_bytes())
+                    .expect("write prefix");
+                peer.write_all(body).expect("write body");
+            }
+            // Drop `peer` -> the reader sees EOF after the scripted frames.
+        })
+    }
+
+    /// The interleaved UDS watch frames mirroring python's `_UDS_*` watch fixtures.
+    const UDS_WATCH_EVENT: &str = concat!(
+        r#"{:event :watch-event :type :assert "#,
+        r#":data #fact {:predicate subset-of :subject #entity "wp" :object #entity "group"}}"#,
+    );
+    const UDS_STRAY_ECHO: &str = r#"{:event :asserted}"#;
+
+    #[test]
+    fn test_uds_await_watch_event_returns_event_past_leading_command_replies() {
+        // Two command echoes precede the :watch-event on the one frame stream;
+        // the demux must skip them and return the event. Mirrors python's
+        // skipping-leading-command-replies case.
+        let (mut a, b) = UnixStream::pair().expect("socketpair");
+        let writer = spawn_uds_frame_writer(
+            b,
+            vec![
+                UDS_STRAY_ECHO.to_string(),
+                r#"{:event :asserted}"#.to_string(),
+                UDS_WATCH_EVENT.to_string(),
+            ],
+        );
+
+        let event = uds_await_watch_event(&mut a, 8);
+        writer.join().unwrap();
+
+        let event = event.expect("the :watch-event must be demuxed off the stream");
+        assert_eq!(
+            get(&event, "event"),
+            Some(&Value::Keyword(Keyword::from_name("watch-event")))
+        );
+        assert_eq!(
+            get(&event, "type"),
+            Some(&Value::Keyword(Keyword::from_name("assert")))
+        );
+    }
+
+    #[test]
+    fn test_uds_await_watch_event_returns_event_when_it_is_the_first_frame() {
+        // The very first frame is the event: returned immediately, no skipping.
+        let (mut a, b) = UnixStream::pair().expect("socketpair");
+        let writer = spawn_uds_frame_writer(b, vec![UDS_WATCH_EVENT.to_string()]);
+
+        let event = uds_await_watch_event(&mut a, 8);
+        writer.join().unwrap();
+
+        let event = event.expect("a leading :watch-event must be returned");
+        assert_eq!(
+            get(&event, "event"),
+            Some(&Value::Keyword(Keyword::from_name("watch-event")))
+        );
+    }
+
+    #[test]
+    fn test_uds_await_watch_event_returns_none_when_absent_within_max_frames() {
+        // Only command echoes, never an event, and exactly max_frames + 1 of them
+        // on the wire: the bounded loop reads max_frames, finds no event, and
+        // returns None rather than hanging. (max_frames=3 here, four echoes
+        // scripted so the bound -- not EOF -- is what ends the loop.)
+        let (mut a, b) = UnixStream::pair().expect("socketpair");
+        let writer = spawn_uds_frame_writer(b, vec![r#"{:event :asserted}"#.to_string(); 4]);
+
+        let event = uds_await_watch_event(&mut a, 3);
+        writer.join().unwrap();
+
+        assert!(
+            event.is_none(),
+            "no event within max_frames must yield None"
+        );
+    }
+
+    #[test]
+    fn test_uds_await_watch_event_returns_none_on_premature_close() {
+        // The frame stream closes (EOF) before any event: uds_recv_frame Errs on
+        // the truncated read, the helper swallows it and reports None.
+        let (mut a, b) = UnixStream::pair().expect("socketpair");
+        drop(b); // immediate EOF, no frames at all
+
+        let event = uds_await_watch_event(&mut a, 8);
+
+        assert!(
+            event.is_none(),
+            "a premature close must yield None, not hang"
+        );
+    }
+
+    // ===================================================================
+    // (L) End-to-end UDS watch demux through the REAL main_uds.
+    //     Mirrors python UdsWatchPathEndToEndTests. main_uds reads the
+    //     :watch-event off the SAME socket the command replies ride, so the
+    //     scripted peer must (a) answer the watch-pattern / probe-propose /
+    //     probe-assert frames in lockstep, then (b) PUSH a stray command echo
+    //     and the :watch-event WITHOUT a preceding request, then (c) answer the
+    //     final unwatch. We assert the wire behaviour: a (watch-pattern frame and
+    //     an (unwatch frame were sent, with the #watch handle threaded into the
+    //     unwatch.
+    // ===================================================================
+
+    /// A UDS welcome advertising BOTH cursor-pagination AND watch, so main_uds
+    /// runs the full paginated tail AND the watch demo end to end.
+    const UDS_WELCOME_WITH_WATCH: &str = concat!(
+        r#"{:event :welcome :version 1 :session #session "s-uds-1" :world #world "default" "#,
+        r#":capabilities #{:lemma/v1 :lemma/cursor-pagination :lemma/watch} "#,
+        r#":limits {:max-message-bytes 1048576} "#,
+        r#":verbs {:core #{hello use-world propose assert query continue watch-pattern unwatch} :extensions {}}}"#,
+    );
+
+    const UDS_WATCH_ESTABLISHED: &str = r#"{:event :watch-established :watch #watch "w-1"}"#;
+    const UDS_UNWATCHED: &str = r#"{:event :ok}"#;
+
+    /// Spawn a scripted UDS peer for the end-to-end watch path. It serves
+    /// `lockstep` replies one-per-request as usual, but after writing the reply
+    /// at index `push_after` (the probe-assert reply) it ALSO writes the
+    /// unsolicited `pushes` (stray echo + :watch-event) -- exactly the
+    /// interleaving the watch dispatcher produces on the one frame stream.
+    /// Returns the socket path, a drop guard, and a handle yielding the decoded
+    /// EDN strings the client sent.
+    fn spawn_scripted_uds_watch_peer(
+        lockstep: Vec<String>,
+        push_after: usize,
+        pushes: Vec<String>,
+    ) -> (std::path::PathBuf, UdsPeerGuard, JoinHandle<Vec<String>>) {
+        let path = unique_socket_path();
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).expect("bind unix listener");
+        let guard = UdsPeerGuard { path: path.clone() };
+
+        let handle = thread::spawn(move || {
+            let (mut stream, _addr) = listener.accept().expect("accept uds connection");
+            let mut received = Vec::new();
+            for (i, reply) in lockstep.iter().enumerate() {
+                let mut prefix = [0u8; 4];
+                if stream.read_exact(&mut prefix).is_err() {
+                    break; // client stopped early
+                }
+                let len = u32::from_be_bytes(prefix) as usize;
+                let mut body = vec![0u8; len];
+                stream.read_exact(&mut body).expect("read request body");
+                received.push(String::from_utf8(body).expect("utf8 request"));
+                stream
+                    .write_all(&frame_bytes(reply))
+                    .expect("write reply frame");
+                // After the probe-assert reply, push the interleaved frames the
+                // client demuxes WITHOUT issuing a request for them.
+                if i == push_after {
+                    for push in &pushes {
+                        stream
+                            .write_all(&frame_bytes(push))
+                            .expect("write push frame");
+                    }
+                }
+            }
+            received
+        });
+
+        (path, guard, handle)
+    }
+
+    /// The 13 lockstep replies main_uds expects on the full watch run: the nine
+    /// paginated replies, then watch-established, probe-proposed, probe-asserted,
+    /// and the unwatch :ok. The stray echo + :watch-event are pushed (not
+    /// lockstep) between the probe-assert reply and the unwatch.
+    fn uds_watch_lockstep() -> Vec<String> {
+        let mut seq = uds_full_paginated_sequence(UDS_WELCOME_WITH_WATCH);
+        seq.push(UDS_WATCH_ESTABLISHED.to_string()); // reply to watch-pattern
+        seq.push(UDS_PROPOSED.to_string()); // reply to probe propose
+        seq.push(UDS_ASSERTED.to_string()); // reply to probe assert (push_after THIS)
+        seq.push(UDS_UNWATCHED.to_string()); // reply to unwatch
+        seq
+    }
+
+    #[test]
+    fn test_uds_end_to_end_watch_demuxes_event_and_sends_watch_pattern_then_unwatch() {
+        // The full demux: nine paginated frames + watch-pattern, probe
+        // propose+assert, then the unwatch -- thirteen sent frames. The stray
+        // echo and the :watch-event are PUSHED before the unwatch reply, so the
+        // client must skip the stray, observe the event, and only then unwatch.
+        // push_after = 11 (0-based): index 11 is the probe-assert reply (0..=8
+        // are the nine paginated replies, 9 watch-established, 10 probe-proposed,
+        // 11 probe-asserted).
+        let (path, _guard, peer) = spawn_scripted_uds_watch_peer(
+            uds_watch_lockstep(),
+            11,
+            vec![UDS_STRAY_ECHO.to_string(), UDS_WATCH_EVENT.to_string()],
+        );
+
+        main_uds(path.to_str().unwrap());
+        let sent = peer.join().unwrap();
+
+        // Thirteen frames in all: the watch demo ran to completion.
+        assert_eq!(sent.len(), 13, "the full watch path issues thirteen frames");
+
+        // Exactly one (watch-pattern frame was sent, with the flat :pattern args.
+        let watch_patterns: Vec<&String> = sent
+            .iter()
+            .filter(|f| {
+                matches!(parse_str(f), Ok(Value::List(elems))
+                    if elems.first() == Some(&sym("watch-pattern")))
+            })
+            .collect();
+        assert_eq!(watch_patterns.len(), 1, "exactly one (watch-pattern frame");
+
+        // The final frame is the (unwatch ...) carrying the #watch handle from
+        // the watch-established reply, threaded in verbatim.
+        let last = parse_str(&sent[12]).unwrap();
+        assert_eq!(
+            last,
+            verb(vec![
+                sym("unwatch"),
+                Value::TaggedElement(Symbol::from_name("watch"), Box::new(Value::from("w-1"))),
+            ]),
+            "the unwatch must thread the #watch \"w-1\" handle"
+        );
+    }
+
+    #[test]
+    fn test_uds_end_to_end_watch_threads_watch_handle_and_runs_after_a_stray_frame() {
+        // Parity with python's demux-past-a-stray case: the :watch-event arrives
+        // only AFTER a stray command echo on the wire, yet the client still
+        // reaches the unwatch (it did not stop on the stray, nor block waiting).
+        // Proven by the unwatch frame being present and carrying #watch "w-1".
+        let (path, _guard, peer) = spawn_scripted_uds_watch_peer(
+            uds_watch_lockstep(),
+            11,
+            vec![UDS_STRAY_ECHO.to_string(), UDS_WATCH_EVENT.to_string()],
+        );
+
+        main_uds(path.to_str().unwrap());
+        let sent = peer.join().unwrap();
+
+        let unwatch = sent
+            .iter()
+            .find_map(|f| match parse_str(f) {
+                Ok(Value::List(elems)) if elems.first() == Some(&sym("unwatch")) => Some(elems),
+                _ => None,
+            })
+            .expect("an (unwatch frame must have been sent after the demux");
+        assert_eq!(
+            unwatch.get(1),
+            Some(&Value::TaggedElement(
+                Symbol::from_name("watch"),
+                Box::new(Value::from("w-1")),
+            ))
+        );
     }
 }
