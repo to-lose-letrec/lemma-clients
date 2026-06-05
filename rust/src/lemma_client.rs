@@ -69,8 +69,9 @@
 //! Loading this file performs no network I/O — only `main` / `main_run` touch
 //! the network.
 
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::net::TcpStream;
+use std::os::unix::net::UnixStream;
 
 use edn_format::{Keyword, Symbol, Value, emit_str, parse_str};
 
@@ -471,20 +472,249 @@ fn main_run(base: &str) {
 }
 
 // ---------------------------------------------------------------------------
+// UDS transport:  EDN form  ->  length-prefixed frame  ->  parsed EDN response
+//
+// A second transport that speaks the same EDN codec over a Unix domain socket
+// instead of HTTP. It sits alongside post_edn rather than replacing it — same
+// "encode, send, decode" shape, different plumbing. Two things differ from the
+// HTTP path:
+//
+//   * Framing. There is no HTTP envelope, so each message is delimited
+//     explicitly: a 4-byte big-endian UNSIGNED length prefix followed by that
+//     many UTF-8 bytes of EDN. This matches Dianoia's transport/uds.clj
+//     write-frame / read-frame exactly (DataOutputStream.writeInt is a 4-byte
+//     big-endian int), and the prefix is built/read with u32::to_be_bytes /
+//     u32::from_be_bytes — no struct/binary helper, just std.
+//   * Session binding. Over HTTP the client threads the session id back into
+//     each request header. Over UDS the server binds the session to the
+//     *connection*: it captures the id from the welcome envelope and attaches
+//     it to the socket (see uds.clj handle-frame / build-ctx). So the client
+//     must NOT echo the session id into later frames — it just keeps sending on
+//     the same socket, and the server already knows who it is. We read the id
+//     for display straight out of the welcome BODY (:session), never a header.
+//
+// Pure std: std::os::unix::net::UnixStream for the connection, the byte-array
+// prefix for framing; the EDN codec is still edn-format.
+// ---------------------------------------------------------------------------
+
+/// Where a locally booted Dianoia UDS listener binds by default (see uds.clj
+/// start! :socket-path). Override per call via the `socket_path` argument.
+const DEFAULT_SOCKET: &str = "/tmp/dianoia.sock";
+
+/// Frame `edn_str` and write it: 4-byte big-endian length prefix, then the body.
+///
+/// The body is the UTF-8 bytes of `edn_str` (Rust `&str` is already UTF-8); the
+/// prefix is its BYTE length as a big-endian `u32` (`u32::to_be_bytes`).
+/// `write_all` keeps writing until every byte is on the wire, so one call per
+/// chunk suffices. Mirrors uds.clj write-frame.
+fn uds_send_frame(stream: &mut UnixStream, edn_str: &str) -> io::Result<()> {
+    let body = edn_str.as_bytes();
+    let prefix = (body.len() as u32).to_be_bytes();
+    stream.write_all(&prefix)?;
+    stream.write_all(body)?;
+    Ok(())
+}
+
+/// Read one length-prefixed frame and return its body as a `String`.
+///
+/// The inverse of [`uds_send_frame`]: `read_exact` the 4-byte big-endian length
+/// (`u32::from_be_bytes`), `read_exact` that many body bytes, then decode UTF-8.
+/// `read_exact` is the loop-until-satisfied read — a single `read` may return
+/// fewer bytes than asked, and a peer that closes mid-frame surfaces as an
+/// `UnexpectedEof`. We rewrite that into an error naming how many bytes were
+/// expected (prefix vs. body), so a truncated frame is actionable — mirroring
+/// python's `_recv_exactly` message shape. Mirrors uds.clj read-frame.
+fn uds_recv_frame(stream: &mut UnixStream) -> io::Result<String> {
+    let mut prefix = [0u8; 4];
+    stream.read_exact(&mut prefix).map_err(|err| {
+        io::Error::new(
+            err.kind(),
+            format!("reading frame length prefix (4 bytes expected): {err}"),
+        )
+    })?;
+    let length = u32::from_be_bytes(prefix) as usize;
+    let mut body = vec![0u8; length];
+    stream.read_exact(&mut body).map_err(|err| {
+        io::Error::new(
+            err.kind(),
+            format!("reading frame body ({length} bytes expected): {err}"),
+        )
+    })?;
+    String::from_utf8(body).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+}
+
+fn main_uds(socket_path: &str) {
+    // Dial the socket. A failure here — the socket file is missing, or nothing
+    // is accepting on it — is the one transport error we name up front, pointing
+    // at the path so the failure is actionable rather than a bare errno. No TCP
+    // is touched: this is the only connect on the UDS path.
+    let mut stream = match UnixStream::connect(socket_path) {
+        Ok(s) => s,
+        Err(err) => {
+            println!(
+                "could not connect to the Lemma UDS server at {socket_path:?} ({err}); \
+                 is the server running?"
+            );
+            return;
+        }
+    };
+
+    // One round-trip: frame out, frame in, parse. The session lives on the
+    // connection — no id is echoed back, unlike the HTTP transport. A transport
+    // error (write/read) or an unparseable body is returned as Err so the caller
+    // can stop cleanly. Takes `&mut UnixStream` so it can reuse the one socket.
+    let call = |stream: &mut UnixStream, form: &Value| -> Result<Value, String> {
+        let payload = emit_str(form);
+        uds_send_frame(stream, &payload)
+            .map_err(|err| format!("could not send UDS frame to {socket_path:?} ({err})"))?;
+        let raw = uds_recv_frame(stream)
+            .map_err(|err| format!("could not read UDS frame from {socket_path:?} ({err})"))?;
+        parse_str(&raw)
+            .map_err(|err| format!("parsing EDN response from {socket_path:?} ({err}): {raw:?}"))
+    };
+
+    // 1. Anonymous hello. The welcome reply carries the session id, which the
+    //    server has already pinned to this connection for us — so unlike HTTP we
+    //    read it from the body (:session), not a header.
+    let body = match call(&mut stream, &verb(vec![sym("hello")])) {
+        Ok(b) => b,
+        Err(err) => {
+            println!("{err}");
+            return;
+        }
+    };
+    if get(&body, "event") != Some(&Value::Keyword(Keyword::from_name("welcome"))) {
+        println!(
+            "hello: expected :welcome, got {} -- {}",
+            render(get(&body, "event")),
+            describe_failure(&body)
+        );
+        return;
+    }
+    println!(
+        "hello -> :welcome  version={}  session={}  world={}",
+        render(get(&body, "version")),
+        render(get(&body, "session")),
+        render(get(&body, "world"))
+    );
+
+    // 2. Enter the world. (use-world #world "default")
+    let body = match call(&mut stream, &verb(vec![sym("use-world"), world("default")])) {
+        Ok(b) => b,
+        Err(err) => {
+            println!("{err}");
+            return;
+        }
+    };
+    if is_failure(&body) {
+        println!("use-world refused: {}", describe_failure(&body));
+        return;
+    }
+    println!(
+        "use-world \"default\" -> {}  world={}",
+        render(get(&body, "event")),
+        render(get(&body, "world"))
+    );
+
+    // 3. Propose a fact: morningstar is equivalent to venus. The reply hands
+    //    back a #proposal handle we feed straight into the assert.
+    let f = fact_value("equivalent", entity("morningstar"), entity("venus"));
+    let body = match call(&mut stream, &verb(vec![sym("propose"), f])) {
+        Ok(b) => b,
+        Err(err) => {
+            println!("{err}");
+            return;
+        }
+    };
+    if is_failure(&body) {
+        println!("propose refused: {}", describe_failure(&body));
+        return;
+    }
+    // Clone the proposal handle out of the borrowed body so we can feed it into
+    // the assert without holding the borrow (same shape as the HTTP path).
+    let proposal = match get(&body, "proposal") {
+        Some(p) => p.clone(),
+        None => {
+            println!(
+                "propose -> {} but no :proposal handle",
+                render(get(&body, "event"))
+            );
+            return;
+        }
+    };
+    println!(
+        "propose (equivalent morningstar venus) -> {}  proposal={}",
+        render(get(&body, "event")),
+        emit_str(&proposal)
+    );
+
+    // 4. Assert the proposed fact into the world.
+    let body = match call(&mut stream, &verb(vec![sym("assert"), proposal])) {
+        Ok(b) => b,
+        Err(err) => {
+            println!("{err}");
+            return;
+        }
+    };
+    if is_failure(&body) {
+        println!("assert refused: {}", describe_failure(&body));
+        return;
+    }
+    println!("assert proposal -> {}", render(get(&body, "event")));
+
+    // 5. Query it back. As in the HTTP path, :find / :where are VECTORS and the
+    //    where-clause is a vector of vectors; only the verb head is a list, and
+    //    the query variable ?o stays a Symbol.
+    let mut query_map = std::collections::BTreeMap::new();
+    query_map.insert(
+        Value::Keyword(Keyword::from_name("find")),
+        Value::Vector(vec![sym("?o")]),
+    );
+    query_map.insert(
+        Value::Keyword(Keyword::from_name("where")),
+        Value::Vector(vec![Value::Vector(vec![
+            sym("equivalent"),
+            entity("morningstar"),
+            sym("?o"),
+        ])]),
+    );
+    let body = match call(
+        &mut stream,
+        &verb(vec![sym("query"), Value::Map(query_map)]),
+    ) {
+        Ok(b) => b,
+        Err(err) => {
+            println!("{err}");
+            return;
+        }
+    };
+    if is_failure(&body) {
+        println!("query refused: {}", describe_failure(&body));
+        return;
+    }
+    println!(
+        "query (equivalent morningstar ?o) -> rows={}  done?={}",
+        render(get(&body, "rows")),
+        render(get(&body, "done?"))
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Dispatch & entry point
 //
 // dispatch routes CLI arguments to a transport, mirroring the sibling clients:
 // no args runs the HTTP round-trip against the local default; a leading "uds"
-// is reserved for the Unix-domain-socket transport (not yet implemented); any
-// other leading argument is an HTTP base URL.
+// selects the Unix-domain-socket transport (with an optional socket-path
+// argument); any other leading argument is an HTTP base URL.
 // ---------------------------------------------------------------------------
 
 /// Route CLI arguments (everything after the program name) to a transport.
 fn dispatch(args: &[String]) {
     match args.first().map(String::as_str) {
         None => main_run(DEFAULT_BASE),
-        // "uds" is reserved for the UDS transport, which lands next.
-        Some("uds") => println!("uds transport: not yet implemented"),
+        // ["uds", path?] selects the Unix-domain-socket transport, taking an
+        // optional second argument as the socket path (else DEFAULT_SOCKET).
+        Some("uds") => main_uds(args.get(1).map(String::as_str).unwrap_or(DEFAULT_SOCKET)),
         Some(base) => main_run(base),
     }
 }
@@ -525,6 +755,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
+    use std::os::unix::net::{UnixListener, UnixStream};
     use std::sync::mpsc;
     use std::thread::{self, JoinHandle};
 
@@ -888,6 +1119,322 @@ mod tests {
         rx.recv()
             .expect("dispatch with no args should return cleanly");
         worker.join().unwrap();
+    }
+
+    // ===================================================================
+    // (D) UDS framing — uds_send_frame / uds_recv_frame over a socketpair.
+    //     Mirrors python UdsSendFrameTests / UdsRecvFrameTests /
+    //     RecvExactlyTests. We use std::os::unix::net::UnixStream::pair() for
+    //     an in-memory bidirectional socketpair: writing on one end and reading
+    //     on the other exercises the real read_exact/write_all paths with no
+    //     listener, no path, no sleeps — every wait is a blocking I/O event.
+    // ===================================================================
+
+    #[test]
+    fn test_uds_frame_round_trips_across_a_pair() {
+        // Send a framed EDN string down one half of a socketpair; recv on the
+        // other half must reconstruct the exact same string.
+        let (mut a, mut b) = UnixStream::pair().expect("socketpair");
+        let edn = emit_str(&verb(vec![sym("use-world"), world("default")]));
+
+        // Write from a scripted peer thread so the blocking recv on `b` has a
+        // producer; join proves the write completed.
+        let sent = edn.clone();
+        let writer = thread::spawn(move || {
+            uds_send_frame(&mut a, &sent).expect("send frame");
+            // `a` drops here, but the body was already fully written.
+        });
+        let got = uds_recv_frame(&mut b).expect("recv frame");
+        writer.join().unwrap();
+
+        assert_eq!(got, edn);
+        // And the reconstructed text parses back to the original form.
+        assert_eq!(
+            parse_str(&got).unwrap(),
+            verb(vec![sym("use-world"), world("default")])
+        );
+    }
+
+    #[test]
+    fn test_uds_send_frame_prefix_is_four_byte_big_endian_length() {
+        // A 5-byte body must be prefixed by exactly the bytes [0, 0, 0, 5] —
+        // a 4-byte big-endian u32 — before the body itself.
+        let (mut a, mut b) = UnixStream::pair().expect("socketpair");
+        let body = "hello"; // 5 ASCII bytes
+        assert_eq!(body.len(), 5);
+
+        let writer = thread::spawn(move || {
+            uds_send_frame(&mut a, body).expect("send frame");
+        });
+        // Read the raw 4 prefix bytes + 5 body bytes off the wire directly,
+        // bypassing uds_recv_frame, so we assert the on-wire prefix shape.
+        let mut raw = [0u8; 9];
+        b.read_exact(&mut raw).expect("read raw frame bytes");
+        writer.join().unwrap();
+
+        assert_eq!(&raw[..4], &[0, 0, 0, 5]);
+        assert_eq!(&raw[4..], b"hello");
+    }
+
+    #[test]
+    fn test_uds_recv_frame_reassembles_a_frame_split_across_writes() {
+        // UnixStream is a byte stream, so read_exact reassembles a frame that
+        // arrives in many small writes. The peer writes the 4-byte prefix one
+        // byte at a time, then the body in two halves; recv must still return
+        // the whole EDN string. (No sleeps — each write is a real I/O event the
+        // blocking reader picks up.)
+        let (mut a, mut b) = UnixStream::pair().expect("socketpair");
+        let edn = r#"{:event :result :rows [["venus"]] :done? true}"#;
+        let body = edn.as_bytes().to_vec();
+        let prefix = (body.len() as u32).to_be_bytes();
+
+        let writer = thread::spawn(move || {
+            for byte in prefix {
+                a.write_all(&[byte]).expect("write prefix byte");
+                a.flush().expect("flush prefix byte");
+            }
+            let mid = body.len() / 2;
+            a.write_all(&body[..mid]).expect("write body first half");
+            a.flush().expect("flush body first half");
+            a.write_all(&body[mid..]).expect("write body second half");
+            a.flush().expect("flush body second half");
+        });
+        let got = uds_recv_frame(&mut b).expect("recv reassembled frame");
+        writer.join().unwrap();
+
+        assert_eq!(got, edn);
+    }
+
+    #[test]
+    fn test_uds_recv_frame_premature_eof_in_prefix_errs_naming_expected_bytes() {
+        // The peer writes 2 of the 4 prefix bytes then closes. recv must Err
+        // (not hang, not short-read) with a message naming the prefix byte
+        // count it expected. Mirrors python RecvExactly premature-EOF.
+        let (mut a, mut b) = UnixStream::pair().expect("socketpair");
+
+        let writer = thread::spawn(move || {
+            a.write_all(&[0u8, 0u8]).expect("write partial prefix");
+            // Drop `a` -> peer closed -> reader sees EOF mid-prefix.
+        });
+        let err = uds_recv_frame(&mut b).expect_err("truncated prefix must Err");
+        writer.join().unwrap();
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("4 bytes expected"),
+            "prefix EOF error should name the 4-byte prefix, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_uds_recv_frame_premature_eof_in_body_errs_naming_expected_bytes() {
+        // A valid prefix declaring 10 body bytes, but only 5 arrive before the
+        // peer closes. recv must Err with a message naming the declared body
+        // byte count. Mirrors python recv_frame premature-EOF-in-body.
+        let (mut a, mut b) = UnixStream::pair().expect("socketpair");
+
+        let writer = thread::spawn(move || {
+            a.write_all(&10u32.to_be_bytes()).expect("write prefix");
+            a.write_all(b"short").expect("write partial body"); // 5 of 10 bytes
+            // Drop `a` -> EOF mid-body.
+        });
+        let err = uds_recv_frame(&mut b).expect_err("truncated body must Err");
+        writer.join().unwrap();
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("10 bytes expected"),
+            "body EOF error should name the declared 10-byte body, got: {msg}"
+        );
+    }
+
+    // ===================================================================
+    // (E) main_uds against a scripted UnixListener.
+    //     Mirrors python UdsHandshake* tests, but with a real socket pair
+    //     over a unique temp path instead of a monkeypatched socket factory.
+    //     A drop guard removes the socket file even if a test panics; a
+    //     std::thread peer reads each request frame and replies in lockstep.
+    // ===================================================================
+
+    /// Removes the bound socket path on drop, so a panicking test never leaves
+    /// a stale file in temp_dir. Holds the listener for the same lifetime.
+    struct UdsPeerGuard {
+        path: std::path::PathBuf,
+    }
+
+    impl Drop for UdsPeerGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    /// A unique socket path under the system temp dir. Uniqueness comes from
+    /// the pid plus a process-global counter, so concurrent tests never collide.
+    fn unique_socket_path() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("lemma-uds-test-{}-{n}.sock", std::process::id()))
+    }
+
+    /// Frame each canned reply the way the server would (4-byte big-endian
+    /// length prefix + UTF-8 body), for raw writing back to the client.
+    fn frame_bytes(edn: &str) -> Vec<u8> {
+        let body = edn.as_bytes();
+        let mut out = (body.len() as u32).to_be_bytes().to_vec();
+        out.extend_from_slice(body);
+        out
+    }
+
+    /// Bind a scripted UDS peer that accepts one connection and, for each
+    /// element of `replies`, reads exactly one request frame off the client
+    /// then writes that reply frame back. Returns the socket path, a drop guard,
+    /// and a join handle yielding the decoded EDN strings the client sent.
+    fn spawn_scripted_uds_peer(
+        replies: Vec<String>,
+    ) -> (std::path::PathBuf, UdsPeerGuard, JoinHandle<Vec<String>>) {
+        let path = unique_socket_path();
+        let _ = std::fs::remove_file(&path); // clear any stale file first
+        let listener = UnixListener::bind(&path).expect("bind unix listener");
+        let guard = UdsPeerGuard { path: path.clone() };
+
+        let handle = thread::spawn(move || {
+            let (mut stream, _addr) = listener.accept().expect("accept uds connection");
+            let mut received = Vec::new();
+            for reply in &replies {
+                // Read one request frame from the client (same wire format).
+                let mut prefix = [0u8; 4];
+                if stream.read_exact(&mut prefix).is_err() {
+                    break; // client stopped early (e.g. failure path)
+                }
+                let len = u32::from_be_bytes(prefix) as usize;
+                let mut body = vec![0u8; len];
+                stream.read_exact(&mut body).expect("read request body");
+                received.push(String::from_utf8(body).expect("utf8 request"));
+                // Reply in lockstep.
+                stream
+                    .write_all(&frame_bytes(reply))
+                    .expect("write reply frame");
+            }
+            // Drop `stream` -> client sees EOF on any further read.
+            received
+        });
+
+        (path, guard, handle)
+    }
+
+    // Canned UDS reply bodies, mirroring the python fixtures' base five-step
+    // sequence (the Rust recipe has no pagination/watch tail). The welcome
+    // carries the session as a #session handle in its BODY (:session) — over
+    // UDS the client reads it there, never echoes it back.
+    const UDS_WELCOME: &str =
+        r#"{:event :welcome :version 1 :session #session "s-uds-1" :world #world "default"}"#;
+    const UDS_WORLD_SELECTED: &str = r#"{:event :world-selected :world #world "default"}"#;
+    const UDS_PROPOSED: &str = r#"{:event :proposed :proposal #proposal "p-1"}"#;
+    const UDS_ASSERTED: &str = r#"{:event :asserted}"#;
+    const UDS_RESULT: &str = r#"{:event :result :rows [["venus"]] :done? true}"#;
+
+    fn uds_full_sequence() -> Vec<String> {
+        [
+            UDS_WELCOME,
+            UDS_WORLD_SELECTED,
+            UDS_PROPOSED,
+            UDS_ASSERTED,
+            UDS_RESULT,
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+    }
+
+    #[test]
+    fn test_uds_first_sent_frame_is_anonymous_hello_with_no_session() {
+        // The first frame main_uds sends must be exactly the anonymous (hello)
+        // verb form, carrying no session anywhere — there is no session to know
+        // before the welcome arrives.
+        let (path, _guard, peer) = spawn_scripted_uds_peer(uds_full_sequence());
+
+        main_uds(path.to_str().unwrap());
+        let sent = peer.join().unwrap();
+
+        assert_eq!(sent[0], "(hello)");
+        assert!(!sent[0].contains("session"));
+        assert!(!sent[0].contains("s-uds-1"));
+    }
+
+    #[test]
+    fn test_uds_no_frame_after_hello_echoes_the_session_handle() {
+        // CRITICAL: over UDS the server binds the session to the connection, so
+        // the client must NOT re-send the session id in any later frame. No
+        // sent frame may contain a #session handle, the :session key, or the
+        // session value text.
+        let (path, _guard, peer) = spawn_scripted_uds_peer(uds_full_sequence());
+
+        main_uds(path.to_str().unwrap());
+        let sent = peer.join().unwrap();
+
+        // All five steps were sent (we reached the query), and none leaks the
+        // session handle.
+        assert_eq!(sent.len(), 5);
+        for frame in &sent {
+            assert!(
+                !frame.contains("#session"),
+                "frame leaked #session: {frame}"
+            );
+            assert!(
+                !frame.contains("s-uds-1"),
+                "frame leaked session id: {frame}"
+            );
+            assert!(
+                !frame.contains(":session"),
+                "frame leaked :session: {frame}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_uds_proposal_handle_is_threaded_into_assert_frame() {
+        // The #proposal handle from the propose reply must be fed verbatim into
+        // the assert frame: (assert #proposal "p-1"). Frame index 3 is the
+        // assert (0 hello, 1 use-world, 2 propose, 3 assert, 4 query).
+        let (path, _guard, peer) = spawn_scripted_uds_peer(uds_full_sequence());
+
+        main_uds(path.to_str().unwrap());
+        let sent = peer.join().unwrap();
+
+        let assert_form = parse_str(&sent[3]).unwrap();
+        assert_eq!(
+            assert_form,
+            verb(vec![
+                sym("assert"),
+                Value::TaggedElement(Symbol::from_name("proposal"), Box::new(Value::from("p-1")),),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_uds_nonexistent_socket_path_returns_fast_without_connecting() {
+        // main_uds prints rather than returns its connect error, so we assert
+        // the wire-level absence (no listener was ever bound, so nothing could
+        // accept) plus a clean, prompt return. A channel proves it returned;
+        // the path points at a temp file that does not exist.
+        let path = unique_socket_path();
+        let _ = std::fs::remove_file(&path); // ensure it does not exist
+        let target = path.to_str().unwrap().to_string();
+
+        let (tx, rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            main_uds(&target);
+            tx.send(()).expect("signal completion");
+        });
+        // Returns cleanly: recv succeeds because the connect fails fast and
+        // main_uds returns rather than hanging.
+        rx.recv()
+            .expect("main_uds on a missing socket should return cleanly");
+        worker.join().unwrap();
+
+        // Wire-level absence: no socket file was created by the connect attempt.
+        assert!(!path.exists(), "connect must not create the socket file");
     }
 
     // A tiny guard that the BTreeMap-keyed envelope helpers agree with `get` on
