@@ -180,6 +180,185 @@ fn render(value: Option<&Value>) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Capabilities & limits:  the :welcome surface  ->  ServerInfo
+//
+// Every session opens with a (hello) whose :welcome reply advertises what the
+// server can do (SPEC §10): a :capabilities set of namespaced flag keywords, a
+// :limits map of resource caps, and the :verbs / :predicates the world exposes.
+// A well-behaved client reads this once and tailors itself to it — skipping
+// features the server doesn't advertise and staying under the byte caps it
+// enforces. ServerInfo is the parsed, queryable form of that surface; it is a
+// plain data record (no new abstraction layer), so the round-trip code below
+// can ask "does this server paginate?" or "is my message small enough?" in one
+// readable call. Mirrors python's ServerInfo and the go sibling's struct.
+// ---------------------------------------------------------------------------
+
+/// The parsed `:welcome` surface: what this server advertises (SPEC §10).
+///
+/// Fields mirror the welcome map. `capabilities` is a `BTreeSet` of `Keyword`
+/// flags (e.g. `:lemma/cursor-pagination`) — a BTree so iteration is sorted,
+/// which keeps the caps status line stable. `limits` is a `Keyword -> Value`
+/// map of resource caps; `verbs` / `predicates` are flat `Symbol` sets with the
+/// `:core` and `:extensions` surfaces merged. `Default` gives the all-empty
+/// surface a bare `{:event :welcome}` parses to.
+#[derive(Debug, Default)]
+struct ServerInfo {
+    // `version`, `verbs`, and `predicates` complete the parsed welcome surface
+    // for parity with the python/go siblings, which carry the same fields. This
+    // demo only branches on `capabilities` and `limits`, so the three are read
+    // by `read_welcome` but not yet consumed downstream — kept (and allowed) so
+    // a reader sees the whole advertised surface, not a lossy subset.
+    #[allow(dead_code)]
+    version: Option<Value>,
+    capabilities: std::collections::BTreeSet<Keyword>,
+    limits: std::collections::BTreeMap<Keyword, Value>,
+    #[allow(dead_code)]
+    verbs: std::collections::BTreeSet<Symbol>,
+    #[allow(dead_code)]
+    predicates: std::collections::BTreeSet<Symbol>,
+}
+
+impl ServerInfo {
+    /// Whether `cap` (a namespaced bare name, e.g.
+    /// `"lemma/cursor-pagination"`) is in the advertised capability set.
+    ///
+    /// The flag is a namespaced keyword on the wire (`:lemma/cursor-pagination`),
+    /// so we split the `namespace/name` argument and build the matching
+    /// `Keyword` internally — callers pass the plain name, never construct the
+    /// keyword themselves. A name with no `/` builds a namespace-less keyword.
+    fn supports(&self, cap: &str) -> bool {
+        let keyword = match cap.split_once('/') {
+            Some((namespace, name)) => Keyword::from_namespace_and_name(namespace, name),
+            None => Keyword::from_name(cap),
+        };
+        self.capabilities.contains(&keyword)
+    }
+
+    /// The `:max-message-bytes` limit, or `None` if the server didn't advertise
+    /// one. `None` means "unadvertised" — treated as unlimited by
+    /// [`within_message_limit`]. Only an integer limit is honoured; any other
+    /// shape reads as unadvertised rather than panicking.
+    fn max_message_bytes(&self) -> Option<i64> {
+        match self.limits.get(&Keyword::from_name("max-message-bytes")) {
+            Some(Value::Integer(bytes)) => Some(*bytes),
+            _ => None,
+        }
+    }
+}
+
+/// Merge a `{:core #{…} :extensions {pack #{…}}}` map into one flat `Symbol` set.
+///
+/// The `:verbs` and `:predicates` entries of a welcome split names into a
+/// `:core` set plus per-pack `:extensions` sets (SPEC §10); a client mostly just
+/// wants "every name this server understands", so we union `:core` with all the
+/// extension sets. Each name set is an EDN set (`Value::Set`) whose elements we
+/// keep only when they are symbols. A missing or non-map surface yields the
+/// empty set rather than an error, so a minimal welcome never panics — the
+/// result is always a set, possibly empty. Mirrors the go sibling's
+/// `flattenSurface`.
+fn flatten_surface(surface: &Value) -> std::collections::BTreeSet<Symbol> {
+    let mut names = std::collections::BTreeSet::new();
+    let Value::Map(map) = surface else {
+        return names;
+    };
+    // Pull every Symbol out of an EDN set (`#{…}` -> Value::Set), ignoring any
+    // non-symbol element and any non-set value.
+    let mut add_set = |raw: Option<&Value>| {
+        if let Some(Value::Set(set)) = raw {
+            for element in set {
+                if let Value::Symbol(symbol) = element {
+                    names.insert(symbol.clone());
+                }
+            }
+        }
+    };
+    add_set(map.get(&Value::Keyword(Keyword::from_name("core"))));
+    if let Some(Value::Map(extensions)) = map.get(&Value::Keyword(Keyword::from_name("extensions")))
+    {
+        for pack_names in extensions.values() {
+            add_set(Some(pack_names));
+        }
+    }
+    names
+}
+
+/// Parse a `:welcome` envelope (the parsed body map) into a [`ServerInfo`].
+///
+/// We pull `:version`, `:capabilities` (an EDN set of Keyword flags), `:limits`
+/// (a Keyword -> Value map), and the flattened `:verbs` / `:predicates`
+/// surfaces. Every key is optional: a server that omits a section yields an
+/// empty default rather than an error, so this stays robust against minimal
+/// welcomes — a bare `{:event :welcome}` parses to all-empty defaults with no
+/// unwrap on server data. Mirrors python `read_welcome` / go `readWelcome`.
+fn read_welcome(body: &Value) -> ServerInfo {
+    let mut info = ServerInfo {
+        version: get(body, "version").cloned(),
+        verbs: flatten_surface(get(body, "verbs").unwrap_or(&Value::Nil)),
+        predicates: flatten_surface(get(body, "predicates").unwrap_or(&Value::Nil)),
+        ..ServerInfo::default()
+    };
+    // :capabilities is an EDN set, so it decodes to Value::Set keyed by Keyword;
+    // narrow it to the typed flag set, ignoring any non-keyword element.
+    if let Some(Value::Set(caps)) = get(body, "capabilities") {
+        for cap in caps {
+            if let Value::Keyword(keyword) = cap {
+                info.capabilities.insert(keyword.clone());
+            }
+        }
+    }
+    // :limits is an EDN map; keep its Keyword keys with their values verbatim.
+    if let Some(Value::Map(limits)) = get(body, "limits") {
+        for (key, value) in limits {
+            if let Value::Keyword(keyword) = key {
+                info.limits.insert(keyword.clone(), value.clone());
+            }
+        }
+    }
+    info
+}
+
+/// Whether `edn_text` fits under the server's `:max-message-bytes` cap.
+///
+/// The limit is measured in UTF-8 BYTES (SPEC §10). In Rust a `&str` is already
+/// UTF-8, so `str::len()` IS the byte count — no re-encoding needed. An
+/// unadvertised limit (`max_message_bytes() == None`) means unlimited, so any
+/// message passes. Mirrors python `within_message_limit` / go `withinMessageLimit`.
+fn within_message_limit(info: &ServerInfo, edn_text: &str) -> bool {
+    match info.max_message_bytes() {
+        Some(cap) => (edn_text.len() as i64) <= cap,
+        None => true,
+    }
+}
+
+/// Print the one-line caps/limit summary both mains emit right after the
+/// welcome: `server: caps={…} max-message-bytes=…`. Cap names are the bare
+/// namespaced keyword names (e.g. `lemma/cursor-pagination`, no leading colon),
+/// `", "`-joined; the `BTreeSet` iteration order already sorts them for a stable
+/// line. An unadvertised `:max-message-bytes` prints as `none` (the absent
+/// marker), mirroring the go sibling; otherwise the integer byte cap.
+fn print_server_info(info: &ServerInfo) {
+    let names: Vec<String> = info
+        .capabilities
+        .iter()
+        // The wire form is `:namespace/name`; python prints the bare
+        // `namespace/name` (no colon), so rebuild that from the keyword parts.
+        .map(|keyword| match keyword.namespace() {
+            Some(namespace) => format!("{namespace}/{}", keyword.name()),
+            None => keyword.name().to_string(),
+        })
+        .collect();
+    let limit = match info.max_message_bytes() {
+        Some(bytes) => bytes.to_string(),
+        None => "none".to_string(),
+    };
+    println!(
+        "server: caps={{{}}} max-message-bytes={}",
+        names.join(", "),
+        limit
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Cursor pagination:  drain a (query …) across (continue #cursor …) pages
 //
 // A (query …) with a :limit returns a FULL first page — `:rows` plus
@@ -447,6 +626,13 @@ fn main_run(base: &str) {
         render(get(&body, "world"))
     );
 
+    // 1a. Read the advertised capabilities and limits once, up front, so the
+    //     rest of the round-trip can tailor itself to this server (SPEC §10):
+    //     gate the paginated block on cursor pagination, and stay under the
+    //     :max-message-bytes limit (or "none" when unadvertised).
+    let info = read_welcome(&body);
+    print_server_info(&info);
+
     // 2. Every later call rides the same session, on the named endpoint, with
     //    the session id echoed in the request header. The closure threads `base`
     //    and `session` so the steps below read as a plain sequence of verbs.
@@ -552,100 +738,112 @@ fn main_run(base: &str) {
         render(get(&body, "done?"))
     );
 
-    // 7. Paginated query: seed three subset-of facts in one batched propose,
-    //    assert, then drain a :limit 2 query via query_all / (continue #cursor …).
-    // Seed three subset-of facts in ONE batched propose, then assert the
-    // batch, so the paginated query below spans more than a single page.
-    // subset-of is a pure-EDB (stored-fact) predicate: a query over it has
-    // stable ordering and so can be paginated. A rule-headed predicate like
-    // member-of cannot be the sole outer :where pattern — the server rejects
-    // that :bad-args :unsupported-rule-call-ordering.
-    let f1 = fact_value("subset-of", entity("sub-a"), entity("group"));
-    let f2 = fact_value("subset-of", entity("sub-b"), entity("group"));
-    let f3 = fact_value("subset-of", entity("sub-c"), entity("group"));
-    let propose_form = verb(vec![sym("propose"), f1, f2, f3]);
-    let body = match named(&propose_form) {
-        Ok(b) => b,
-        Err(err) => {
-            println!("{err}");
+    // 7. The paginated section is gated on the server advertising cursor
+    //    pagination — without it, draining pages via (continue #cursor …) is
+    //    unsupported, so we skip the whole block rather than guess (SPEC §10).
+    if info.supports("lemma/cursor-pagination") {
+        // Seed three subset-of facts in ONE batched propose, then assert the
+        // batch, so the paginated query below spans more than a single page.
+        // subset-of is a pure-EDB (stored-fact) predicate: a query over it has
+        // stable ordering and so can be paginated. A rule-headed predicate like
+        // member-of cannot be the sole outer :where pattern — the server rejects
+        // that :bad-args :unsupported-rule-call-ordering.
+        let f1 = fact_value("subset-of", entity("sub-a"), entity("group"));
+        let f2 = fact_value("subset-of", entity("sub-b"), entity("group"));
+        let f3 = fact_value("subset-of", entity("sub-c"), entity("group"));
+        let propose_form = verb(vec![sym("propose"), f1, f2, f3]);
+        // The batch propose is the largest representative message we send, so it
+        // is the one worth checking against :max-message-bytes before sending. A
+        // real client checks every outbound message; this demo checks this one.
+        if !within_message_limit(&info, &emit_str(&propose_form)) {
+            println!("limit-exceeded: message exceeds max-message-bytes; skipping");
             return;
         }
-    };
-    if is_failure(&body) {
-        println!(
-            "propose (3x subset-of) refused: {}",
-            describe_failure(&body)
-        );
-        return;
-    }
-    let proposal = match get(&body, "proposal") {
-        Some(p) => p.clone(),
-        None => {
-            println!(
-                "propose (3x subset-of) -> {} but no :proposal handle",
-                render(get(&body, "event"))
-            );
-            return;
-        }
-    };
-    println!(
-        "propose (3x subset-of ? group) -> {}  proposal={}",
-        render(get(&body, "event")),
-        emit_str(&proposal)
-    );
-    let body = match named(&verb(vec![sym("assert"), proposal])) {
-        Ok(b) => b,
-        Err(err) => {
-            println!("{err}");
-            return;
-        }
-    };
-    if is_failure(&body) {
-        println!("assert (3x subset-of) refused: {}", describe_failure(&body));
-        return;
-    }
-    println!("assert proposal -> {}", render(get(&body, "event")));
-
-    // 8. Paginated query: :limit 2 over 3 matching rows yields two pages
-    //    (2 + 1). query_all drains them via (continue #cursor …). named takes
-    //    a &Value and returns just the body (the session id rides the header,
-    //    not the return), so we adapt it to the form -> body closure
-    //    query_all wants.
-    let mut paged_query = std::collections::BTreeMap::new();
-    paged_query.insert(
-        Value::Keyword(Keyword::from_name("find")),
-        Value::Vector(vec![sym("?x")]),
-    );
-    paged_query.insert(
-        Value::Keyword(Keyword::from_name("where")),
-        Value::Vector(vec![Value::Vector(vec![
-            sym("subset-of"),
-            sym("?x"),
-            entity("group"),
-        ])]),
-    );
-    paged_query.insert(
-        Value::Keyword(Keyword::from_name("limit")),
-        Value::Integer(2),
-    );
-    let qform = verb(vec![sym("query"), Value::Map(paged_query)]);
-    let mut send = |form: Value| named(&form);
-    match query_all(&mut send, qform) {
-        Ok((rows, pages, failure)) => {
-            if let Some(failure) = failure {
-                println!("paged query refused: {}", describe_failure(&failure));
+        let body = match named(&propose_form) {
+            Ok(b) => b,
+            Err(err) => {
+                println!("{err}");
                 return;
             }
+        };
+        if is_failure(&body) {
             println!(
-                "paged query (subset-of ? group), limit 2 -> {} rows over {} page(s): {}",
-                rows.len(),
-                pages,
-                emit_str(&Value::Vector(rows))
+                "propose (3x subset-of) refused: {}",
+                describe_failure(&body)
             );
+            return;
         }
-        Err(err) => {
-            println!("{err}");
+        let proposal = match get(&body, "proposal") {
+            Some(p) => p.clone(),
+            None => {
+                println!(
+                    "propose (3x subset-of) -> {} but no :proposal handle",
+                    render(get(&body, "event"))
+                );
+                return;
+            }
+        };
+        println!(
+            "propose (3x subset-of ? group) -> {}  proposal={}",
+            render(get(&body, "event")),
+            emit_str(&proposal)
+        );
+        let body = match named(&verb(vec![sym("assert"), proposal])) {
+            Ok(b) => b,
+            Err(err) => {
+                println!("{err}");
+                return;
+            }
+        };
+        if is_failure(&body) {
+            println!("assert (3x subset-of) refused: {}", describe_failure(&body));
+            return;
         }
+        println!("assert proposal -> {}", render(get(&body, "event")));
+
+        // 8. Paginated query: :limit 2 over 3 matching rows yields two pages
+        //    (2 + 1). query_all drains them via (continue #cursor …). named takes
+        //    a &Value and returns just the body (the session id rides the header,
+        //    not the return), so we adapt it to the form -> body closure
+        //    query_all wants.
+        let mut paged_query = std::collections::BTreeMap::new();
+        paged_query.insert(
+            Value::Keyword(Keyword::from_name("find")),
+            Value::Vector(vec![sym("?x")]),
+        );
+        paged_query.insert(
+            Value::Keyword(Keyword::from_name("where")),
+            Value::Vector(vec![Value::Vector(vec![
+                sym("subset-of"),
+                sym("?x"),
+                entity("group"),
+            ])]),
+        );
+        paged_query.insert(
+            Value::Keyword(Keyword::from_name("limit")),
+            Value::Integer(2),
+        );
+        let qform = verb(vec![sym("query"), Value::Map(paged_query)]);
+        let mut send = |form: Value| named(&form);
+        match query_all(&mut send, qform) {
+            Ok((rows, pages, failure)) => {
+                if let Some(failure) = failure {
+                    println!("paged query refused: {}", describe_failure(&failure));
+                    return;
+                }
+                println!(
+                    "paged query (subset-of ? group), limit 2 -> {} rows over {} page(s): {}",
+                    rows.len(),
+                    pages,
+                    emit_str(&Value::Vector(rows))
+                );
+            }
+            Err(err) => {
+                println!("{err}");
+            }
+        }
+    } else {
+        println!("server does not advertise cursor pagination; skipping paged query");
     }
 }
 
@@ -776,6 +974,12 @@ fn main_uds(socket_path: &str) {
         render(get(&body, "world"))
     );
 
+    // 1a. Read the advertised capabilities and limits once, up front, so the
+    //     rest of the round-trip can tailor itself to this server (SPEC §10),
+    //     exactly as the HTTP path does: gate pagination, honour the byte cap.
+    let info = read_welcome(&body);
+    print_server_info(&info);
+
     // 2. Enter the world. (use-world #world "default")
     let body = match call(&mut stream, &verb(vec![sym("use-world"), world("default")])) {
         Ok(b) => b,
@@ -876,99 +1080,111 @@ fn main_uds(socket_path: &str) {
         render(get(&body, "done?"))
     );
 
-    // 6. Paginated query: seed three subset-of facts in one batched propose,
-    //    assert, then drain a :limit 2 query via query_all / (continue #cursor …).
-    // Seed three subset-of facts in ONE batched propose, then assert the
-    // batch, so the paginated query below spans more than a single page.
-    // subset-of is pure-EDB (stored facts) with stable ordering, so it
-    // paginates; a rule-headed predicate like member-of cannot be the sole
-    // outer :where pattern (server :bad-args :unsupported-rule-call-ordering).
-    let f1 = fact_value("subset-of", entity("sub-a"), entity("group"));
-    let f2 = fact_value("subset-of", entity("sub-b"), entity("group"));
-    let f3 = fact_value("subset-of", entity("sub-c"), entity("group"));
-    let propose_form = verb(vec![sym("propose"), f1, f2, f3]);
-    let body = match call(&mut stream, &propose_form) {
-        Ok(b) => b,
-        Err(err) => {
-            println!("{err}");
+    // 6. The paginated section is gated on the server advertising cursor
+    //    pagination, exactly as the HTTP path — without it, draining pages via
+    //    (continue #cursor …) is unsupported, so we skip the block (SPEC §10).
+    if info.supports("lemma/cursor-pagination") {
+        // Seed three subset-of facts in ONE batched propose, then assert the
+        // batch, so the paginated query below spans more than a single page.
+        // subset-of is pure-EDB (stored facts) with stable ordering, so it
+        // paginates; a rule-headed predicate like member-of cannot be the sole
+        // outer :where pattern (server :bad-args :unsupported-rule-call-ordering).
+        let f1 = fact_value("subset-of", entity("sub-a"), entity("group"));
+        let f2 = fact_value("subset-of", entity("sub-b"), entity("group"));
+        let f3 = fact_value("subset-of", entity("sub-c"), entity("group"));
+        let propose_form = verb(vec![sym("propose"), f1, f2, f3]);
+        // The batch propose is the largest representative message we send, so it
+        // is the one worth checking against :max-message-bytes before sending. A
+        // real client checks every outbound message; this demo checks this one.
+        if !within_message_limit(&info, &emit_str(&propose_form)) {
+            println!("limit-exceeded: message exceeds max-message-bytes; skipping");
             return;
         }
-    };
-    if is_failure(&body) {
-        println!(
-            "propose (3x subset-of) refused: {}",
-            describe_failure(&body)
-        );
-        return;
-    }
-    let proposal = match get(&body, "proposal") {
-        Some(p) => p.clone(),
-        None => {
-            println!(
-                "propose (3x subset-of) -> {} but no :proposal handle",
-                render(get(&body, "event"))
-            );
-            return;
-        }
-    };
-    println!(
-        "propose (3x subset-of ? group) -> {}  proposal={}",
-        render(get(&body, "event")),
-        emit_str(&proposal)
-    );
-    let body = match call(&mut stream, &verb(vec![sym("assert"), proposal])) {
-        Ok(b) => b,
-        Err(err) => {
-            println!("{err}");
-            return;
-        }
-    };
-    if is_failure(&body) {
-        println!("assert (3x subset-of) refused: {}", describe_failure(&body));
-        return;
-    }
-    println!("assert proposal -> {}", render(get(&body, "event")));
-
-    // 7. Paginated query: :limit 2 over 3 matching rows yields two pages
-    //    (2 + 1). query_all drains them via (continue #cursor …). The UDS
-    //    `call` is (stream, form) -> body, so we wrap it in a form -> body
-    //    closure that threads the one open socket — the session already rides
-    //    the connection.
-    let mut paged_query = std::collections::BTreeMap::new();
-    paged_query.insert(
-        Value::Keyword(Keyword::from_name("find")),
-        Value::Vector(vec![sym("?x")]),
-    );
-    paged_query.insert(
-        Value::Keyword(Keyword::from_name("where")),
-        Value::Vector(vec![Value::Vector(vec![
-            sym("subset-of"),
-            sym("?x"),
-            entity("group"),
-        ])]),
-    );
-    paged_query.insert(
-        Value::Keyword(Keyword::from_name("limit")),
-        Value::Integer(2),
-    );
-    let qform = verb(vec![sym("query"), Value::Map(paged_query)]);
-    let mut send = |form: Value| call(&mut stream, &form);
-    match query_all(&mut send, qform) {
-        Ok((rows, pages, failure)) => {
-            if let Some(failure) = failure {
-                println!("paged query refused: {}", describe_failure(&failure));
+        let body = match call(&mut stream, &propose_form) {
+            Ok(b) => b,
+            Err(err) => {
+                println!("{err}");
                 return;
             }
+        };
+        if is_failure(&body) {
             println!(
-                "paged query (subset-of ? group), limit 2 -> {} rows over {} page(s): {}",
-                rows.len(),
-                pages,
-                emit_str(&Value::Vector(rows))
+                "propose (3x subset-of) refused: {}",
+                describe_failure(&body)
             );
+            return;
         }
-        Err(err) => {
-            println!("{err}");
+        let proposal = match get(&body, "proposal") {
+            Some(p) => p.clone(),
+            None => {
+                println!(
+                    "propose (3x subset-of) -> {} but no :proposal handle",
+                    render(get(&body, "event"))
+                );
+                return;
+            }
+        };
+        println!(
+            "propose (3x subset-of ? group) -> {}  proposal={}",
+            render(get(&body, "event")),
+            emit_str(&proposal)
+        );
+        let body = match call(&mut stream, &verb(vec![sym("assert"), proposal])) {
+            Ok(b) => b,
+            Err(err) => {
+                println!("{err}");
+                return;
+            }
+        };
+        if is_failure(&body) {
+            println!("assert (3x subset-of) refused: {}", describe_failure(&body));
+            return;
         }
+        println!("assert proposal -> {}", render(get(&body, "event")));
+
+        // 7. Paginated query: :limit 2 over 3 matching rows yields two pages
+        //    (2 + 1). query_all drains them via (continue #cursor …). The UDS
+        //    `call` is (stream, form) -> body, so we wrap it in a form -> body
+        //    closure that threads the one open socket — the session already rides
+        //    the connection.
+        let mut paged_query = std::collections::BTreeMap::new();
+        paged_query.insert(
+            Value::Keyword(Keyword::from_name("find")),
+            Value::Vector(vec![sym("?x")]),
+        );
+        paged_query.insert(
+            Value::Keyword(Keyword::from_name("where")),
+            Value::Vector(vec![Value::Vector(vec![
+                sym("subset-of"),
+                sym("?x"),
+                entity("group"),
+            ])]),
+        );
+        paged_query.insert(
+            Value::Keyword(Keyword::from_name("limit")),
+            Value::Integer(2),
+        );
+        let qform = verb(vec![sym("query"), Value::Map(paged_query)]);
+        let mut send = |form: Value| call(&mut stream, &form);
+        match query_all(&mut send, qform) {
+            Ok((rows, pages, failure)) => {
+                if let Some(failure) = failure {
+                    println!("paged query refused: {}", describe_failure(&failure));
+                    return;
+                }
+                println!(
+                    "paged query (subset-of ? group), limit 2 -> {} rows over {} page(s): {}",
+                    rows.len(),
+                    pages,
+                    emit_str(&Value::Vector(rows))
+                );
+            }
+            Err(err) => {
+                println!("{err}");
+            }
+        }
+    } else {
+        println!("server does not advertise cursor pagination; skipping paged query");
     }
 }
 
@@ -1969,5 +2185,411 @@ mod tests {
         assert_eq!(err, "connection reset mid-drain");
         // The query and the failing continue were both attempted.
         assert_eq!(send.call_count(), 2);
+    }
+
+    // ===================================================================
+    // (G) read_welcome: the :welcome surface -> ServerInfo.
+    //     Mirrors python ReadWelcomeTests. Welcome bodies are canned EDN
+    //     strings parsed via parse_str AT TEST TIME, so #session / #world
+    //     handles, the :capabilities set, the :limits map, and the
+    //     :core/:extensions verb-and-predicate split all decode into the
+    //     exact Values read_welcome consumes -- no hand-built maps.
+    // ===================================================================
+
+    /// A realistic welcome surface (SPEC §10): a versioned welcome with a
+    /// #session handle, three capability flags, a one-megabyte byte cap, and
+    /// :core/:extensions splits for both verbs and predicates. Mirrors python's
+    /// `_REALISTIC_WELCOME` (extended here with a `pack` extension verb so the
+    /// flatten-the-extensions case has something non-empty to find).
+    const REALISTIC_WELCOME: &str = concat!(
+        r#"{:event :welcome :version 1 :session #session "s-1" "#,
+        r#":capabilities #{:lemma/v1 :lemma/cursor-pagination} "#,
+        r#":limits {:max-message-bytes 1048576} "#,
+        r#":verbs {:core #{hello query} :extensions {pack #{foo}}} "#,
+        r#":predicates {:core #{equivalent subset-of} :extensions {}}}"#,
+    );
+
+    #[test]
+    fn test_read_welcome_supports_true_for_an_advertised_capability() {
+        let info = read_welcome(&parse_str(REALISTIC_WELCOME).unwrap());
+        assert!(info.supports("lemma/cursor-pagination"));
+    }
+
+    #[test]
+    fn test_read_welcome_supports_false_for_an_unadvertised_capability() {
+        let info = read_welcome(&parse_str(REALISTIC_WELCOME).unwrap());
+        assert!(!info.supports("lemma/nope"));
+    }
+
+    #[test]
+    fn test_read_welcome_max_message_bytes_reads_the_advertised_limit() {
+        let info = read_welcome(&parse_str(REALISTIC_WELCOME).unwrap());
+        assert_eq!(info.max_message_bytes(), Some(1048576));
+    }
+
+    #[test]
+    fn test_read_welcome_verbs_surface_contains_the_core_symbols() {
+        let info = read_welcome(&parse_str(REALISTIC_WELCOME).unwrap());
+        assert!(info.verbs.contains(&Symbol::from_name("hello")));
+        assert!(info.verbs.contains(&Symbol::from_name("query")));
+    }
+
+    #[test]
+    fn test_read_welcome_predicates_surface_contains_the_core_symbols() {
+        let info = read_welcome(&parse_str(REALISTIC_WELCOME).unwrap());
+        assert!(info.predicates.contains(&Symbol::from_name("equivalent")));
+        assert!(info.predicates.contains(&Symbol::from_name("subset-of")));
+    }
+
+    #[test]
+    fn test_read_welcome_flattens_the_verb_extensions_pack_into_the_verb_set() {
+        // :verbs splits into :core plus per-pack :extensions; read_welcome
+        // unions them, so the `pack` extension's `foo` appears alongside core.
+        let info = read_welcome(&parse_str(REALISTIC_WELCOME).unwrap());
+        assert!(info.verbs.contains(&Symbol::from_name("foo")));
+        assert!(info.verbs.contains(&Symbol::from_name("hello")));
+    }
+
+    #[test]
+    fn test_read_welcome_minimal_welcome_yields_all_empty_defaults_without_panic() {
+        // A bare {:event :welcome} -- no :version, :capabilities, :limits,
+        // :verbs, or :predicates -- must parse to the all-empty default surface
+        // rather than panicking on any absent section.
+        let info = read_welcome(&parse_str(r#"{:event :welcome}"#).unwrap());
+        // No limit advertised.
+        assert_eq!(info.max_message_bytes(), None);
+        // Nothing is supported.
+        assert!(!info.supports("lemma/cursor-pagination"));
+        // The surfaces are empty but present (non-null) sets.
+        assert!(info.capabilities.is_empty());
+        assert!(info.limits.is_empty());
+        assert!(info.verbs.is_empty());
+        assert!(info.predicates.is_empty());
+    }
+
+    // ===================================================================
+    // (H) within_message_limit: is an EDN message under the byte cap?
+    //     Mirrors python WithinMessageLimitTests. The cap is measured in
+    //     UTF-8 BYTES (SPEC §10); ServerInfo values come from read_welcome
+    //     of canned welcomes so the limit decodes exactly as on the wire.
+    // ===================================================================
+
+    /// Build a ServerInfo carrying just a :max-message-bytes limit, via a
+    /// canned welcome -- keeps these tests on the same parse_str path as the
+    /// rest rather than hand-constructing the private struct.
+    fn info_with_limit(max_message_bytes: i64) -> ServerInfo {
+        let welcome =
+            format!(r#"{{:event :welcome :limits {{:max-message-bytes {max_message_bytes}}}}}"#);
+        read_welcome(&parse_str(&welcome).unwrap())
+    }
+
+    #[test]
+    fn test_within_message_limit_small_payload_passes_under_one_megabyte() {
+        let info = info_with_limit(1_048_576);
+        assert!(within_message_limit(&info, "(hello)"));
+    }
+
+    #[test]
+    fn test_within_message_limit_oversized_payload_against_tiny_cap_is_rejected() {
+        let info = info_with_limit(4);
+        // Eight bytes against a four-byte cap.
+        assert_eq!("(hello!!)".len(), 9);
+        assert!(!within_message_limit(&info, "(hello!"));
+    }
+
+    #[test]
+    fn test_within_message_limit_no_advertised_limit_always_passes() {
+        // A welcome with no :limits section: max_message_bytes() is None, which
+        // means unlimited, so even a huge payload passes.
+        let info = read_welcome(&parse_str(r#"{:event :welcome}"#).unwrap());
+        assert_eq!(info.max_message_bytes(), None);
+        assert!(within_message_limit(&info, &"x".repeat(10_000_000)));
+    }
+
+    #[test]
+    fn test_within_message_limit_measures_utf8_bytes_not_chars() {
+        // "αβγδε" is 5 Unicode scalar values but 10 UTF-8 bytes (each Greek
+        // letter is 2 bytes). Against a 6-byte cap it must be REJECTED -- proving
+        // the limit measures str::len() (bytes), not char count. A char-counting
+        // implementation would (wrongly) accept 5 <= 6.
+        let multibyte = "αβγδε";
+        assert_eq!(multibyte.chars().count(), 5);
+        assert_eq!(multibyte.len(), 10);
+        let info = info_with_limit(6);
+        assert!(!within_message_limit(&info, multibyte));
+    }
+
+    // ===================================================================
+    // (I) Capability gating through the REAL mains, on BOTH transports.
+    //
+    //     The paginated tail (seed-propose 3x subset-of, assert, then the
+    //     limit-2 query drained via one (continue #cursor …)) is gated on the
+    //     welcome advertising :lemma/cursor-pagination (SPEC §10). Without the
+    //     flag, both mains SKIP the whole block and issue only the five base
+    //     messages, with NO (continue anywhere. With it, the full nine-call /
+    //     nine-frame path runs, carrying exactly ONE (continue.
+    //
+    //     We drive the real main_run / main_uds against scripted listeners and
+    //     inspect the recorded request forms -- no mocking of the client.
+    // ===================================================================
+
+    /// Whether a recorded request form is a `(continue …)` verb (its head
+    /// symbol is `continue`).
+    fn is_continue_form(form: &Value) -> bool {
+        matches!(form, Value::List(elems) if elems.first() == Some(&sym("continue")))
+    }
+
+    // -- HTTP gating: a multi-connection scripted peer -------------------
+    //
+    // main_run's `named` closure calls post_edn, which dials a FRESH
+    // TcpStream per request (Connection: close). So unlike the one-shot
+    // spawn_scripted_peer, the gating peer must accept one connection PER
+    // scripted reply, read that request, answer it, and close -- in lockstep.
+
+    /// Spawn a scripted HTTP peer that serves `replies.len()` sequential
+    /// connections: for each reply it accepts one connection, reads the full
+    /// request, writes that reply (200 OK, session header s-1), and closes.
+    /// Returns the base URL and a handle yielding the captured request bodies
+    /// (the EDN forms the client POSTed, in order).
+    fn spawn_scripted_http_sequence(replies: Vec<String>) -> (String, JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let port = listener.local_addr().expect("local addr").port();
+        let base = format!("http://127.0.0.1:{port}");
+        let handle = thread::spawn(move || {
+            let mut bodies = Vec::new();
+            for reply in &replies {
+                let (mut stream, _peer) = match listener.accept() {
+                    Ok(pair) => pair,
+                    Err(_) => break, // client stopped early
+                };
+                let request = read_http_request(&mut stream);
+                bodies.push(request.body);
+                let response = http_response("200 OK", Some(("X-Lemma-Session", "s-1")), reply);
+                stream.write_all(&response).expect("write response");
+                // Drop `stream` -> Connection: close -> client reads to EOF.
+            }
+            bodies
+        });
+        (base, handle)
+    }
+
+    // The five base HTTP replies (welcome, world-selected, proposed, asserted,
+    // result). The welcome's :capabilities decides whether the paginated tail
+    // runs. world/proposed/asserted/result reuse the codec shapes the other
+    // suites already exercise.
+    const HTTP_WORLD_SELECTED: &str = r#"{:event :world-selected :world #world "default"}"#;
+    const HTTP_PROPOSED: &str = r#"{:event :proposed :proposal #proposal "p-1"}"#;
+    const HTTP_ASSERTED: &str = r#"{:event :asserted}"#;
+    const HTTP_RESULT: &str = r#"{:event :result :rows [["venus"]] :done? true}"#;
+
+    /// A welcome WITHOUT cursor-pagination: the paged tail is gated out, so only
+    /// the five base messages run. Mirrors python `_WELCOME_NO_PAGINATION`.
+    const WELCOME_NO_PAGINATION: &str = concat!(
+        r#"{:event :welcome :version 1 :session #session "s-77" :world #world "default" "#,
+        r#":capabilities #{:lemma/v1} "#,
+        r#":limits {:max-message-bytes 1048576} "#,
+        r#":verbs {:core #{hello use-world propose assert query} :extensions {}}}"#,
+    );
+
+    /// A welcome advertising :lemma/cursor-pagination: the full nine-call paged
+    /// path runs. Same shape as WELCOME_NO_PAGINATION plus the pagination flag.
+    const WELCOME_WITH_PAGINATION: &str = concat!(
+        r#"{:event :welcome :version 1 :session #session "s-77" :world #world "default" "#,
+        r#":capabilities #{:lemma/v1 :lemma/cursor-pagination} "#,
+        r#":limits {:max-message-bytes 1048576} "#,
+        r#":verbs {:core #{hello use-world propose assert query continue} :extensions {}}}"#,
+    );
+
+    /// The five base replies, parameterised by which welcome opens them.
+    fn http_base_sequence(welcome: &str) -> Vec<String> {
+        [
+            welcome,
+            HTTP_WORLD_SELECTED,
+            HTTP_PROPOSED,
+            HTTP_ASSERTED,
+            HTTP_RESULT,
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+    }
+
+    /// The full nine-reply paginated sequence: the five base replies, then the
+    /// seed-propose's :proposed, its :asserted, and a TWO-page query -- page one
+    /// (rows [a b], not done, #cursor "c-1") and page two (rows [c], done) --
+    /// drained by exactly one (continue #cursor …).
+    fn http_full_sequence(welcome: &str) -> Vec<String> {
+        let mut seq = http_base_sequence(welcome);
+        seq.push(HTTP_PROPOSED.to_string()); // seed-propose (3x subset-of)
+        seq.push(HTTP_ASSERTED.to_string()); // its assert
+        seq.push(
+            r#"{:event :result :rows [[#entity "a"] [#entity "b"]] :done? false :cursor #cursor "c-1"}"#
+                .to_string(),
+        ); // paged query, page 1
+        seq.push(r#"{:event :result :rows [[#entity "c"]] :done? true}"#.to_string()); // page 2
+        seq
+    }
+
+    #[test]
+    fn test_http_gating_caps_less_welcome_makes_exactly_the_five_base_calls() {
+        // No :lemma/cursor-pagination -> the seed-propose / paged-query block is
+        // skipped; the run issues only hello, use-world, propose, assert, query.
+        let (base, peer) = spawn_scripted_http_sequence(http_base_sequence(WELCOME_NO_PAGINATION));
+
+        main_run(&base);
+        let bodies = peer.join().unwrap();
+
+        assert_eq!(bodies.len(), 5);
+    }
+
+    #[test]
+    fn test_http_gating_caps_less_welcome_issues_no_continue() {
+        // The skip path must emit NO (continue …) frame anywhere.
+        let (base, peer) = spawn_scripted_http_sequence(http_base_sequence(WELCOME_NO_PAGINATION));
+
+        main_run(&base);
+        let bodies = peer.join().unwrap();
+
+        for body in &bodies {
+            let form = parse_str(body).unwrap();
+            assert!(
+                !is_continue_form(&form),
+                "skip path emitted a continue: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_http_gating_paginating_welcome_runs_the_full_nine_call_path() {
+        // With :lemma/cursor-pagination advertised, the full path runs: the five
+        // base calls plus seed-propose, assert, and a two-page query drained by
+        // one continue -> nine calls total.
+        let (base, peer) =
+            spawn_scripted_http_sequence(http_full_sequence(WELCOME_WITH_PAGINATION));
+
+        main_run(&base);
+        let bodies = peer.join().unwrap();
+
+        assert_eq!(bodies.len(), 9);
+    }
+
+    #[test]
+    fn test_http_gating_paginating_welcome_issues_exactly_one_continue() {
+        // Exactly ONE (continue #cursor …) is issued across the full drain (page
+        // one -> page two), and it carries the page-1 cursor verbatim.
+        let (base, peer) =
+            spawn_scripted_http_sequence(http_full_sequence(WELCOME_WITH_PAGINATION));
+
+        main_run(&base);
+        let bodies = peer.join().unwrap();
+
+        let continues: Vec<&String> = bodies
+            .iter()
+            .filter(|b| is_continue_form(&parse_str(b).unwrap()))
+            .collect();
+        assert_eq!(continues.len(), 1);
+        assert_eq!(continues[0], r#"(continue #cursor "c-1")"#);
+    }
+
+    // -- UDS gating: reuse the scripted UnixListener peer ----------------
+    //
+    // main_uds reuses ONE socket across frames, so spawn_scripted_uds_peer's
+    // single-connection, lockstep reply model already fits -- we just feed it
+    // the base-only or the full paginated reply script.
+
+    /// A UDS welcome WITHOUT cursor-pagination: the paged tail is gated out.
+    const UDS_WELCOME_NO_PAGINATION: &str = concat!(
+        r#"{:event :welcome :version 1 :session #session "s-uds-1" :world #world "default" "#,
+        r#":capabilities #{:lemma/v1} "#,
+        r#":limits {:max-message-bytes 1048576} "#,
+        r#":verbs {:core #{hello use-world propose assert query} :extensions {}}}"#,
+    );
+
+    /// A UDS welcome advertising cursor-pagination: the full paged path runs.
+    const UDS_WELCOME_WITH_PAGINATION: &str = concat!(
+        r#"{:event :welcome :version 1 :session #session "s-uds-1" :world #world "default" "#,
+        r#":capabilities #{:lemma/v1 :lemma/cursor-pagination} "#,
+        r#":limits {:max-message-bytes 1048576} "#,
+        r#":verbs {:core #{hello use-world propose assert query continue} :extensions {}}}"#,
+    );
+
+    fn uds_base_sequence(welcome: &str) -> Vec<String> {
+        [
+            welcome,
+            UDS_WORLD_SELECTED,
+            UDS_PROPOSED,
+            UDS_ASSERTED,
+            UDS_RESULT,
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+    }
+
+    fn uds_full_paginated_sequence(welcome: &str) -> Vec<String> {
+        let mut seq = uds_base_sequence(welcome);
+        seq.push(UDS_PROPOSED.to_string()); // seed-propose (3x subset-of)
+        seq.push(UDS_ASSERTED.to_string()); // its assert
+        seq.push(
+            r#"{:event :result :rows [[#entity "a"] [#entity "b"]] :done? false :cursor #cursor "c-1"}"#
+                .to_string(),
+        ); // paged query, page 1
+        seq.push(r#"{:event :result :rows [[#entity "c"]] :done? true}"#.to_string()); // page 2
+        seq
+    }
+
+    #[test]
+    fn test_uds_gating_caps_less_welcome_makes_exactly_the_five_base_frames() {
+        let (path, _guard, peer) =
+            spawn_scripted_uds_peer(uds_base_sequence(UDS_WELCOME_NO_PAGINATION));
+
+        main_uds(path.to_str().unwrap());
+        let sent = peer.join().unwrap();
+
+        assert_eq!(sent.len(), 5);
+    }
+
+    #[test]
+    fn test_uds_gating_caps_less_welcome_issues_no_continue() {
+        let (path, _guard, peer) =
+            spawn_scripted_uds_peer(uds_base_sequence(UDS_WELCOME_NO_PAGINATION));
+
+        main_uds(path.to_str().unwrap());
+        let sent = peer.join().unwrap();
+
+        for frame in &sent {
+            let form = parse_str(frame).unwrap();
+            assert!(
+                !is_continue_form(&form),
+                "skip path emitted a continue: {frame}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_uds_gating_paginating_welcome_runs_the_full_nine_frame_path() {
+        let (path, _guard, peer) =
+            spawn_scripted_uds_peer(uds_full_paginated_sequence(UDS_WELCOME_WITH_PAGINATION));
+
+        main_uds(path.to_str().unwrap());
+        let sent = peer.join().unwrap();
+
+        assert_eq!(sent.len(), 9);
+    }
+
+    #[test]
+    fn test_uds_gating_paginating_welcome_issues_exactly_one_continue() {
+        let (path, _guard, peer) =
+            spawn_scripted_uds_peer(uds_full_paginated_sequence(UDS_WELCOME_WITH_PAGINATION));
+
+        main_uds(path.to_str().unwrap());
+        let sent = peer.join().unwrap();
+
+        let continues: Vec<&String> = sent
+            .iter()
+            .filter(|f| is_continue_form(&parse_str(f).unwrap()))
+            .collect();
+        assert_eq!(continues.len(), 1);
+        assert_eq!(continues[0], r#"(continue #cursor "c-1")"#);
     }
 }
