@@ -1,0 +1,84 @@
+# CI — run all five demo test suites on every push and pull request.
+#
+# Each job mirrors the gate its language's demo was built under:
+# the suites are deterministic (scripted in-process fakes, no Dianoia
+# server needed), so every job is a plain checkout + toolchain + test.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: python
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install edn_format
+      - run: python3 -m unittest test_lemma_client -v
+
+  typescript:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: typescript
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - run: bun test
+
+  clojure:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: clojure
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          # The UDS tests use java.nio UNIX SocketChannels (JDK 16+); 21
+          # matches the JDK the demos were developed and live-verified on.
+          java-version: "21"
+      - uses: DeLaGuardo/setup-clojure@13.2
+        with:
+          cli: latest
+      # -M:test is the dependency-free runner: it requires the test
+      # namespace, runs clojure.test, and exits nonzero on any failure.
+      - run: clojure -M:test
+
+  go:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: go
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go/go.mod
+      - run: go vet ./...
+      - run: go test ./... -count=1
+
+  rust:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
